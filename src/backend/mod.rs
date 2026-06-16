@@ -9,8 +9,12 @@
 //! backend (rayon for parallelism, autovectorized inner loops for SIMD).
 
 mod cpu;
+#[cfg(feature = "gpu")]
+mod gpu;
 
 pub use cpu::CpuBackend;
+#[cfg(feature = "gpu")]
+pub use gpu::GpuBackend;
 
 use crate::tensor::QMatrix;
 
