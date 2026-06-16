@@ -35,8 +35,13 @@ pub trait Backend: Send + Sync {
     /// Apply rotary positional embeddings (RoPE) in place.
     ///
     /// Rotates the query vector `q` (length `n_heads * head_size`) and the key
-    /// vector `k` (length `kv_dim`) for absolute position `pos`, using base
-    /// frequency `theta` (10000 for Llama-2, 500000 for Llama-3, …).
+    /// vector `k` (length `kv_dim`) for absolute position `pos`. `inv_freq`
+    /// holds one inverse frequency per rotated `(even, odd)` pair within a head
+    /// (`head_size / 2` for full rotary, fewer for partial rotary — the extra
+    /// pairs are left untouched). `mscale` scales the rotation magnitude (1.0
+    /// except under YaRN long-context scaling). The table is precomputed once
+    /// at load time; see [`crate::config::Config::rope_table`].
+    #[allow(clippy::too_many_arguments)]
     fn rope(
         &self,
         q: &mut [f32],
@@ -44,7 +49,8 @@ pub trait Backend: Send + Sync {
         pos: usize,
         head_size: usize,
         kv_dim: usize,
-        theta: f32,
+        inv_freq: &[f32],
+        mscale: f32,
     );
 
     /// Grouped-query attention for the current position.

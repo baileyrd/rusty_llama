@@ -4,7 +4,7 @@
 //! without downloading multi-megabyte weights. The output is, of course,
 //! gibberish — the weights are deterministic noise.
 
-use crate::config::Config;
+use crate::config::{Config, RopeScaling};
 use crate::quant::GgmlType;
 use crate::tokenizer::Tokenizer;
 
@@ -163,6 +163,51 @@ impl GgufWriter {
         }
         self.kv_count += 1;
     }
+    fn kv_i32_array(&mut self, key: &str, items: &[i32]) {
+        self.str(key);
+        self.u32(9); // array
+        self.u32(5); // of i32
+        self.u64(items.len() as u64);
+        for &v in items {
+            self.u32(v as u32);
+        }
+        self.kv_count += 1;
+    }
+}
+
+/// Emit the `llama.rope.scaling.*` metadata keys for a [`RopeScaling`].
+fn emit_rope_scaling(meta: &mut GgufWriter, scaling: RopeScaling) {
+    let k = "llama.rope.scaling.";
+    match scaling {
+        RopeScaling::None => {}
+        RopeScaling::Linear { factor } => {
+            meta.kv_str(&format!("{k}type"), "linear");
+            meta.kv_f32(&format!("{k}factor"), factor);
+        }
+        RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            orig_ctx,
+        } => {
+            meta.kv_str(&format!("{k}type"), "llama3");
+            meta.kv_f32(&format!("{k}factor"), factor);
+            meta.kv_f32(&format!("{k}low_freq_factor"), low_freq_factor);
+            meta.kv_f32(&format!("{k}high_freq_factor"), high_freq_factor);
+            meta.kv_u32(&format!("{k}original_context_length"), orig_ctx as u32);
+        }
+        RopeScaling::Yarn {
+            factor,
+            orig_ctx,
+            attn_factor,
+            ..
+        } => {
+            meta.kv_str(&format!("{k}type"), "yarn");
+            meta.kv_f32(&format!("{k}factor"), factor);
+            meta.kv_f32(&format!("{k}attn_factor"), attn_factor);
+            meta.kv_u32(&format!("{k}original_context_length"), orig_ctx as u32);
+        }
+    }
 }
 
 /// Which embedded tokenizer the synthetic GGUF carries.
@@ -175,7 +220,7 @@ enum TokKind {
 /// Serialize a synthetic GGUF `llama` model with F32 weights and a dummy
 /// (SentencePiece) tokenizer, in the layout [`crate::Model::from_gguf`] expects.
 pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
-    build_gguf(config, GgmlType::F32, TokKind::Llama)
+    build_gguf(config, GgmlType::F32, TokKind::Llama, &[])
 }
 
 /// Like [`synthetic_gguf`] but stores the 2-D matmul weights in `matmul_type`
@@ -184,16 +229,30 @@ pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
 ///
 /// `config.shared_weights` is honoured (no `output.weight` when shared).
 pub fn synthetic_gguf_typed(config: &Config, matmul_type: GgmlType) -> Vec<u8> {
-    build_gguf(config, matmul_type, TokKind::Llama)
+    build_gguf(config, matmul_type, TokKind::Llama, &[])
 }
 
 /// A synthetic GGUF carrying a `gpt2` byte-level BPE tokenizer (all 256 byte
 /// tokens, no merges). Requires `config.vocab_size == 256`.
 pub fn synthetic_gguf_gpt2(config: &Config) -> Vec<u8> {
-    build_gguf(config, GgmlType::F32, TokKind::Gpt2)
+    build_gguf(config, GgmlType::F32, TokKind::Gpt2, &[])
 }
 
-fn build_gguf(config: &Config, matmul_type: GgmlType, tok: TokKind) -> Vec<u8> {
+/// A `gpt2`-tokenizer GGUF whose vocabulary is the 256 byte tokens followed by
+/// `specials` — `(text, token_type)` pairs (use 3 for CONTROL, 4 for
+/// USER_DEFINED) — with a matching `tokenizer.ggml.token_type` array.
+///
+/// `config.vocab_size` must equal `256 + specials.len()`.
+pub fn synthetic_gguf_gpt2_special(config: &Config, specials: &[(&str, u32)]) -> Vec<u8> {
+    build_gguf(config, GgmlType::F32, TokKind::Gpt2, specials)
+}
+
+fn build_gguf(
+    config: &Config,
+    matmul_type: GgmlType,
+    tok: TokKind,
+    specials: &[(&str, u32)],
+) -> Vec<u8> {
     let c = config;
     // 2-D tensors carry the (possibly quantized) matmul weights; 1-D norm
     // vectors stay full precision.
@@ -269,7 +328,8 @@ fn build_gguf(config: &Config, matmul_type: GgmlType, tok: TokKind) -> Vec<u8> {
     meta.kv_u32("llama.context_length", c.seq_len as u32);
     meta.kv_f32("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
     meta.kv_f32("llama.rope.freq_base", c.rope_freq_base);
-    meta.kv_u32("llama.rope.dimension_count", (c.dim / c.n_heads) as u32);
+    meta.kv_u32("llama.rope.dimension_count", c.rotary_dim() as u32);
+    emit_rope_scaling(&mut meta, c.rope_scaling);
     match tok {
         TokKind::Llama => {
             meta.kv_str("tokenizer.ggml.model", "llama");
@@ -277,14 +337,28 @@ fn build_gguf(config: &Config, matmul_type: GgmlType, tok: TokKind) -> Vec<u8> {
             meta.kv_f32_array("tokenizer.ggml.scores", &vec![0.0; c.vocab_size]);
         }
         TokKind::Gpt2 => {
-            let tokens: Vec<Vec<u8>> = crate::tokenizer::gpt2_byte_tokens()
+            let mut tokens: Vec<Vec<u8>> = crate::tokenizer::gpt2_byte_tokens()
                 .into_iter()
                 .map(String::into_bytes)
                 .collect();
-            assert_eq!(tokens.len(), c.vocab_size, "gpt2 dummy needs vocab_size == 256");
+            // GGML_TOKEN_TYPE_NORMAL = 1 for the byte tokens; the appended
+            // special tokens carry their given CONTROL/USER_DEFINED type.
+            let mut types: Vec<i32> = vec![1; tokens.len()];
+            for (text, ty) in specials {
+                tokens.push(text.as_bytes().to_vec());
+                types.push(*ty as i32);
+            }
+            assert_eq!(
+                tokens.len(),
+                c.vocab_size,
+                "gpt2 dummy needs vocab_size == 256 + specials"
+            );
             meta.kv_str("tokenizer.ggml.model", "gpt2");
             meta.kv_str_array("tokenizer.ggml.tokens", &tokens);
             meta.kv_str_array("tokenizer.ggml.merges", &[]); // no merges
+            if !specials.is_empty() {
+                meta.kv_i32_array("tokenizer.ggml.token_type", &types);
+            }
         }
     }
     meta.kv_u32("tokenizer.ggml.bos_token_id", 1);

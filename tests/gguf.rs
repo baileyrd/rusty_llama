@@ -1,10 +1,13 @@
 //! End-to-end tests for the GGUF path: parse a synthetic GGUF file, load the
 //! weights/tokenizer, and run the forward pass.
 
-use rusty_llama::dummy::{synthetic_gguf, synthetic_gguf_gpt2, synthetic_gguf_typed};
+use rusty_llama::dummy::{
+    synthetic_gguf, synthetic_gguf_gpt2, synthetic_gguf_gpt2_special, synthetic_gguf_typed,
+};
 use rusty_llama::quant::dequantize;
 use rusty_llama::{
-    forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RunState, Sampler, Tokenizer,
+    forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RopeScaling, RunState, Sampler,
+    Tokenizer,
 };
 
 fn cfg() -> Config {
@@ -108,6 +111,89 @@ fn from_gguf_reads_rope_base_and_eps() {
     let model = Model::from_gguf(&gguf).unwrap();
     assert_eq!(model.config.rope_freq_base, 500000.0);
     assert_eq!(model.config.rms_eps, 2e-5);
+}
+
+#[test]
+fn gpt2_special_tokens_round_trip() {
+    // 256 byte tokens, then four special tokens (CONTROL=3 / USER_DEFINED=4)
+    // marked via tokenizer.ggml.token_type.
+    let specials = [
+        ("<|begin_of_text|>", 3u32),
+        ("<|im_start|>", 3),
+        ("<|im_end|>", 3),
+        ("<|tool|>", 4),
+    ];
+    let c = Config {
+        dim: 32,
+        hidden_dim: 64,
+        n_layers: 1,
+        n_heads: 4,
+        n_kv_heads: 4,
+        vocab_size: 256 + specials.len(),
+        seq_len: 8,
+        shared_weights: true,
+        ..Default::default()
+    };
+    let bytes = synthetic_gguf_gpt2_special(&c, &specials);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let tk = Tokenizer::from_gguf(&gguf).unwrap();
+
+    // Each special is recognized as exactly one id (byte tokens occupy 0..256,
+    // specials follow in order).
+    assert_eq!(tk.encode("<|begin_of_text|>", false, false), vec![256]);
+    assert_eq!(tk.encode("<|im_start|>", false, false), vec![257]);
+    assert_eq!(tk.encode("<|tool|>", false, false), vec![259]);
+
+    // Mixed text: specials become single ids, the gaps (incl. multi-byte CJK)
+    // go through byte-level BPE.
+    let text = "<|im_start|>user\nHello 世界!<|im_end|>";
+    let ids = tk.encode(text, false, false);
+    assert!(ids.contains(&257) && ids.contains(&258));
+    // The special ids are single tokens, not split into their bytes.
+    assert!(ids.iter().filter(|&&id| id == 257).count() == 1);
+
+    // Full round-trip: decode reproduces the original text, special tokens
+    // included.
+    let mut out = Vec::new();
+    let mut prev = 0;
+    for &id in &ids {
+        out.extend_from_slice(&tk.decode(prev, id));
+        prev = id;
+    }
+    assert_eq!(out, text.as_bytes());
+}
+
+#[test]
+fn from_gguf_accepts_rope_scaling() {
+    // A model that used to be rejected (scaling ignored) now loads, and the
+    // scaling is read back into the config and folded into the rope table.
+    let c = Config {
+        rope_freq_base: 500000.0,
+        rope_scaling: RopeScaling::Linear { factor: 4.0 },
+        ..cfg()
+    };
+    let bytes = synthetic_gguf(&c);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    assert_eq!(
+        model.config.rope_scaling,
+        RopeScaling::Linear { factor: 4.0 }
+    );
+    // Linear scaling divides every base frequency by the factor.
+    let base = Config {
+        rope_scaling: RopeScaling::None,
+        ..c
+    }
+    .rope_table();
+    for (scaled, b) in model.rope.inv_freq.iter().zip(&base.inv_freq) {
+        assert!((scaled - b / 4.0).abs() < 1e-9);
+    }
+
+    // The scaled model still runs a finite forward pass.
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward(&model, &mut s, &backend, 1, 0);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
 }
 
 #[test]

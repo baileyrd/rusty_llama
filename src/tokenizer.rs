@@ -14,8 +14,10 @@
 //! repeat vocab_size times: float32 score | int32 len | u8[len] piece
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use fancy_regex::Regex;
 
 use crate::error::{Error, Result};
 use crate::gguf::{Gguf, MetaValue};
@@ -88,6 +90,104 @@ impl Tokenizer {
 }
 
 // ===========================================================================
+// Special (control / user-defined) tokens
+// ===========================================================================
+
+/// GGUF `tokenizer.ggml.token_type` value for a control token (e.g. `<s>`).
+const TOKEN_TYPE_CONTROL: u64 = 3;
+/// GGUF `tokenizer.ggml.token_type` value for a user-defined / added token.
+const TOKEN_TYPE_USER_DEFINED: u64 = 4;
+
+/// One piece of [`SpecialTokens::split`] output.
+enum Segment<'t> {
+    /// Ordinary text to run through the normal tokenizer.
+    Gap(&'t str),
+    /// A recognized special token, emitted as this id verbatim.
+    Special(usize),
+}
+
+/// Control / user-defined tokens (`<|begin_of_text|>`, `<|im_start|>`, …) that
+/// are matched verbatim during encode and emitted as literal text on decode,
+/// mirroring HuggingFace's `AddedVocabulary` behaviour.
+#[derive(Default)]
+struct SpecialTokens {
+    /// `(literal text, id)`, sorted by descending text length so overlapping
+    /// tokens match longest-first.
+    entries: Vec<(String, usize)>,
+    /// Set of special ids, for O(1) decode-time lookup.
+    ids: HashSet<usize>,
+}
+
+impl SpecialTokens {
+    /// Build from `(text, id)` pairs (used by tests and the GGUF path).
+    fn new(mut entries: Vec<(String, usize)>) -> Self {
+        entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let ids = entries.iter().map(|(_, id)| *id).collect();
+        SpecialTokens { entries, ids }
+    }
+
+    /// Collect CONTROL / USER_DEFINED tokens from `tokenizer.ggml.token_type`.
+    ///
+    /// `tokens` are the raw (un-decoded) vocabulary strings, indexed by id;
+    /// special tokens are stored literally, so their string is the text to
+    /// match. Returns an empty table when the metadata is absent.
+    fn from_gguf(gguf: &Gguf, tokens: &[String]) -> Self {
+        let types = match gguf.meta("tokenizer.ggml.token_type") {
+            Some(MetaValue::Array(a)) => a,
+            _ => return SpecialTokens::default(),
+        };
+        let entries = types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let ty = t.as_u64()?;
+                let special = ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED;
+                match tokens.get(i) {
+                    Some(s) if special && !s.is_empty() => Some((s.clone(), i)),
+                    _ => None,
+                }
+            })
+            .collect();
+        SpecialTokens::new(entries)
+    }
+
+    /// Whether `id` is a special token (decode emits its literal text).
+    fn contains(&self, id: usize) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// Walk `text`, handing ordinary spans and special-token hits to `f` in
+    /// order. With no special tokens this is a single `Gap` over all of `text`.
+    fn split<'t>(&self, text: &'t str, mut f: impl FnMut(Segment<'t>)) {
+        if self.entries.is_empty() {
+            if !text.is_empty() {
+                f(Segment::Gap(text));
+            }
+            return;
+        }
+        let mut gap_start = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &text[i..];
+            // `entries` is longest-first, so the first hit is the longest match.
+            if let Some((s, id)) = self.entries.iter().find(|(s, _)| rest.starts_with(s.as_str())) {
+                if gap_start < i {
+                    f(Segment::Gap(&text[gap_start..i]));
+                }
+                f(Segment::Special(*id));
+                i += s.len();
+                gap_start = i;
+            } else {
+                i += rest.chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        if gap_start < text.len() {
+            f(Segment::Gap(&text[gap_start..]));
+        }
+    }
+}
+
+// ===========================================================================
 // SentencePiece-style tokenizer
 // ===========================================================================
 
@@ -98,6 +198,9 @@ pub struct Spm {
     lookup: HashMap<Vec<u8>, usize>,
     #[allow(dead_code)]
     max_token_length: usize,
+    /// Control / user-defined tokens recognized verbatim (empty unless built
+    /// from a GGUF that marks them via `tokenizer.ggml.token_type`).
+    specials: SpecialTokens,
 }
 
 impl Spm {
@@ -115,6 +218,7 @@ impl Spm {
             scores,
             lookup,
             max_token_length,
+            specials: SpecialTokens::default(),
         }
     }
 
@@ -171,32 +275,63 @@ impl Spm {
             Some(MetaValue::Array(a)) => a,
             _ => return Err(Error::Format("GGUF missing tokenizer.ggml.tokens".into())),
         };
-        let vocab: Vec<Vec<u8>> = tokens
+        // Raw strings (for special-token matching) and their normalized bytes.
+        let raw: Vec<String> = tokens
             .iter()
             .map(|t| {
                 t.as_str()
-                    .map(normalize_spm_piece)
+                    .map(str::to_owned)
                     .ok_or_else(|| Error::Format("non-string token in GGUF vocab".into()))
             })
             .collect::<Result<_>>()?;
+        let vocab: Vec<Vec<u8>> = raw.iter().map(|s| normalize_spm_piece(s)).collect();
 
         let scores = match gguf.meta("tokenizer.ggml.scores") {
             Some(MetaValue::Array(a)) => a.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect(),
             _ => vec![0.0; vocab.len()],
         };
 
-        Ok(Spm::from_vocab(vocab, scores))
+        let mut tk = Spm::from_vocab(vocab, scores);
+        tk.specials = SpecialTokens::from_gguf(gguf, &raw);
+        Ok(tk)
     }
 
     /// Encode following SentencePiece defaults: dummy leading space, byte
     /// fallback, and greedy highest-score adjacent merges.
+    ///
+    /// Any special (control / user-defined) tokens are recognized verbatim and
+    /// the ordinary spans between them are encoded independently.
     pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<usize> {
         let mut tokens: Vec<usize> = Vec::new();
-
         if bos {
             tokens.push(1);
         }
-        if !text.is_empty() {
+        // The dummy leading space is added only to the first ordinary span.
+        let mut first = true;
+        self.specials.split(text, |seg| match seg {
+            Segment::Gap(g) => {
+                self.encode_piece(g, first, &mut tokens);
+                first = false;
+            }
+            Segment::Special(id) => {
+                tokens.push(id);
+                first = false;
+            }
+        });
+        if eos {
+            tokens.push(2);
+        }
+        tokens
+    }
+
+    /// Encode one ordinary span: optional dummy leading space, byte fallback,
+    /// then greedy highest-score adjacent merges (which never cross spans).
+    fn encode_piece(&self, text: &str, add_dummy_space: bool, out: &mut Vec<usize>) {
+        if text.is_empty() {
+            return;
+        }
+        let mut tokens: Vec<usize> = Vec::new();
+        if add_dummy_space {
             if let Some(&id) = self.lookup.get(b" ".as_slice()) {
                 tokens.push(id);
             }
@@ -237,15 +372,16 @@ impl Spm {
                 None => break,
             }
         }
-
-        if eos {
-            tokens.push(2);
-        }
-        tokens
+        out.extend(tokens);
     }
 
     /// Decode, stripping the leading space after BOS and expanding `<0xXX>`.
     pub fn decode(&self, prev_token: usize, token: usize) -> Vec<u8> {
+        // Special tokens decode to their literal text (no space-strip / byte
+        // parsing).
+        if self.specials.contains(token) {
+            return self.vocab[token].clone();
+        }
         let piece = &self.vocab[token];
         let mut bytes: &[u8] = piece;
         if prev_token == 1 && bytes.first() == Some(&b' ') {
@@ -289,10 +425,9 @@ fn parse_byte_token(bytes: &[u8]) -> Option<u8> {
 /// the input is pre-tokenized into word-like chunks, and each chunk's symbols
 /// are merged by rank. Decoding reverses the byte→unicode map.
 ///
-/// The pre-tokenizer here approximates GPT-2's regex (contractions, runs of
-/// letters / digits / punctuation, whitespace). It is not a byte-exact match
-/// for every model's pre-tokenizer, so token boundaries can differ from the
-/// reference on unusual inputs; the byte mapping and rank merges are exact.
+/// The pre-tokenizer applies the model's exact splitting regex, selected by the
+/// GGUF `tokenizer.ggml.pre` name (GPT-2 / Llama-3 / Qwen2; see [`PreTokenizer`]),
+/// so token boundaries match the reference.
 pub struct Bpe {
     /// Raw bytes each token id decodes to.
     id_to_bytes: Vec<Vec<u8>>,
@@ -302,17 +437,35 @@ pub struct Bpe {
     merge_ranks: HashMap<(String, String), usize>,
     /// byte → printable unicode char.
     byte_encoder: [char; 256],
+    /// Pre-tokenizer (splitting regex) selected by the model's `pre` name.
+    pre: PreTokenizer,
+    /// Control / user-defined tokens recognized verbatim during encode.
+    specials: SpecialTokens,
     bos: Option<usize>,
     eos: Option<usize>,
 }
 
 impl Bpe {
-    /// Build from encoded `tokens`, ordered `merges`, and optional BOS/EOS ids.
+    /// Build from encoded `tokens`, ordered `merges`, and optional BOS/EOS ids,
+    /// using the default (GPT-2) pre-tokenizer.
     pub fn new(
         tokens: Vec<String>,
         merges: Vec<(String, String)>,
         bos: Option<usize>,
         eos: Option<usize>,
+    ) -> Self {
+        Bpe::build(tokens, merges, bos, eos, "gpt-2", SpecialTokens::default())
+    }
+
+    /// Build with an explicit pre-tokenizer name (see [`pre_pattern`]) and
+    /// special-token table.
+    fn build(
+        tokens: Vec<String>,
+        merges: Vec<(String, String)>,
+        bos: Option<usize>,
+        eos: Option<usize>,
+        pre: &str,
+        specials: SpecialTokens,
     ) -> Self {
         let byte_encoder = bytes_to_unicode();
         let byte_decoder: HashMap<char, u8> = byte_encoder
@@ -341,6 +494,8 @@ impl Bpe {
             token_to_id,
             merge_ranks,
             byte_encoder,
+            pre: PreTokenizer::new(pre),
+            specials,
             bos,
             eos,
         }
@@ -380,18 +535,29 @@ impl Bpe {
             .ok()
             .map(|v| v as usize);
 
-        Ok(Bpe::new(tokens, merges, bos, eos))
+        // The pre-tokenizer name picks the exact splitting regex (Llama-3,
+        // Qwen2, …); absent or unknown falls back to GPT-2.
+        let pre = gguf.meta_str("tokenizer.ggml.pre").unwrap_or("gpt-2");
+        let specials = SpecialTokens::from_gguf(gguf, &tokens);
+
+        Ok(Bpe::build(tokens, merges, bos, eos, pre, specials))
     }
 
     /// Encode `text`, optionally bracketing with BOS/EOS.
+    ///
+    /// Special (control / user-defined) tokens are matched verbatim and only the
+    /// ordinary spans between them are pre-tokenized and BPE-merged.
     pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<usize> {
         let mut ids = Vec::new();
         if bos {
             ids.extend(self.bos);
         }
-        for chunk in pretokenize_gpt2(text) {
-            self.encode_chunk(&chunk, &mut ids);
-        }
+        self.specials.split(text, |seg| match seg {
+            Segment::Gap(gap) => self
+                .pre
+                .for_each_chunk(gap, |chunk| self.encode_chunk(chunk, &mut ids)),
+            Segment::Special(id) => ids.push(id),
+        });
         if eos {
             ids.extend(self.eos);
         }
@@ -505,73 +671,83 @@ pub(crate) fn gpt2_byte_tokens() -> Vec<String> {
     bytes_to_unicode().iter().map(|c| c.to_string()).collect()
 }
 
-/// Split `text` into GPT-2-style pre-token chunks (approximate; see [`Bpe`]).
-fn pretokenize_gpt2(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out = Vec::new();
-    let mut i = 0;
+// GPT-2's original pre-tokenizer regex: contractions, then runs of letters /
+// digits / other (each with an optional leading space), then whitespace.
+const PRE_GPT2: &str =
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
-    let take = |a: usize, b: usize| -> String { chars[a..b].iter().collect() };
+// Llama-3's pattern (from its `tokenizer.json`): case-insensitive contractions,
+// letters optionally led by one non-letter/digit, digits in groups of up to 3,
+// other runs that swallow trailing newlines, then whitespace.
+const PRE_LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    while i < n {
-        // Contractions: 's 't 'm 'd / 're 've 'll
-        if chars[i] == '\'' {
-            if let Some(len) = contraction_len(&chars[i..]) {
-                out.push(take(i, i + len));
-                i += len;
-                continue;
-            }
-        }
+// Qwen2's pattern — identical to Llama-3's except digits split one at a time
+// (`\p{N}` instead of `\p{N}{1,3}`).
+const PRE_QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-        // Optional single leading space, then a run of one category.
-        let space = usize::from(chars[i] == ' ');
-        let j = i + space;
-        if j < n && chars[j].is_alphabetic() {
-            let mut k = j;
-            while k < n && chars[k].is_alphabetic() {
-                k += 1;
-            }
-            out.push(take(i, k));
-            i = k;
-        } else if j < n && chars[j].is_numeric() {
-            let mut k = j;
-            while k < n && chars[k].is_numeric() {
-                k += 1;
-            }
-            out.push(take(i, k));
-            i = k;
-        } else if j < n && !chars[j].is_whitespace() {
-            let mut k = j;
-            while k < n && !chars[k].is_whitespace() && !chars[k].is_alphanumeric() {
-                k += 1;
-            }
-            out.push(take(i, k));
-            i = k;
-        } else {
-            // Whitespace run (also catches a lone trailing space).
-            let mut k = i;
-            while k < n && chars[k].is_whitespace() {
-                k += 1;
-            }
-            let k = k.max(i + 1); // ensure progress
-            out.push(take(i, k));
-            i = k;
-        }
+/// Map a GGUF `tokenizer.ggml.pre` name to its splitting regex.
+///
+/// Names follow llama.cpp's `llama-vocab.cpp`. Anything unrecognized (or a
+/// missing `pre`) falls back to the GPT-2 pattern, matching llama.cpp's default.
+fn pre_pattern(pre: &str) -> &'static str {
+    match pre {
+        "llama-bpe" | "llama3" | "llama-v3" | "llama-bpe-v3" => PRE_LLAMA3,
+        "qwen2" | "qwen" => PRE_QWEN2,
+        _ => PRE_GPT2,
     }
-    out
 }
 
-/// Length (in chars) of a contraction starting at `s[0] == '\''`, else `None`.
-fn contraction_len(s: &[char]) -> Option<usize> {
-    let two: String = s.iter().skip(1).take(2).collect();
-    if two == "re" || two == "ve" || two == "ll" {
-        return Some(3);
+/// The byte-exact GPT-2-family pre-tokenizer: a compiled splitting regex chosen
+/// by the model's `pre` name. The `regex` crate lacks the lookahead these
+/// patterns use, so we compile them with `fancy-regex`.
+struct PreTokenizer {
+    re: Regex,
+}
+
+impl PreTokenizer {
+    /// Compile the pattern selected by `pre` (see [`pre_pattern`]).
+    fn new(pre: &str) -> Self {
+        // The patterns are fixed constants, so compilation cannot fail.
+        let re = Regex::new(pre_pattern(pre)).expect("built-in pretokenizer regex is valid");
+        PreTokenizer { re }
     }
-    match s.get(1) {
-        Some('s' | 't' | 'm' | 'd') => Some(2),
-        _ => None,
+
+    /// Apply the regex, handing each pre-token chunk to `f` in order.
+    ///
+    /// These patterns tile the whole input (every character matches some
+    /// alternative), but should a gap ever appear it is emitted verbatim so no
+    /// bytes are dropped.
+    fn for_each_chunk<'t>(&self, text: &'t str, mut f: impl FnMut(&'t str)) {
+        let mut last = 0;
+        for m in self.re.find_iter(text) {
+            let m = m.expect("pretokenizer regex match");
+            if m.start() > last {
+                f(&text[last..m.start()]);
+            }
+            f(&text[m.start()..m.end()]);
+            last = m.end();
+        }
+        if last < text.len() {
+            f(&text[last..]);
+        }
     }
+
+    /// Collect the chunks into a `Vec` (convenience for callers/tests).
+    fn split(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.for_each_chunk(text, |c| out.push(c.to_owned()));
+        out
+    }
+}
+
+/// Split `text` into GPT-2-family pre-token chunks using the regex selected by
+/// the `pre` name (`"gpt-2"`, `"llama-bpe"` for Llama-3, `"qwen2"`, …).
+///
+/// Exposed mainly so the byte-exactness of the splitter can be checked against
+/// reference tokenizer output. Compiles a regex per call, so prefer encoding
+/// through a [`Tokenizer`] for hot paths.
+pub fn pretokenize(pre: &str, text: &str) -> Vec<String> {
+    PreTokenizer::new(pre).split(text)
 }
 
 #[cfg(test)]
@@ -706,9 +882,76 @@ mod tests {
     }
 
     #[test]
+    fn special_tokens_split_longest_first() {
+        // Overlapping specials: the longer one must win at a shared prefix.
+        let st = SpecialTokens::new(vec![
+            ("<|a|>".to_string(), 10),
+            ("<|ab|>".to_string(), 11),
+        ]);
+        let mut segs = Vec::new();
+        st.split("x<|ab|>y<|a|>", |seg| {
+            segs.push(match seg {
+                Segment::Gap(g) => g.to_string(),
+                Segment::Special(id) => format!("#{id}"),
+            })
+        });
+        assert_eq!(segs, vec!["x", "#11", "y", "#10"]);
+    }
+
+    #[test]
+    fn spm_special_tokens_round_trip() {
+        // A tiny SPM vocab with a control token "<s2>" injected as special.
+        let entries: &[(&[u8], f32)] = &[
+            (b"<unk>", 0.0),    // 0
+            (b"\n<s>\n", 0.0),  // 1 BOS
+            (b"\n</s>\n", 0.0), // 2 EOS
+            (b" ", -3.0),       // 3
+            (b"h", -4.0),       // 4
+            (b"i", -5.0),       // 5
+            (b"<s2>", 0.0),     // 6 special (control)
+        ];
+        let vocab: Vec<Vec<u8>> = entries.iter().map(|(p, _)| p.to_vec()).collect();
+        let scores = entries.iter().map(|(_, s)| *s).collect();
+        let mut spm = Spm::from_vocab(vocab, scores);
+        spm.specials = SpecialTokens::new(vec![("<s2>".to_string(), 6)]);
+
+        // "<s2>" is recognized as id 6, "hi" still encodes around it.
+        let ids = spm.encode("hi<s2>hi", false, false);
+        assert!(ids.contains(&6));
+        assert_eq!(ids.iter().filter(|&&i| i == 6).count(), 1);
+
+        // Decode of the special yields its literal text.
+        assert_eq!(spm.decode(0, 6), b"<s2>");
+    }
+
+    #[test]
     fn pretokenize_splits_like_gpt2() {
-        assert_eq!(pretokenize_gpt2("hello world"), vec!["hello", " world"]);
-        assert_eq!(pretokenize_gpt2("it's 42!"), vec!["it", "'s", " 42", "!"]);
-        assert_eq!(pretokenize_gpt2(""), Vec::<String>::new());
+        assert_eq!(pretokenize("gpt-2", "hello world"), vec!["hello", " world"]);
+        assert_eq!(
+            pretokenize("gpt-2", "it's 42!"),
+            vec!["it", "'s", " 42", "!"]
+        );
+        assert_eq!(pretokenize("gpt-2", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pretokenize_digit_runs_differ_by_pre() {
+        // The clearest discriminator between the three patterns: GPT-2 keeps a
+        // digit run whole, Llama-3 splits it into groups of ≤3, Qwen2 one apiece.
+        assert_eq!(pretokenize("gpt-2", "1234567"), vec!["1234567"]);
+        assert_eq!(pretokenize("llama-bpe", "1234567"), vec!["123", "456", "7"]);
+        assert_eq!(
+            pretokenize("qwen2", "1234567"),
+            vec!["1", "2", "3", "4", "5", "6", "7"]
+        );
+    }
+
+    #[test]
+    fn pretokenize_uppercase_contractions_need_case_insensitive() {
+        // Llama-3/Qwen2 fold contraction case, so "'S" stays one chunk; GPT-2's
+        // contractions are lowercase-only, so the apostrophe splits off.
+        assert_eq!(pretokenize("gpt-2", "IT'S"), vec!["IT", "'", "S"]);
+        assert_eq!(pretokenize("llama-bpe", "IT'S"), vec!["IT", "'S"]);
+        assert_eq!(pretokenize("qwen2", "IT'S"), vec!["IT", "'S"]);
     }
 }

@@ -35,7 +35,7 @@ pub mod tokenizer;
 mod loader;
 
 pub use backend::{Backend, CpuBackend};
-pub use config::Config;
+pub use config::{Config, RopeScaling, RopeTable};
 pub use error::{Error, Result};
 pub use gguf::Gguf;
 pub use loader::Checkpoint;

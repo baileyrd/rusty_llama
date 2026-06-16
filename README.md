@@ -124,7 +124,8 @@ and that greedy generation reproduces.
 - [x] Integer (Q8 / Q8_K) activation fast path for Q8_0/Q4_0/Q4_K/Q6_K matmuls (~3× over per-block dequant)
 - [x] Per-model RoPE base (θ) and RMSNorm epsilon read from GGUF (Llama-3 / Qwen2 θ honoured)
 - [x] Byte-level BPE (`gpt2`) tokenizer — Llama-3 / Qwen2 vocabularies load
-- [ ] RoPE long-context scaling (`linear`/`yarn`/`llama3`) + byte-exact pretokenizer regex
+- [x] Byte-exact pretokenizer regex (`gpt-2`/`llama-bpe`/`qwen2` via `fancy-regex`) + special-token handling
+- [x] RoPE long-context scaling (`linear`/`yarn`/`llama3`)
 - [x] Explicit AVX-512 VNNI (`vpdpbusd`) integer dot products for Q8_0/Q4_0/Q4_K (~2.2–2.5×, bit-identical to scalar)
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
 
