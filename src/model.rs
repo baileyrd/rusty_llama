@@ -152,7 +152,7 @@ impl<'a> Model<'a> {
 
         // RoPE rotary dimension. Defaults to the full head size; a smaller value
         // (partial rotary) leaves each head's trailing dims unrotated.
-        let head_size = if n_heads == 0 { 0 } else { dim / n_heads };
+        let head_size = dim.checked_div(n_heads).unwrap_or(0);
         let rope_dim = gguf
             .meta_u64(&key("rope.dimension_count"))
             .unwrap_or(head_size as u64) as usize;
