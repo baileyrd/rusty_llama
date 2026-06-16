@@ -36,6 +36,7 @@ fn main() -> std::io::Result<()> {
         vocab_size: 32000,
         seq_len: 256,
         shared_weights: true,
+        ..Default::default()
     };
 
     let bytes = if path.ends_with(".gguf") {

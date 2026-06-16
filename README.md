@@ -112,9 +112,10 @@ and that greedy generation reproduces.
 - [x] GGUF container + quantized weights (F16, Q4_0, Q8_0, Q4_K, Q6_K) + GGUF SPM tokenizer
 - [x] On-the-fly quantized matmul — weights stay compressed in RAM (mmap), dequantized per block
 - [x] Integer (Q8 / Q8_K) activation fast path for Q8_0/Q4_0/Q4_K/Q6_K matmuls (~3× over per-block dequant)
+- [x] Per-model RoPE base (θ) and RMSNorm epsilon read from GGUF (Llama-3 / Qwen2 θ honoured)
+- [ ] Byte-level BPE (`gpt2`) tokenizer + RoPE long-context scaling → full Llama-3 / Qwen2 support
 - [ ] Explicit SIMD intrinsics (e.g. AVX-512 VNNI) for the integer dot products
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
-- [ ] Llama-3 (RoPE θ / scaling), byte-level BPE (`gpt2`) tokenizers, chat templating
 
 ## Credits
 

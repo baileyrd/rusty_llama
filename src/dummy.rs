@@ -251,7 +251,9 @@ pub fn synthetic_gguf_typed(config: &Config, matmul_type: GgmlType) -> Vec<u8> {
     meta.kv_u32("llama.attention.head_count_kv", c.n_kv_heads as u32);
     meta.kv_u32("llama.feed_forward_length", c.hidden_dim as u32);
     meta.kv_u32("llama.context_length", c.seq_len as u32);
-    meta.kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+    meta.kv_f32("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
+    meta.kv_f32("llama.rope.freq_base", c.rope_freq_base);
+    meta.kv_u32("llama.rope.dimension_count", (c.dim / c.n_heads) as u32);
     meta.kv_str("tokenizer.ggml.model", "llama");
     meta.kv_str_array("tokenizer.ggml.tokens", &tokens);
     meta.kv_f32_array("tokenizer.ggml.scores", &vec![0.0; c.vocab_size]);

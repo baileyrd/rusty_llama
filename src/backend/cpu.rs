@@ -46,11 +46,11 @@ impl CpuBackend {
 }
 
 impl Backend for CpuBackend {
-    fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32]) {
+    fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
         debug_assert_eq!(out.len(), x.len());
         debug_assert_eq!(out.len(), weight.len());
         let n = x.len() as f32;
-        let ss = x.iter().map(|&v| v * v).sum::<f32>() / n + 1e-5;
+        let ss = x.iter().map(|&v| v * v).sum::<f32>() / n + eps;
         let inv = 1.0 / ss.sqrt();
         for ((o, &xi), &wi) in out.iter_mut().zip(x).zip(weight) {
             *o = xi * inv * wi;
@@ -105,7 +105,15 @@ impl Backend for CpuBackend {
         }
     }
 
-    fn rope(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_size: usize, kv_dim: usize) {
+    fn rope(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        pos: usize,
+        head_size: usize,
+        kv_dim: usize,
+        theta: f32,
+    ) {
         // Rotate consecutive (even, odd) pairs within each head by an angle
         // that grows with position and shrinks with the pair's index in the
         // head. Pairs below `kv_dim` rotate both q and k; the rest (extra query
@@ -114,7 +122,7 @@ impl Backend for CpuBackend {
         let mut i = 0;
         while i < dim {
             let head_dim = i % head_size;
-            let freq = 1.0 / 10000f32.powf(head_dim as f32 / head_size as f32);
+            let freq = 1.0 / theta.powf(head_dim as f32 / head_size as f32);
             let val = pos as f32 * freq;
             let (fcr, fci) = (val.cos(), val.sin());
 
@@ -369,11 +377,23 @@ mod tests {
         let x = [1.0, 1.0, 1.0, 1.0];
         let w = [1.0; 4];
         let mut out = [0.0; 4];
-        CpuBackend.rmsnorm(&mut out, &x, &w);
+        CpuBackend.rmsnorm(&mut out, &x, &w, 1e-5);
         let expected = 1.0 / (1.0 + 1e-5f32).sqrt();
         for &o in &out {
             approx(o, expected);
         }
+    }
+
+    #[test]
+    fn rmsnorm_uses_eps() {
+        // A large eps must visibly shrink the output.
+        let x = [1.0, 1.0, 1.0, 1.0];
+        let w = [1.0; 4];
+        let (mut a, mut b) = ([0.0; 4], [0.0; 4]);
+        CpuBackend.rmsnorm(&mut a, &x, &w, 1e-5);
+        CpuBackend.rmsnorm(&mut b, &x, &w, 9.0);
+        approx(b[0], 1.0 / (1.0 + 9.0f32).sqrt());
+        assert!(b[0] < a[0]);
     }
 
     #[test]
@@ -398,19 +418,37 @@ mod tests {
         let mut q = [1.0, 2.0, 3.0, 4.0];
         let mut k = [5.0, 6.0, 7.0, 8.0];
         let before = (q, k);
-        CpuBackend.rope(&mut q, &mut k, 0, 4, 4);
+        CpuBackend.rope(&mut q, &mut k, 0, 4, 4, 10000.0);
         assert_eq!(q, before.0);
         assert_eq!(k, before.1);
     }
 
     #[test]
     fn rope_rotates_by_angle() {
-        // head_size 2, single pair, pos 1, head_dim 0 -> freq 1, angle = 1 rad.
+        // head_size 2, single pair, pos 1, head_dim 0 -> freq 1, angle = 1 rad
+        // (independent of theta since the exponent is 0).
         let mut q = [1.0, 0.0];
         let mut k = [1.0, 0.0];
-        CpuBackend.rope(&mut q, &mut k, 1, 2, 2);
+        CpuBackend.rope(&mut q, &mut k, 1, 2, 2, 10000.0);
         approx(q[0], 1.0f32.cos());
         approx(q[1], 1.0f32.sin());
+    }
+
+    #[test]
+    fn rope_uses_theta() {
+        // head_dim 2 of a size-4 head: angle = pos / theta^(2/4) = 1/sqrt(theta),
+        // so different bases give different rotations.
+        let rotate = |theta: f32| {
+            let mut q = [0.0, 0.0, 1.0, 0.0];
+            let mut k = q;
+            CpuBackend.rope(&mut q, &mut k, 1, 4, 4, theta);
+            (q[2], q[3])
+        };
+        let (a_cos, _) = rotate(10000.0);
+        let (b_cos, _) = rotate(100.0);
+        approx(a_cos, (1.0f32 / 10000.0f32.sqrt()).cos());
+        approx(b_cos, (1.0f32 / 100.0f32.sqrt()).cos());
+        assert!((a_cos - b_cos).abs() > 1e-4);
     }
 
     #[test]

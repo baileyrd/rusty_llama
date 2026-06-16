@@ -4,11 +4,12 @@ use crate::error::{Error, Result};
 
 /// Transformer hyper-parameters.
 ///
-/// This mirrors the 7-`int32` header that prefixes a llama2.c checkpoint
-/// (`dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len`),
-/// plus the `shared_weights` flag that the original format smuggles into the
-/// *sign* of `vocab_size`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The first eight fields mirror the llama2.c checkpoint header
+/// (`dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len`, plus
+/// the `shared_weights` flag that the format smuggles into the *sign* of
+/// `vocab_size`). The last two are real-model knobs that GGUF carries
+/// explicitly and that llama2.c leaves implicit.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
     /// Model (a.k.a. embedding / residual stream) dimension.
     pub dim: usize,
@@ -26,6 +27,27 @@ pub struct Config {
     pub seq_len: usize,
     /// Whether the output classifier reuses the token-embedding matrix.
     pub shared_weights: bool,
+    /// RoPE base frequency θ (10000 for Llama-2; 500000 for Llama-3; 1e6 for Qwen2).
+    pub rope_freq_base: f32,
+    /// RMSNorm epsilon.
+    pub rms_eps: f32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            dim: 0,
+            hidden_dim: 0,
+            n_layers: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            vocab_size: 0,
+            seq_len: 0,
+            shared_weights: true,
+            rope_freq_base: 10000.0,
+            rms_eps: 1e-5,
+        }
+    }
 }
 
 impl Config {
@@ -85,6 +107,8 @@ impl Config {
             vocab_size: vocab_raw.unsigned_abs() as usize,
             seq_len: nonneg(seq_len, "seq_len")?,
             shared_weights,
+            // llama2.c implies these; use the standard Llama-2 defaults.
+            ..Default::default()
         };
         cfg.validate()?;
         Ok(cfg)
@@ -112,6 +136,13 @@ impl Config {
             return bad(format!(
                 "head_size ({}) must be even for RoPE",
                 self.head_size()
+            ));
+        }
+        let positive = |v: f32| v.is_finite() && v > 0.0;
+        if !positive(self.rope_freq_base) || !positive(self.rms_eps) {
+            return bad(format!(
+                "rope_freq_base ({}) and rms_eps ({}) must be finite and positive",
+                self.rope_freq_base, self.rms_eps
             ));
         }
         Ok(())
