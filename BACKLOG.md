@@ -24,7 +24,7 @@ Trait surface to implement:
 |-------------|----------------|
 | `rmsnorm(out, x, weight, eps)`                                   | all length `dim` |
 | `matmul(out, x, w: &QMatrix)`                                    | `out=[w.rows()]`, `x=[w.cols()]` |
-| `rope(q, k, pos, head_size, kv_dim, theta)`                      | in place |
+| `rope(q, k, pos, head_size, kv_dim, inv_freq, mscale)`           | in place; `inv_freq` is the precomputed per-pair table |
 | `attention(out, q, key_cache, value_cache, att, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim)` | GQA, one position |
 | `swiglu(hb, hb2)`                                                | `hb = silu(hb) * hb2` |
 | `add(out, x)`                                                    | residual |

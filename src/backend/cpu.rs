@@ -105,6 +105,7 @@ impl Backend for CpuBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rope(
         &self,
         q: &mut [f32],
@@ -112,28 +113,31 @@ impl Backend for CpuBackend {
         pos: usize,
         head_size: usize,
         kv_dim: usize,
-        theta: f32,
+        inv_freq: &[f32],
+        mscale: f32,
     ) {
-        // Rotate consecutive (even, odd) pairs within each head by an angle
-        // that grows with position and shrinks with the pair's index in the
-        // head. Pairs below `kv_dim` rotate both q and k; the rest (extra query
-        // heads under grouped-query attention) rotate q only.
+        // Rotate consecutive (even, odd) pairs within each head, looking up the
+        // pair's precomputed inverse frequency. Pairs below `kv_dim` rotate both
+        // q and k; the rest (extra query heads under grouped-query attention)
+        // rotate q only. Pairs whose index is past `inv_freq.len()` (partial
+        // rotary) pass through unchanged.
         let dim = q.len();
         let mut i = 0;
         while i < dim {
-            let head_dim = i % head_size;
-            let freq = 1.0 / theta.powf(head_dim as f32 / head_size as f32);
-            let val = pos as f32 * freq;
-            let (fcr, fci) = (val.cos(), val.sin());
+            let pair = (i % head_size) / 2;
+            if pair < inv_freq.len() {
+                let val = pos as f32 * inv_freq[pair];
+                let (fcr, fci) = (val.cos() * mscale, val.sin() * mscale);
 
-            let (q0, q1) = (q[i], q[i + 1]);
-            q[i] = q0 * fcr - q1 * fci;
-            q[i + 1] = q0 * fci + q1 * fcr;
+                let (q0, q1) = (q[i], q[i + 1]);
+                q[i] = q0 * fcr - q1 * fci;
+                q[i + 1] = q0 * fci + q1 * fcr;
 
-            if i < kv_dim {
-                let (k0, k1) = (k[i], k[i + 1]);
-                k[i] = k0 * fcr - k1 * fci;
-                k[i + 1] = k0 * fci + k1 * fcr;
+                if i < kv_dim {
+                    let (k0, k1) = (k[i], k[i + 1]);
+                    k[i] = k0 * fcr - k1 * fci;
+                    k[i + 1] = k0 * fci + k1 * fcr;
+                }
             }
             i += 2;
         }
@@ -413,12 +417,20 @@ mod tests {
         approx(hb[0], 0.7310586 * 2.0);
     }
 
+    /// Base RoPE inverse frequencies for a full-rotary head: `θ^(-2j/head_size)`.
+    fn base_inv_freq(head_size: usize, theta: f32) -> Vec<f32> {
+        (0..head_size / 2)
+            .map(|j| (theta as f64).powf(-2.0 * j as f64 / head_size as f64) as f32)
+            .collect()
+    }
+
     #[test]
     fn rope_pos_zero_is_identity() {
         let mut q = [1.0, 2.0, 3.0, 4.0];
         let mut k = [5.0, 6.0, 7.0, 8.0];
         let before = (q, k);
-        CpuBackend.rope(&mut q, &mut k, 0, 4, 4, 10000.0);
+        let inv = base_inv_freq(4, 10000.0);
+        CpuBackend.rope(&mut q, &mut k, 0, 4, 4, &inv, 1.0);
         assert_eq!(q, before.0);
         assert_eq!(k, before.1);
     }
@@ -429,7 +441,8 @@ mod tests {
         // (independent of theta since the exponent is 0).
         let mut q = [1.0, 0.0];
         let mut k = [1.0, 0.0];
-        CpuBackend.rope(&mut q, &mut k, 1, 2, 2, 10000.0);
+        let inv = base_inv_freq(2, 10000.0);
+        CpuBackend.rope(&mut q, &mut k, 1, 2, 2, &inv, 1.0);
         approx(q[0], 1.0f32.cos());
         approx(q[1], 1.0f32.sin());
     }
@@ -441,7 +454,8 @@ mod tests {
         let rotate = |theta: f32| {
             let mut q = [0.0, 0.0, 1.0, 0.0];
             let mut k = q;
-            CpuBackend.rope(&mut q, &mut k, 1, 4, 4, theta);
+            let inv = base_inv_freq(4, theta);
+            CpuBackend.rope(&mut q, &mut k, 1, 4, 4, &inv, 1.0);
             (q[2], q[3])
         };
         let (a_cos, _) = rotate(10000.0);
@@ -449,6 +463,46 @@ mod tests {
         approx(a_cos, (1.0f32 / 10000.0f32.sqrt()).cos());
         approx(b_cos, (1.0f32 / 100.0f32.sqrt()).cos());
         assert!((a_cos - b_cos).abs() > 1e-4);
+    }
+
+    #[test]
+    fn rope_linear_scaling_halves_angle() {
+        // A linearly-scaled table divides every frequency (hence every angle)
+        // by `factor`. With factor 2 at pos 1, the head_dim-0 pair rotates by
+        // 0.5 rad instead of 1.0.
+        let mut q = [1.0, 0.0];
+        let mut k = [1.0, 0.0];
+        let inv: Vec<f32> = base_inv_freq(2, 10000.0).iter().map(|f| f / 2.0).collect();
+        CpuBackend.rope(&mut q, &mut k, 1, 2, 2, &inv, 1.0);
+        approx(q[0], 0.5f32.cos());
+        approx(q[1], 0.5f32.sin());
+    }
+
+    #[test]
+    fn rope_mscale_scales_magnitude() {
+        // YaRN's mscale multiplies cos/sin, so the rotated vector's magnitude
+        // grows by `mscale`.
+        let mut q = [1.0, 0.0];
+        let mut k = [1.0, 0.0];
+        let inv = base_inv_freq(2, 10000.0);
+        CpuBackend.rope(&mut q, &mut k, 1, 2, 2, &inv, 2.0);
+        approx(q[0], 2.0 * 1.0f32.cos());
+        approx(q[1], 2.0 * 1.0f32.sin());
+    }
+
+    #[test]
+    fn rope_partial_rotary_leaves_tail_untouched() {
+        // Only the first pair of each size-4 head is rotated (inv_freq has one
+        // entry); the second pair passes through unchanged.
+        let mut q = [1.0, 0.0, 7.0, 9.0];
+        let mut k = [1.0, 0.0, 7.0, 9.0];
+        let inv = vec![1.0f32]; // rotary_dim = 2 of head_size 4
+        CpuBackend.rope(&mut q, &mut k, 1, 4, 4, &inv, 1.0);
+        approx(q[0], 1.0f32.cos());
+        approx(q[1], 1.0f32.sin());
+        // Untouched tail.
+        approx(q[2], 7.0);
+        approx(q[3], 9.0);
     }
 
     #[test]

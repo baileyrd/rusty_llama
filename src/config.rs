@@ -1,6 +1,56 @@
 //! Model hyper-parameters and checkpoint header parsing.
 
+use std::f64::consts::PI;
+
 use crate::error::{Error, Result};
+
+/// RoPE long-context scaling, as carried in GGUF `{arch}.rope.scaling.*`.
+///
+/// Each variant rewrites the per-dimension rotary frequencies (and, for YaRN,
+/// an attention magnitude scale) at load time; see [`Config::rope_table`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RopeScaling {
+    /// No scaling — the plain `base^(-2j/d)` frequencies.
+    #[default]
+    None,
+    /// Linear (a.k.a. "position interpolation"): divide every frequency by
+    /// `factor`, equivalently stretch positions by `factor`.
+    Linear { factor: f32 },
+    /// Llama-3.1 piecewise rescaling: low-frequency dims are divided by
+    /// `factor`, high-frequency dims are kept, and a band in between is
+    /// smoothly interpolated.
+    Llama3 {
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        orig_ctx: usize,
+    },
+    /// YaRN (NTK-by-parts): per-dim blend of extrapolated and interpolated
+    /// frequencies plus an attention magnitude scale folded into RoPE.
+    Yarn {
+        factor: f32,
+        orig_ctx: usize,
+        /// Extra attention scale (GGUF `rope.scaling.attn_factor`, usually 1).
+        attn_factor: f32,
+        /// NTK ramp endpoints (llama.cpp defaults: 32 / 1).
+        beta_fast: f32,
+        beta_slow: f32,
+    },
+}
+
+/// Precomputed RoPE rotation table: one inverse frequency per rotated pair,
+/// plus a scalar magnitude applied to the rotation (1.0 unless YaRN).
+///
+/// `inv_freq.len()` is the number of *rotated* pairs (`rope_dim / 2`), which is
+/// `head_size / 2` for the usual full-rotary models and fewer for partial
+/// rotary — the backend leaves the remaining pairs untouched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RopeTable {
+    /// Inverse frequency per rotated `(even, odd)` pair.
+    pub inv_freq: Vec<f32>,
+    /// Magnitude scale folded into `cos`/`sin` (YaRN's `mscale`; else 1.0).
+    pub mscale: f32,
+}
 
 /// Transformer hyper-parameters.
 ///
@@ -31,6 +81,12 @@ pub struct Config {
     pub rope_freq_base: f32,
     /// RMSNorm epsilon.
     pub rms_eps: f32,
+    /// Number of dimensions per head that RoPE rotates. `0` means "full
+    /// rotary" (`= head_size`); a smaller value selects partial rotary, leaving
+    /// the trailing dimensions of each head unrotated.
+    pub rope_dim: usize,
+    /// RoPE long-context frequency scaling (none for short-context models).
+    pub rope_scaling: RopeScaling,
 }
 
 impl Default for Config {
@@ -46,6 +102,8 @@ impl Default for Config {
             shared_weights: true,
             rope_freq_base: 10000.0,
             rms_eps: 1e-5,
+            rope_dim: 0,
+            rope_scaling: RopeScaling::None,
         }
     }
 }
@@ -70,6 +128,98 @@ impl Config {
     #[inline]
     pub fn kv_mul(&self) -> usize {
         self.n_heads / self.n_kv_heads
+    }
+
+    /// Number of dimensions RoPE rotates per head (`rope_dim`, or the full
+    /// `head_size` when `rope_dim == 0`).
+    #[inline]
+    pub fn rotary_dim(&self) -> usize {
+        if self.rope_dim == 0 {
+            self.head_size()
+        } else {
+            self.rope_dim
+        }
+    }
+
+    /// Precompute the RoPE rotation table for this config (see [`RopeTable`]).
+    ///
+    /// The base frequency of rotated pair `j` is `θ^(-2j/rotary_dim)`; the
+    /// configured [`RopeScaling`] then rewrites those frequencies (and, for
+    /// YaRN, the magnitude scale). The math mirrors llama.cpp's `rope_yarn` /
+    /// HF's `_compute_*_parameters`.
+    pub fn rope_table(&self) -> RopeTable {
+        let rot = self.rotary_dim();
+        let half = rot / 2;
+        let base = self.rope_freq_base as f64;
+        let mut inv_freq: Vec<f32> = (0..half)
+            .map(|j| base.powf(-2.0 * j as f64 / rot as f64) as f32)
+            .collect();
+        let mut mscale = 1.0f32;
+
+        match self.rope_scaling {
+            RopeScaling::None => {}
+            RopeScaling::Linear { factor } => {
+                let s = 1.0 / factor as f64;
+                for f in &mut inv_freq {
+                    *f = (*f as f64 * s) as f32;
+                }
+            }
+            RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                orig_ctx,
+            } => {
+                let (factor, lo, hi) =
+                    (factor as f64, low_freq_factor as f64, high_freq_factor as f64);
+                let low_wavelen = orig_ctx as f64 / lo;
+                let high_wavelen = orig_ctx as f64 / hi;
+                for f in &mut inv_freq {
+                    let freq = *f as f64;
+                    let wavelen = 2.0 * PI / freq;
+                    *f = if wavelen < high_wavelen {
+                        // High frequency: extrapolate (unchanged).
+                        freq as f32
+                    } else if wavelen > low_wavelen {
+                        // Low frequency: interpolate (divide by factor).
+                        (freq / factor) as f32
+                    } else {
+                        // Smooth blend across the medium band.
+                        let smooth = (orig_ctx as f64 / wavelen - lo) / (hi - lo);
+                        ((1.0 - smooth) * freq / factor + smooth * freq) as f32
+                    };
+                }
+            }
+            RopeScaling::Yarn {
+                factor,
+                orig_ctx,
+                attn_factor,
+                beta_fast,
+                beta_slow,
+            } => {
+                let freq_scale = 1.0 / factor as f64;
+                let n_dims = rot as f64;
+                // Correction range: which pair indices to blend (NTK-by-parts).
+                let corr = |n_rot: f64| {
+                    n_dims * (orig_ctx as f64 / (n_rot * 2.0 * PI)).ln() / (2.0 * base.ln())
+                };
+                let low = corr(beta_fast as f64).floor().max(0.0);
+                let high = corr(beta_slow as f64).ceil().min(n_dims - 1.0);
+                let denom = (high - low).max(0.001);
+                for (j, f) in inv_freq.iter_mut().enumerate() {
+                    let base_inv = *f as f64;
+                    // ramp = 1 at the high-freq end (extrapolate), 0 at the low
+                    // end (interpolate by freq_scale).
+                    let ramp = 1.0 - ((j as f64 - low) / denom).clamp(0.0, 1.0);
+                    let mult = freq_scale * (1.0 - ramp) + ramp;
+                    *f = (base_inv * mult) as f32;
+                }
+                // Magnitude correction for the interpolation (ext_factor != 0).
+                mscale = attn_factor * (1.0 + 0.1 * (factor as f64).ln()) as f32;
+            }
+        }
+
+        RopeTable { inv_freq, mscale }
     }
 
     /// Parse the 7-`int32` little-endian header at the start of a checkpoint.
@@ -154,5 +304,95 @@ fn nonneg(v: i32, name: &str) -> Result<usize> {
         Err(Error::Format(format!("{name} must be positive, got {v}")))
     } else {
         Ok(v as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config whose head is 8-wide (one head), giving 4 rotated pairs with
+    /// the tidy base frequencies `[1, 0.1, 0.01, 0.001]` at θ = 10000.
+    fn cfg(rope_scaling: RopeScaling) -> Config {
+        Config {
+            dim: 8,
+            hidden_dim: 8,
+            n_layers: 1,
+            n_heads: 1,
+            n_kv_heads: 1,
+            vocab_size: 8,
+            seq_len: 16,
+            rope_freq_base: 10000.0,
+            rope_scaling,
+            ..Default::default()
+        }
+    }
+
+    /// Assert two frequency tables match within f32 tolerance.
+    fn approx_slice(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "length: {got:?} vs {want:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!(
+                (g - w).abs() <= 1e-6 * w.abs().max(1.0) + 1e-9,
+                "got {g}, want {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn rope_table_no_scaling_is_base_freqs() {
+        let t = cfg(RopeScaling::None).rope_table();
+        approx_slice(&t.inv_freq, &[1.0, 0.1, 0.01, 0.001]);
+        assert_eq!(t.mscale, 1.0);
+    }
+
+    #[test]
+    fn rope_table_linear_divides_freqs() {
+        // factor 4 -> every frequency / 4.
+        let t = cfg(RopeScaling::Linear { factor: 4.0 }).rope_table();
+        approx_slice(&t.inv_freq, &[0.25, 0.025, 0.0025, 0.00025]);
+        assert_eq!(t.mscale, 1.0);
+    }
+
+    #[test]
+    fn rope_table_llama3_piecewise() {
+        // Tuned so all three branches fire: j0/j1 kept (high freq), j2 smoothly
+        // blended (medium band), j3 divided by factor (low freq). Expected
+        // values cross-checked against the HF llama3 formula in Python.
+        let t = cfg(RopeScaling::Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 8.0,
+            orig_ctx: 2000,
+        })
+        .rope_table();
+        approx_slice(&t.inv_freq, &[1.0, 0.1, 0.003_978_873_6, 0.000_125]);
+        assert_eq!(t.mscale, 1.0);
+    }
+
+    #[test]
+    fn rope_table_yarn_ntk_and_mscale() {
+        // factor 4 over a 2048 original context: j0/j1 extrapolate (kept), j2 is
+        // blended, j3 fully interpolated (* freq_scale = 1/4). mscale folds in
+        // the magnitude correction. Values cross-checked in Python.
+        let t = cfg(RopeScaling::Yarn {
+            factor: 4.0,
+            orig_ctx: 2048,
+            attn_factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        })
+        .rope_table();
+        approx_slice(&t.inv_freq, &[1.0, 0.1, 0.00625, 0.00025]);
+        assert!((t.mscale - 1.138_629_4).abs() < 1e-6, "mscale {}", t.mscale);
+    }
+
+    #[test]
+    fn rope_table_partial_rotary_shortens_table() {
+        // Rotate only 4 of the 8 head dims -> 2 pairs, frequencies base^(-2j/4).
+        let mut c = cfg(RopeScaling::None);
+        c.rope_dim = 4;
+        let t = c.rope_table();
+        approx_slice(&t.inv_freq, &[1.0, 0.01]);
     }
 }

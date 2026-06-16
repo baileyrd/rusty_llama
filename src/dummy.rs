@@ -4,7 +4,7 @@
 //! without downloading multi-megabyte weights. The output is, of course,
 //! gibberish — the weights are deterministic noise.
 
-use crate::config::Config;
+use crate::config::{Config, RopeScaling};
 use crate::quant::GgmlType;
 use crate::tokenizer::Tokenizer;
 
@@ -165,6 +165,41 @@ impl GgufWriter {
     }
 }
 
+/// Emit the `llama.rope.scaling.*` metadata keys for a [`RopeScaling`].
+fn emit_rope_scaling(meta: &mut GgufWriter, scaling: RopeScaling) {
+    let k = "llama.rope.scaling.";
+    match scaling {
+        RopeScaling::None => {}
+        RopeScaling::Linear { factor } => {
+            meta.kv_str(&format!("{k}type"), "linear");
+            meta.kv_f32(&format!("{k}factor"), factor);
+        }
+        RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            orig_ctx,
+        } => {
+            meta.kv_str(&format!("{k}type"), "llama3");
+            meta.kv_f32(&format!("{k}factor"), factor);
+            meta.kv_f32(&format!("{k}low_freq_factor"), low_freq_factor);
+            meta.kv_f32(&format!("{k}high_freq_factor"), high_freq_factor);
+            meta.kv_u32(&format!("{k}original_context_length"), orig_ctx as u32);
+        }
+        RopeScaling::Yarn {
+            factor,
+            orig_ctx,
+            attn_factor,
+            ..
+        } => {
+            meta.kv_str(&format!("{k}type"), "yarn");
+            meta.kv_f32(&format!("{k}factor"), factor);
+            meta.kv_f32(&format!("{k}attn_factor"), attn_factor);
+            meta.kv_u32(&format!("{k}original_context_length"), orig_ctx as u32);
+        }
+    }
+}
+
 /// Which embedded tokenizer the synthetic GGUF carries.
 #[derive(Clone, Copy)]
 enum TokKind {
@@ -269,7 +304,8 @@ fn build_gguf(config: &Config, matmul_type: GgmlType, tok: TokKind) -> Vec<u8> {
     meta.kv_u32("llama.context_length", c.seq_len as u32);
     meta.kv_f32("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
     meta.kv_f32("llama.rope.freq_base", c.rope_freq_base);
-    meta.kv_u32("llama.rope.dimension_count", (c.dim / c.n_heads) as u32);
+    meta.kv_u32("llama.rope.dimension_count", c.rotary_dim() as u32);
+    emit_rope_scaling(&mut meta, c.rope_scaling);
     match tok {
         TokKind::Llama => {
             meta.kv_str("tokenizer.ggml.model", "llama");

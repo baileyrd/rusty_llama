@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use crate::backend::Backend;
-use crate::config::Config;
+use crate::config::{Config, RopeScaling, RopeTable};
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 use crate::quant::{dequantize, GgmlType};
@@ -51,6 +51,8 @@ pub struct Model<'a> {
     pub config: Config,
     /// Weight tensors.
     pub weights: Weights<'a>,
+    /// Precomputed RoPE rotation table (derived from `config` at load time).
+    pub rope: RopeTable,
 }
 
 impl<'a> Model<'a> {
@@ -98,6 +100,7 @@ impl<'a> Model<'a> {
         };
 
         Ok(Model {
+            rope: config.rope_table(),
             config,
             weights: Weights {
                 token_embedding_table: QMatrix::f32(
@@ -147,17 +150,20 @@ impl<'a> Model<'a> {
             .meta_f32(&key("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
 
-        // We only implement full rotary; reject partial-rotary models loudly
-        // rather than computing the wrong thing.
+        // RoPE rotary dimension. Defaults to the full head size; a smaller value
+        // (partial rotary) leaves each head's trailing dims unrotated.
         let head_size = if n_heads == 0 { 0 } else { dim / n_heads };
         let rope_dim = gguf
             .meta_u64(&key("rope.dimension_count"))
             .unwrap_or(head_size as u64) as usize;
-        if head_size != 0 && rope_dim != head_size {
+        if head_size != 0 && rope_dim > head_size {
             return Err(Error::Format(format!(
-                "partial rotary not supported: rope.dimension_count {rope_dim} != head_size {head_size}"
+                "rope.dimension_count {rope_dim} exceeds head_size {head_size}"
             )));
         }
+
+        // Long-context RoPE frequency scaling (linear / llama3 / yarn), if any.
+        let rope_scaling = read_rope_scaling(gguf, &arch)?;
 
         // Vocabulary size = second (row) dimension of the embedding tensor.
         let tok_embd = gguf
@@ -182,6 +188,8 @@ impl<'a> Model<'a> {
             shared_weights,
             rope_freq_base,
             rms_eps,
+            rope_dim,
+            rope_scaling,
         };
         config.validate()?;
 
@@ -208,6 +216,7 @@ impl<'a> Model<'a> {
         };
 
         Ok(Model {
+            rope: config.rope_table(),
             config,
             weights: Weights {
                 token_embedding_table,
@@ -225,6 +234,46 @@ impl<'a> Model<'a> {
             },
         })
     }
+}
+
+/// Read `{arch}.rope.scaling.*` into a [`RopeScaling`] (defaults to `None`).
+///
+/// Mirrors the keys llama.cpp writes: `type`, `factor`,
+/// `original_context_length`, `attn_factor`, and the llama3 band factors. YaRN
+/// `beta_fast`/`beta_slow` are runtime knobs without standard GGUF keys, so we
+/// use llama.cpp's defaults (32 / 1).
+fn read_rope_scaling(gguf: &Gguf, arch: &str) -> Result<RopeScaling> {
+    let key = |k: &str| format!("{arch}.rope.scaling.{k}");
+    let ty = match gguf.meta_str(&key("type")) {
+        Ok(t) => t.to_owned(),
+        Err(_) => return Ok(RopeScaling::None),
+    };
+    let factor = gguf.meta_f32(&key("factor")).unwrap_or(1.0);
+    let orig_ctx = gguf
+        .meta_u64(&key("original_context_length"))
+        .unwrap_or(0) as usize;
+    Ok(match ty.as_str() {
+        "none" => RopeScaling::None,
+        "linear" => RopeScaling::Linear { factor },
+        "llama3" => RopeScaling::Llama3 {
+            factor,
+            low_freq_factor: gguf.meta_f32(&key("low_freq_factor")).unwrap_or(1.0),
+            high_freq_factor: gguf.meta_f32(&key("high_freq_factor")).unwrap_or(4.0),
+            orig_ctx,
+        },
+        "yarn" => RopeScaling::Yarn {
+            factor,
+            orig_ctx,
+            attn_factor: gguf.meta_f32(&key("attn_factor")).unwrap_or(1.0),
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+        },
+        other => {
+            return Err(Error::Format(format!(
+                "unsupported rope.scaling.type '{other}' (have none/linear/llama3/yarn)"
+            )))
+        }
+    })
 }
 
 /// Slice a contiguous `(n_layers, rows, cols)` f32 buffer into per-layer f32
@@ -364,7 +413,8 @@ pub fn forward(
             pos,
             head_size,
             kv_dim,
-            p.rope_freq_base,
+            &model.rope.inv_freq,
+            model.rope.mscale,
         );
 
         backend.attention(
