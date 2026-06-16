@@ -1,0 +1,6 @@
+# Build for the machine we're compiling on so the f32 matmul / attention inner
+# loops autovectorize to AVX2 / AVX-512 / FMA. If you intend to copy the
+# resulting binary to a *different* machine, switch this to a portable baseline
+# such as "x86-64-v3" (AVX2) or remove the section entirely.
+[build]
+rustflags = ["-C", "target-cpu=native"]
