@@ -1,7 +1,7 @@
 //! End-to-end tests for the GGUF path: parse a synthetic GGUF file, load the
 //! weights/tokenizer, and run the forward pass.
 
-use rusty_llama::dummy::{synthetic_gguf, synthetic_gguf_typed};
+use rusty_llama::dummy::{synthetic_gguf, synthetic_gguf_gpt2, synthetic_gguf_typed};
 use rusty_llama::quant::dequantize;
 use rusty_llama::{
     forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RunState, Sampler, Tokenizer,
@@ -50,6 +50,49 @@ fn tokenizer_loads_from_gguf() {
     let tk = Tokenizer::from_gguf(&gguf).unwrap();
     assert_eq!(tk.vocab_size(), c.vocab_size);
     assert_eq!(tk.encode("", true, false), vec![1]); // just BOS
+}
+
+#[test]
+fn gpt2_tokenizer_loads_from_gguf() {
+    // A model whose embedded tokenizer is byte-level BPE (gpt2), vocab 256.
+    let c = Config {
+        dim: 32,
+        hidden_dim: 64,
+        n_layers: 2,
+        n_heads: 4,
+        n_kv_heads: 4,
+        vocab_size: 256,
+        seq_len: 8,
+        shared_weights: true,
+        ..Default::default()
+    };
+    let bytes = synthetic_gguf_gpt2(&c);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    assert_eq!(gguf.meta_str("tokenizer.ggml.model").unwrap(), "gpt2");
+
+    let tk = Tokenizer::from_gguf(&gguf).unwrap();
+    assert_eq!(tk.vocab_size(), 256);
+
+    // Byte-level encode → decode roundtrips arbitrary text.
+    let ids = tk.encode("Hi! 7", false, false);
+    let mut out = Vec::new();
+    for &id in &ids {
+        out.extend_from_slice(&tk.decode(0, id));
+    }
+    assert_eq!(out, b"Hi! 7");
+
+    // The model loads and runs with a gpt2-tokenizer file.
+    let model = Model::from_gguf(&gguf).unwrap();
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward(&model, &mut s, &backend, 5, 0);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
+
+    // The full generation loop works with byte-level BPE decode.
+    let mut sampler = Sampler::new(c.vocab_size, 0.0, 0.9, 1);
+    let mut st = RunState::new(&model.config);
+    let n = generate(&model, &mut st, &backend, &tk, &mut sampler, "hi", 4, |_| {});
+    assert!(n <= c.seq_len);
 }
 
 #[test]

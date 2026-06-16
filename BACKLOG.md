@@ -60,25 +60,26 @@ Q4_0, Q8_0, Q4_K, Q6_K.
 
 ---
 
-## 2. `gpt2` byte-level BPE tokenizer (+ RoPE long-context scaling)
+## 2. Finish modern-model tokenization / RoPE  (partially done)
 
-**Why deferred:** large, and hard to validate without a reference tokenizer /
-real model to download (both blocked in the cloud sandbox). *Does not* require a
-GPU — could be done anywhere with network access to a reference.
+**Done:** byte-level BPE (`gpt2`) tokenizer is implemented in
+[`src/tokenizer.rs`](src/tokenizer.rs) (`Bpe`): GPT-2 byte↔unicode mapping,
+rank-based merges from `tokenizer.ggml.merges`, and `Tokenizer::from_gguf`
+dispatches `llama`→SPM / `gpt2`→BPE. So Llama-3 / Qwen2 vocabularies load.
 
-Currently [`Tokenizer::from_gguf`](src/tokenizer.rs) only handles `llama`/SPM
-tokenizers (it rejects `tokenizer.ggml.model == "gpt2"`). Full Llama-3 / Qwen2
-support needs byte-level BPE:
-- GPT-2 byte↔unicode mapping; vocab tokens stored in that encoded form.
-- `tokenizer.ggml.merges` (ordered; merge by lowest rank, vs our current
-  score-based SPM merges).
-- Pre-tokenization regex split (Llama-3 / Qwen2 use specific patterns).
-- RoPE base θ is already read from GGUF (done); long-context **scaling**
-  (`rope_scaling` type `linear`/`yarn`/`llama3`) is still TODO in
-  `Model::from_gguf` (partial rotary is currently rejected outright).
-
-Validate against a known reference (HF `tokenizers` output) on a machine with
-network access.
+**Still TODO** (none of these needs a GPU — do it on a machine with network
+access to a reference tokenizer / small real model):
+- **Byte-exact pre-tokenizer.** `pretokenize_gpt2` is a hand-rolled
+  approximation of GPT-2's regex (contractions, letter/digit/punct runs,
+  whitespace). It does not byte-match Llama-3's / Qwen2's exact regex (which use
+  lookahead). Validate against HF `tokenizers` output and either fix the
+  hand-rolled splitter or pull in `fancy-regex` and use the model's
+  `tokenizer.ggml.pre` pattern.
+- **RoPE long-context scaling.** θ (`rope.freq_base`) is read; the scaling types
+  (`linear`/`yarn`/`llama3`) in `rope_scaling` are not. `Model::from_gguf`
+  currently rejects partial rotary outright — extend it.
+- **Special-token handling.** Added/control tokens (`<|...|>`) are decoded as
+  literal text and not recognized during encode. Add a special-token table.
 
 ---
 
