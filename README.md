@@ -3,10 +3,12 @@
 A small, from-scratch **Llama inference engine in Rust** — think "llama.cpp,
 the Rust way", built up one layer at a time so every piece is understandable.
 
-The first milestone runs [Karpathy llama2.c](https://github.com/karpathy/llama2.c)
-checkpoints (`stories15M.bin` and friends) on the CPU, with all the transformer
-math — RMSNorm, RoPE, grouped-query attention, a KV cache, SwiGLU, and the BPE
-tokenizer — written by hand. No `candle`, no `ggml` bindings.
+It runs both [Karpathy llama2.c](https://github.com/karpathy/llama2.c)
+checkpoints (`stories15M.bin` and friends) **and GGUF files** (llama.cpp's
+format, including quantized weights), on the CPU. All the transformer math —
+RMSNorm, RoPE, grouped-query attention, a KV cache, SwiGLU, the BPE tokenizer,
+and the quant block dequantizers — is written by hand. No `candle`, no `ggml`
+bindings.
 
 ## Quick start
 
@@ -18,12 +20,26 @@ tokenizer — written by hand. No `candle`, no `ggml` bindings.
 cargo run --release -- stories15M.bin -z tokenizer.bin -i "Once upon a time" -n 256
 ```
 
-No network? Try the pipeline with a randomly-weighted model (gibberish, but it
-proves the whole path works):
+### GGUF models
+
+GGUF files carry their own tokenizer, so no `-z` is needed — just point at the
+file (llama-architecture SentencePiece models such as Llama-2 / TinyLlama;
+weights may be F32/F16/Q4_0/Q8_0/Q4_K/Q6_K):
 
 ```sh
+cargo run --release -- TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf -i "The meaning of life is" -n 128
+```
+
+No network? Try the pipeline with a randomly-weighted model (gibberish, but it
+proves the whole path works). The output format is picked by extension:
+
+```sh
+# GGUF (self-contained, embedded tokenizer):
+cargo run --release --example make_dummy -- dummy.gguf
+cargo run --release -- dummy.gguf -i "hi" -n 16
+
+# llama2.c (needs a real tokenizer.bin for readable sub-words):
 cargo run --release --example make_dummy -- dummy.bin
-# (you still need a real tokenizer.bin for readable sub-words)
 cargo run --release -- dummy.bin -z tokenizer.bin -i "Once upon a time" -n 32
 ```
 
@@ -53,9 +69,11 @@ rusty_llama <checkpoint.bin> [options]
 | --------------- | ----------------------------------------------------------- |
 | `config`        | Parse the 7-`int32` checkpoint header into hyper-parameters |
 | `loader`        | `mmap` the checkpoint file (zero-copy weights)              |
-| `model`         | Weight layout, KV-cache scratch, and the `forward` pass     |
+| `gguf`          | Parse the GGUF container (metadata + tensor table)          |
+| `quant`         | GGML type table + dequantizers (Q4_0/Q8_0/Q4_K/Q6_K/F16)    |
+| `model`         | Weight layout, KV-cache scratch, `forward`, and `from_gguf` |
 | `backend`       | `Backend` trait + `CpuBackend` (rayon + autovectorized SIMD)|
-| `tokenizer`     | SentencePiece-style BPE encode/decode                       |
+| `tokenizer`     | SentencePiece-style BPE encode/decode (from `.bin` or GGUF) |
 | `sampler`       | Greedy / temperature / top-p sampling                       |
 
 The forward pass only ever calls `Backend` methods (`matmul`, `rmsnorm`,
@@ -82,10 +100,11 @@ and that greedy generation reproduces.
 ## Roadmap
 
 - [x] llama2.c fp32 checkpoints, CPU backend, BPE tokenizer, sampling
-- [ ] GGUF container + quantized weights (Q8_0, Q4_K, …)
+- [x] GGUF container + quantized weights (F16, Q4_0, Q8_0, Q4_K, Q6_K) + GGUF SPM tokenizer
+- [ ] On-the-fly quantized matmul (keep weights compressed in RAM instead of dequantizing up front)
 - [ ] Explicit SIMD kernels & quantized dot-products
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
-- [ ] Chat templating / instruction models
+- [ ] Llama-3 (RoPE θ / scaling), byte-level BPE (`gpt2`) tokenizers, chat templating
 
 ## Credits
 
