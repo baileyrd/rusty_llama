@@ -8,6 +8,7 @@ repository = "https://github.com/baileyrd/rusty_llama"
 readme = "README.md"
 
 [dependencies]
+fancy-regex = "0.18.0"
 memmap2 = "0.9"
 rayon = "1"
 
