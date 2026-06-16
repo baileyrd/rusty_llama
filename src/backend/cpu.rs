@@ -10,7 +10,10 @@ use rayon::prelude::*;
 
 use crate::backend::Backend;
 use crate::math::{silu, softmax};
-use crate::quant::{dequant_block, GgmlType, MAX_BLOCK};
+use crate::quant::{
+    dequant_block, has_int8_path, quantize_activation_q8, vec_dot_q4_0, vec_dot_q8_0, GgmlType,
+    Q8Activation, MAX_BLOCK,
+};
 use crate::tensor::QMatrix;
 
 /// Dot product of one quantized weight row (decompressed block by block) with
@@ -67,9 +70,24 @@ impl Backend for CpuBackend {
             }
             QMatrix::Quant { ty, data, cols, .. } => {
                 let rb = ty.bytes_for(*cols);
-                out.par_iter_mut().enumerate().for_each(|(i, o)| {
-                    *o = dot_quant_row(*ty, &data[i * rb..i * rb + rb], x);
-                });
+                if has_int8_path(*ty) {
+                    // Fast path: quantize the activation once, then do integer
+                    // block dot products per row.
+                    let act = quantize_activation_q8(x);
+                    let dot: fn(&[u8], &Q8Activation) -> f32 = match ty {
+                        GgmlType::Q8_0 => vec_dot_q8_0,
+                        GgmlType::Q4_0 => vec_dot_q4_0,
+                        _ => unreachable!(),
+                    };
+                    out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                        *o = dot(&data[i * rb..i * rb + rb], &act);
+                    });
+                } else {
+                    // k-quants (Q4_K/Q6_K) and F16: dequantize each block to f32.
+                    out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                        *o = dot_quant_row(*ty, &data[i * rb..i * rb + rb], x);
+                    });
+                }
             }
         }
     }
@@ -204,6 +222,46 @@ mod tests {
         let exact1: f32 = row1.iter().zip(&x).map(|(a, b)| a * b).sum();
         assert!((out[0] - exact0).abs() < 0.1, "{} vs {}", out[0], exact0);
         assert!((out[1] - exact1).abs() < 0.1, "{} vs {}", out[1], exact1);
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_q8_0_matmul() {
+        use crate::quant::{quantize_activation_q8, quantize_q8_0, vec_dot_q8_0};
+        use std::time::Instant;
+
+        let (rows, cols, iters) = (2048usize, 2048usize, 10);
+        let wf: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.01)
+            .collect();
+        let wbytes = quantize_q8_0(&wf);
+        let rb = GgmlType::Q8_0.bytes_for(cols);
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+
+        let mut sink = 0.0f32;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += dot_quant_row(GgmlType::Q8_0, &wbytes[i * rb..i * rb + rb], &x);
+            }
+        }
+        let dequant = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            let act = quantize_activation_q8(&x);
+            for i in 0..rows {
+                sink += vec_dot_q8_0(&wbytes[i * rb..i * rb + rb], &act);
+            }
+        }
+        let int8 = t1.elapsed();
+
+        eprintln!(
+            "Q8_0 {rows}x{cols} x{iters}: dequant={dequant:?} int8={int8:?} \
+             speedup={:.2}x (sink={sink})",
+            dequant.as_secs_f64() / int8.as_secs_f64()
+        );
     }
 
     #[test]
