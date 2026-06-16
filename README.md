@@ -22,9 +22,9 @@ cargo run --release -- stories15M.bin -z tokenizer.bin -i "Once upon a time" -n 
 
 ### GGUF models
 
-GGUF files carry their own tokenizer, so no `-z` is needed — just point at the
-file (llama-architecture SentencePiece models such as Llama-2 / TinyLlama;
-weights may be F32/F16/Q4_0/Q8_0/Q4_K/Q6_K):
+GGUF files carry their own tokenizer (SentencePiece for `llama` models, GPT-2
+byte-level BPE for `gpt2` models such as Llama-3 / Qwen2), so no `-z` is needed
+— just point at the file (weights may be F32/F16/Q4_0/Q8_0/Q4_K/Q6_K):
 
 ```sh
 cargo run --release -- TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf -i "The meaning of life is" -n 128
@@ -74,7 +74,7 @@ rusty_llama <checkpoint.bin> [options]
 | `tensor`        | `QMatrix`: an f32-or-quantized weight matrix, dequantized on demand |
 | `model`         | Weight layout, KV-cache scratch, `forward`, and `from_gguf` |
 | `backend`       | `Backend` trait + `CpuBackend` (rayon; f32 + on-the-fly quant matmul) |
-| `tokenizer`     | SentencePiece-style BPE encode/decode (from `.bin` or GGUF) |
+| `tokenizer`     | SentencePiece (SPM) + GPT-2 byte-level BPE encode/decode    |
 | `sampler`       | Greedy / temperature / top-p sampling                       |
 
 The forward pass only ever calls `Backend` methods (`matmul`, `rmsnorm`,
@@ -113,7 +113,8 @@ and that greedy generation reproduces.
 - [x] On-the-fly quantized matmul — weights stay compressed in RAM (mmap), dequantized per block
 - [x] Integer (Q8 / Q8_K) activation fast path for Q8_0/Q4_0/Q4_K/Q6_K matmuls (~3× over per-block dequant)
 - [x] Per-model RoPE base (θ) and RMSNorm epsilon read from GGUF (Llama-3 / Qwen2 θ honoured)
-- [ ] Byte-level BPE (`gpt2`) tokenizer + RoPE long-context scaling → full Llama-3 / Qwen2 support
+- [x] Byte-level BPE (`gpt2`) tokenizer — Llama-3 / Qwen2 vocabularies load
+- [ ] RoPE long-context scaling (`linear`/`yarn`/`llama3`) + byte-exact pretokenizer regex
 - [ ] Explicit SIMD intrinsics (e.g. AVX-512 VNNI) for the integer dot products
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
 

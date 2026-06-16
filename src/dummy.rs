@@ -165,10 +165,17 @@ impl GgufWriter {
     }
 }
 
+/// Which embedded tokenizer the synthetic GGUF carries.
+#[derive(Clone, Copy)]
+enum TokKind {
+    Llama,
+    Gpt2,
+}
+
 /// Serialize a synthetic GGUF `llama` model with F32 weights and a dummy
-/// tokenizer, in the layout [`crate::Model::from_gguf`] expects.
+/// (SentencePiece) tokenizer, in the layout [`crate::Model::from_gguf`] expects.
 pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
-    synthetic_gguf_typed(config, GgmlType::F32)
+    build_gguf(config, GgmlType::F32, TokKind::Llama)
 }
 
 /// Like [`synthetic_gguf`] but stores the 2-D matmul weights in `matmul_type`
@@ -177,6 +184,16 @@ pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
 ///
 /// `config.shared_weights` is honoured (no `output.weight` when shared).
 pub fn synthetic_gguf_typed(config: &Config, matmul_type: GgmlType) -> Vec<u8> {
+    build_gguf(config, matmul_type, TokKind::Llama)
+}
+
+/// A synthetic GGUF carrying a `gpt2` byte-level BPE tokenizer (all 256 byte
+/// tokens, no merges). Requires `config.vocab_size == 256`.
+pub fn synthetic_gguf_gpt2(config: &Config) -> Vec<u8> {
+    build_gguf(config, GgmlType::F32, TokKind::Gpt2)
+}
+
+fn build_gguf(config: &Config, matmul_type: GgmlType, tok: TokKind) -> Vec<u8> {
     let c = config;
     // 2-D tensors carry the (possibly quantized) matmul weights; 1-D norm
     // vectors stay full precision.
@@ -241,7 +258,6 @@ pub fn synthetic_gguf_typed(config: &Config, matmul_type: GgmlType) -> Vec<u8> {
     }
 
     // Metadata.
-    let tokens = dummy_tokens(c.vocab_size);
     let mut meta = GgufWriter::default();
     meta.kv_str("general.architecture", "llama");
     meta.kv_u32("general.alignment", GGUF_ALIGNMENT as u32);
@@ -254,9 +270,23 @@ pub fn synthetic_gguf_typed(config: &Config, matmul_type: GgmlType) -> Vec<u8> {
     meta.kv_f32("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
     meta.kv_f32("llama.rope.freq_base", c.rope_freq_base);
     meta.kv_u32("llama.rope.dimension_count", (c.dim / c.n_heads) as u32);
-    meta.kv_str("tokenizer.ggml.model", "llama");
-    meta.kv_str_array("tokenizer.ggml.tokens", &tokens);
-    meta.kv_f32_array("tokenizer.ggml.scores", &vec![0.0; c.vocab_size]);
+    match tok {
+        TokKind::Llama => {
+            meta.kv_str("tokenizer.ggml.model", "llama");
+            meta.kv_str_array("tokenizer.ggml.tokens", &dummy_tokens(c.vocab_size));
+            meta.kv_f32_array("tokenizer.ggml.scores", &vec![0.0; c.vocab_size]);
+        }
+        TokKind::Gpt2 => {
+            let tokens: Vec<Vec<u8>> = crate::tokenizer::gpt2_byte_tokens()
+                .into_iter()
+                .map(String::into_bytes)
+                .collect();
+            assert_eq!(tokens.len(), c.vocab_size, "gpt2 dummy needs vocab_size == 256");
+            meta.kv_str("tokenizer.ggml.model", "gpt2");
+            meta.kv_str_array("tokenizer.ggml.tokens", &tokens);
+            meta.kv_str_array("tokenizer.ggml.merges", &[]); // no merges
+        }
+    }
     meta.kv_u32("tokenizer.ggml.bos_token_id", 1);
     meta.kv_u32("tokenizer.ggml.eos_token_id", 2);
 

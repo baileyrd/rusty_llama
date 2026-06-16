@@ -1,15 +1,18 @@
-//! SentencePiece-style BPE tokenizer, matching the llama2.c `tokenizer.bin`.
+//! Tokenizers.
 //!
-//! The file format is:
+//! Two flavours, behind one [`Tokenizer`] enum:
+//!
+//! * [`Spm`] — the SentencePiece-style tokenizer used by llama2.c
+//!   `tokenizer.bin` and `llama`-architecture GGUF files (Llama-2, TinyLlama).
+//!   Greedy score-based merges with byte fallback.
+//! * [`Bpe`] — GPT-2 style byte-level BPE used by `gpt2`-tokenizer GGUF files
+//!   (Llama-3, Qwen2, …). Rank-based merges over a byte→unicode encoding.
+//!
+//! `tokenizer.bin` format (SPM):
 //! ```text
 //! int32  max_token_length
-//! repeat vocab_size times:
-//!     float32  score
-//!     int32    length
-//!     u8[length] piece bytes
+//! repeat vocab_size times: float32 score | int32 len | u8[len] piece
 //! ```
-//! Tokens 0/1/2 are `<unk>`/`<s>`(BOS)/`</s>`(EOS); ids 3..=258 are the raw
-//! byte fallbacks `<0x00>`..=`<0xFF>`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,8 +20,79 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::gguf::{Gguf, MetaValue};
 
-/// A trained BPE vocabulary plus the merge logic to apply it.
-pub struct Tokenizer {
+/// A tokenizer: either SentencePiece-style (SPM) or byte-level BPE.
+pub enum Tokenizer {
+    /// SentencePiece-style (llama2.c / `llama` GGUF).
+    Spm(Spm),
+    /// GPT-2 byte-level BPE (`gpt2` GGUF). Boxed — it's much larger than `Spm`.
+    Bpe(Box<Bpe>),
+}
+
+impl Tokenizer {
+    /// Build an SPM tokenizer directly from pieces and merge scores.
+    pub fn from_vocab(vocab: Vec<Vec<u8>>, scores: Vec<f32>) -> Self {
+        Tokenizer::Spm(Spm::from_vocab(vocab, scores))
+    }
+
+    /// Build a BPE tokenizer from encoded tokens and ordered merges.
+    pub fn from_bpe(
+        tokens: Vec<String>,
+        merges: Vec<(String, String)>,
+        bos: Option<usize>,
+        eos: Option<usize>,
+    ) -> Self {
+        Tokenizer::Bpe(Box::new(Bpe::new(tokens, merges, bos, eos)))
+    }
+
+    /// Load an SPM `tokenizer.bin` with exactly `vocab_size` entries.
+    pub fn load<P: AsRef<Path>>(path: P, vocab_size: usize) -> Result<Self> {
+        Ok(Tokenizer::Spm(Spm::load(path, vocab_size)?))
+    }
+
+    /// Build a tokenizer from a GGUF file, dispatching on
+    /// `tokenizer.ggml.model` (`llama` → SPM, `gpt2` → byte-level BPE).
+    pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let model = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
+        match model {
+            "llama" => Ok(Tokenizer::Spm(Spm::from_gguf(gguf)?)),
+            "gpt2" => Ok(Tokenizer::Bpe(Box::new(Bpe::from_gguf(gguf)?))),
+            other => Err(Error::Format(format!(
+                "unsupported GGUF tokenizer model '{other}' (have 'llama'/SPM, 'gpt2'/BPE)"
+            ))),
+        }
+    }
+
+    /// Encode `text` into token ids, optionally bracketing with BOS/EOS.
+    pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<usize> {
+        match self {
+            Tokenizer::Spm(t) => t.encode(text, bos, eos),
+            Tokenizer::Bpe(t) => t.encode(text, bos, eos),
+        }
+    }
+
+    /// Decode `token` (preceded by `prev_token`) into the bytes to emit.
+    pub fn decode(&self, prev_token: usize, token: usize) -> Vec<u8> {
+        match self {
+            Tokenizer::Spm(t) => t.decode(prev_token, token),
+            Tokenizer::Bpe(t) => t.decode(token),
+        }
+    }
+
+    /// Vocabulary size.
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            Tokenizer::Spm(t) => t.vocab_size(),
+            Tokenizer::Bpe(t) => t.vocab_size(),
+        }
+    }
+}
+
+// ===========================================================================
+// SentencePiece-style tokenizer
+// ===========================================================================
+
+/// A trained SentencePiece-style vocabulary plus the merge logic to apply it.
+pub struct Spm {
     vocab: Vec<Vec<u8>>,
     scores: Vec<f32>,
     lookup: HashMap<Vec<u8>, usize>,
@@ -26,11 +100,8 @@ pub struct Tokenizer {
     max_token_length: usize,
 }
 
-impl Tokenizer {
-    /// Build a tokenizer directly from pieces and their merge scores.
-    ///
-    /// Mostly useful for tests and synthetic models; real models go through
-    /// [`Tokenizer::load`].
+impl Spm {
+    /// Build from pieces and their merge scores.
     pub fn from_vocab(vocab: Vec<Vec<u8>>, scores: Vec<f32>) -> Self {
         assert_eq!(vocab.len(), scores.len());
         let max_token_length = vocab.iter().map(Vec::len).max().unwrap_or(0);
@@ -39,7 +110,7 @@ impl Tokenizer {
             .enumerate()
             .map(|(i, piece)| (piece.clone(), i))
             .collect();
-        Tokenizer {
+        Spm {
             vocab,
             scores,
             lookup,
@@ -86,26 +157,16 @@ impl Tokenizer {
             p += len;
         }
 
-        let mut tk = Tokenizer::from_vocab(vocab, scores);
+        let mut tk = Spm::from_vocab(vocab, scores);
         tk.max_token_length = max_token_length;
         Ok(tk)
     }
 
-    /// Build a tokenizer from a GGUF file's embedded SentencePiece vocabulary.
+    /// Build from a GGUF file's embedded SentencePiece vocabulary.
     ///
-    /// Reads `tokenizer.ggml.tokens` and `tokenizer.ggml.scores`, converting the
-    /// SentencePiece whitespace marker `▁` (U+2581) to a plain space so the same
-    /// encode/decode logic as the llama2.c `tokenizer.bin` path applies. This
-    /// handles `llama`/SPM tokenizers (Llama-2, TinyLlama); byte-level BPE
-    /// (`gpt2`) tokenizers are not yet supported.
+    /// Converts the whitespace marker `▁` (U+2581) to a plain space so the same
+    /// encode/decode logic as the `tokenizer.bin` path applies.
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
-        if let Ok(model) = gguf.meta_str("tokenizer.ggml.model") {
-            if model != "llama" {
-                return Err(Error::Format(format!(
-                    "unsupported GGUF tokenizer model '{model}' (only 'llama'/SPM)"
-                )));
-            }
-        }
         let tokens = match gguf.meta("tokenizer.ggml.tokens") {
             Some(MetaValue::Array(a)) => a,
             _ => return Err(Error::Format("GGUF missing tokenizer.ggml.tokens".into())),
@@ -121,40 +182,33 @@ impl Tokenizer {
 
         let scores = match gguf.meta("tokenizer.ggml.scores") {
             Some(MetaValue::Array(a)) => a.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect(),
-            _ => vec![0.0; vocab.len()], // some models omit scores
+            _ => vec![0.0; vocab.len()],
         };
 
-        Ok(Tokenizer::from_vocab(vocab, scores))
+        Ok(Spm::from_vocab(vocab, scores))
     }
 
-    /// Encode `text` into token ids, optionally bracketing with BOS/EOS.
-    ///
-    /// Follows SentencePiece's defaults: a dummy leading space is prepended,
-    /// bytes that aren't in the vocabulary fall back to byte tokens, and pairs
-    /// are greedily merged by descending score.
+    /// Encode following SentencePiece defaults: dummy leading space, byte
+    /// fallback, and greedy highest-score adjacent merges.
     pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<usize> {
         let mut tokens: Vec<usize> = Vec::new();
 
         if bos {
             tokens.push(1);
         }
-        // SentencePiece prepends a space to the input (`add_dummy_prefix`).
         if !text.is_empty() {
             if let Some(&id) = self.lookup.get(b" ".as_slice()) {
                 tokens.push(id);
             }
         }
 
-        // Map each Unicode scalar to a token, or fall back to its raw bytes.
         let mut buf = [0u8; 4];
         for ch in text.chars() {
             let piece = ch.encode_utf8(&mut buf).as_bytes();
             if let Some(&id) = self.lookup.get(piece) {
                 tokens.push(id);
             } else {
-                // Byte fallback: byte value `b` lives at vocab id `b + 3`.
-                // Real Llama vocabularies always contain those tokens; guard
-                // anyway so a small/odd vocab can't index out of bounds.
+                // Byte fallback: byte `b` lives at vocab id `b + 3`.
                 for &b in piece {
                     let id = b as usize + 3;
                     tokens.push(if id < self.vocab.len() { id } else { 0 });
@@ -162,7 +216,6 @@ impl Tokenizer {
             }
         }
 
-        // Greedily merge the highest-scoring adjacent pair until none remain.
         loop {
             let mut best_score = f32::NEG_INFINITY;
             let mut best = None;
@@ -191,14 +244,10 @@ impl Tokenizer {
         tokens
     }
 
-    /// Decode `token` (preceded by `prev_token`) into the bytes to emit.
-    ///
-    /// Strips the leading space SentencePiece adds after BOS, and turns raw
-    /// byte tokens (`<0xXX>`) back into the single byte they represent.
+    /// Decode, stripping the leading space after BOS and expanding `<0xXX>`.
     pub fn decode(&self, prev_token: usize, token: usize) -> Vec<u8> {
         let piece = &self.vocab[token];
         let mut bytes: &[u8] = piece;
-        // After BOS, drop a single leading space (sentencepiece convention).
         if prev_token == 1 && bytes.first() == Some(&b' ') {
             bytes = &bytes[1..];
         }
@@ -214,8 +263,7 @@ impl Tokenizer {
     }
 }
 
-/// Convert a SentencePiece piece to the byte form this tokenizer uses,
-/// replacing the `▁` whitespace marker (U+2581) with a regular space.
+/// Convert a SentencePiece piece to bytes, replacing `▁` (U+2581) with a space.
 fn normalize_spm_piece(s: &str) -> Vec<u8> {
     s.replace('\u{2581}', " ").into_bytes()
 }
@@ -231,11 +279,305 @@ fn parse_byte_token(bytes: &[u8]) -> Option<u8> {
     }
 }
 
+// ===========================================================================
+// GPT-2 byte-level BPE tokenizer
+// ===========================================================================
+
+/// A GPT-2 style byte-level BPE tokenizer.
+///
+/// Bytes are mapped to printable unicode (so BPE never sees control bytes),
+/// the input is pre-tokenized into word-like chunks, and each chunk's symbols
+/// are merged by rank. Decoding reverses the byte→unicode map.
+///
+/// The pre-tokenizer here approximates GPT-2's regex (contractions, runs of
+/// letters / digits / punctuation, whitespace). It is not a byte-exact match
+/// for every model's pre-tokenizer, so token boundaries can differ from the
+/// reference on unusual inputs; the byte mapping and rank merges are exact.
+pub struct Bpe {
+    /// Raw bytes each token id decodes to.
+    id_to_bytes: Vec<Vec<u8>>,
+    /// Encoded token string → id.
+    token_to_id: HashMap<String, usize>,
+    /// (left, right) encoded strings → merge rank (lower = earlier).
+    merge_ranks: HashMap<(String, String), usize>,
+    /// byte → printable unicode char.
+    byte_encoder: [char; 256],
+    bos: Option<usize>,
+    eos: Option<usize>,
+}
+
+impl Bpe {
+    /// Build from encoded `tokens`, ordered `merges`, and optional BOS/EOS ids.
+    pub fn new(
+        tokens: Vec<String>,
+        merges: Vec<(String, String)>,
+        bos: Option<usize>,
+        eos: Option<usize>,
+    ) -> Self {
+        let byte_encoder = bytes_to_unicode();
+        let byte_decoder: HashMap<char, u8> = byte_encoder
+            .iter()
+            .enumerate()
+            .map(|(b, &c)| (c, b as u8))
+            .collect();
+
+        let token_to_id = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+        let id_to_bytes = tokens
+            .iter()
+            .map(|s| decode_token_bytes(s, &byte_decoder))
+            .collect();
+        let merge_ranks = merges
+            .into_iter()
+            .enumerate()
+            .map(|(r, pair)| (pair, r))
+            .collect();
+
+        Bpe {
+            id_to_bytes,
+            token_to_id,
+            merge_ranks,
+            byte_encoder,
+            bos,
+            eos,
+        }
+    }
+
+    /// Build from GGUF metadata (`tokenizer.ggml.tokens` / `.merges` / ids).
+    pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let tokens = match gguf.meta("tokenizer.ggml.tokens") {
+            Some(MetaValue::Array(a)) => a,
+            _ => return Err(Error::Format("GGUF missing tokenizer.ggml.tokens".into())),
+        };
+        let tokens: Vec<String> = tokens
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::Format("non-string token in GGUF vocab".into()))
+            })
+            .collect::<Result<_>>()?;
+
+        let merges = match gguf.meta("tokenizer.ggml.merges") {
+            Some(MetaValue::Array(a)) => a
+                .iter()
+                .filter_map(|m| m.as_str())
+                .filter_map(|m| m.split_once(' '))
+                .map(|(l, r)| (l.to_owned(), r.to_owned()))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let bos = gguf
+            .meta_u64("tokenizer.ggml.bos_token_id")
+            .ok()
+            .map(|v| v as usize);
+        let eos = gguf
+            .meta_u64("tokenizer.ggml.eos_token_id")
+            .ok()
+            .map(|v| v as usize);
+
+        Ok(Bpe::new(tokens, merges, bos, eos))
+    }
+
+    /// Encode `text`, optionally bracketing with BOS/EOS.
+    pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<usize> {
+        let mut ids = Vec::new();
+        if bos {
+            ids.extend(self.bos);
+        }
+        for chunk in pretokenize_gpt2(text) {
+            self.encode_chunk(&chunk, &mut ids);
+        }
+        if eos {
+            ids.extend(self.eos);
+        }
+        ids
+    }
+
+    /// BPE-encode one pre-token chunk, appending ids to `out`.
+    fn encode_chunk(&self, chunk: &str, out: &mut Vec<usize>) {
+        // Each byte becomes one printable-unicode symbol.
+        let mut symbols: Vec<String> = chunk
+            .bytes()
+            .map(|b| self.byte_encoder[b as usize].to_string())
+            .collect();
+        if symbols.is_empty() {
+            return;
+        }
+
+        // Repeatedly merge the lowest-rank adjacent pair.
+        loop {
+            let mut best_rank = usize::MAX;
+            let mut best = None;
+            for i in 0..symbols.len() - 1 {
+                if let Some(&rank) = self
+                    .merge_ranks
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best = Some(i);
+                    }
+                }
+            }
+            let Some(i) = best else { break };
+            let merged = format!("{}{}", symbols[i], symbols[i + 1]);
+            symbols[i] = merged;
+            symbols.remove(i + 1);
+        }
+
+        for s in &symbols {
+            if let Some(&id) = self.token_to_id.get(s) {
+                out.push(id);
+            } else {
+                // Fall back to single-char (single-byte) tokens.
+                for ch in s.chars() {
+                    if let Some(&id) = self.token_to_id.get(&ch.to_string()) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decode a token id to its raw bytes (caller concatenates).
+    pub fn decode(&self, token: usize) -> Vec<u8> {
+        self.id_to_bytes
+            .get(token)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Vocabulary size.
+    pub fn vocab_size(&self) -> usize {
+        self.id_to_bytes.len()
+    }
+}
+
+/// Decode an encoded token string back to bytes via the byte→unicode inverse.
+fn decode_token_bytes(s: &str, byte_decoder: &HashMap<char, u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        if let Some(&b) = byte_decoder.get(&ch) {
+            out.push(b);
+        } else {
+            // Special/added tokens stored as literal unicode (not byte-encoded).
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// The GPT-2 reversible byte → printable-unicode mapping.
+///
+/// Printable byte ranges map to themselves; the rest map to U+0100.. so that
+/// every byte is represented by a printable char.
+pub(crate) fn bytes_to_unicode() -> [char; 256] {
+    let mut printable: Vec<u32> = Vec::new();
+    printable.extend(0x21..=0x7E);
+    printable.extend(0xA1..=0xAC);
+    printable.extend(0xAE..=0xFF);
+
+    let mut table = ['\0'; 256];
+    let mut next = 0u32;
+    for b in 0..256u32 {
+        let c = if printable.contains(&b) {
+            b
+        } else {
+            let c = 256 + next;
+            next += 1;
+            c
+        };
+        table[b as usize] = char::from_u32(c).unwrap();
+    }
+    table
+}
+
+/// The 256 single-byte token strings (byte → its printable-unicode char).
+///
+/// Useful for building byte-level test/demo vocabularies.
+pub(crate) fn gpt2_byte_tokens() -> Vec<String> {
+    bytes_to_unicode().iter().map(|c| c.to_string()).collect()
+}
+
+/// Split `text` into GPT-2-style pre-token chunks (approximate; see [`Bpe`]).
+fn pretokenize_gpt2(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    let take = |a: usize, b: usize| -> String { chars[a..b].iter().collect() };
+
+    while i < n {
+        // Contractions: 's 't 'm 'd / 're 've 'll
+        if chars[i] == '\'' {
+            if let Some(len) = contraction_len(&chars[i..]) {
+                out.push(take(i, i + len));
+                i += len;
+                continue;
+            }
+        }
+
+        // Optional single leading space, then a run of one category.
+        let space = usize::from(chars[i] == ' ');
+        let j = i + space;
+        if j < n && chars[j].is_alphabetic() {
+            let mut k = j;
+            while k < n && chars[k].is_alphabetic() {
+                k += 1;
+            }
+            out.push(take(i, k));
+            i = k;
+        } else if j < n && chars[j].is_numeric() {
+            let mut k = j;
+            while k < n && chars[k].is_numeric() {
+                k += 1;
+            }
+            out.push(take(i, k));
+            i = k;
+        } else if j < n && !chars[j].is_whitespace() {
+            let mut k = j;
+            while k < n && !chars[k].is_whitespace() && !chars[k].is_alphanumeric() {
+                k += 1;
+            }
+            out.push(take(i, k));
+            i = k;
+        } else {
+            // Whitespace run (also catches a lone trailing space).
+            let mut k = i;
+            while k < n && chars[k].is_whitespace() {
+                k += 1;
+            }
+            let k = k.max(i + 1); // ensure progress
+            out.push(take(i, k));
+            i = k;
+        }
+    }
+    out
+}
+
+/// Length (in chars) of a contraction starting at `s[0] == '\''`, else `None`.
+fn contraction_len(s: &[char]) -> Option<usize> {
+    let two: String = s.iter().skip(1).take(2).collect();
+    if two == "re" || two == "ve" || two == "ll" {
+        return Some(3);
+    }
+    match s.get(1) {
+        Some('s' | 't' | 'm' | 'd') => Some(2),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A small hand-built vocabulary whose merges compose into " hello".
     fn hello_tokenizer() -> Tokenizer {
         let entries: &[(&[u8], f32)] = &[
             (b"<unk>", 0.0),    // 0
@@ -258,24 +600,20 @@ mod tests {
     }
 
     #[test]
-    fn encode_merges_into_single_token() {
+    fn spm_encode_merges_into_single_token() {
         let tk = hello_tokenizer();
-        // BOS, dummy-space, then "hello" greedily merges all the way up to
-        // " hello" (id 11).
         assert_eq!(tk.encode("hello", true, false), vec![1, 11]);
     }
 
     #[test]
-    fn decode_strips_space_after_bos() {
+    fn spm_decode_strips_space_after_bos() {
         let tk = hello_tokenizer();
-        // " hello" (id 11) loses its leading space when it follows BOS.
         assert_eq!(tk.decode(1, 11), b"hello");
-        // Without BOS context, the space stays.
         assert_eq!(tk.decode(7, 11), b" hello");
     }
 
     #[test]
-    fn roundtrip_via_decode() {
+    fn spm_roundtrip_via_decode() {
         let tk = hello_tokenizer();
         let ids = tk.encode("hello", true, false);
         let mut out = Vec::new();
@@ -294,10 +632,83 @@ mod tests {
     }
 
     #[test]
-    fn byte_token_decodes_to_raw_byte() {
+    fn spm_byte_token_decodes_to_raw_byte() {
         let tk = Tokenizer::from_vocab(vec![b"<0x41>".to_vec()], vec![0.0]);
-        assert_eq!(tk.decode(0, 0), b"A"); // 0x41 == 'A'
+        assert_eq!(tk.decode(0, 0), b"A");
         assert_eq!(parse_byte_token(b"<0x0a>"), Some(b'\n'));
         assert_eq!(parse_byte_token(b"hello"), None);
+    }
+
+    #[test]
+    fn byte_unicode_map_is_a_bijection() {
+        let table = bytes_to_unicode();
+        let mut seen = std::collections::HashSet::new();
+        for &c in &table {
+            assert!(seen.insert(c), "duplicate char in byte map");
+        }
+        assert_eq!(table[b' ' as usize], 'Ġ'); // GPT-2's encoded space
+        assert_eq!(table[b'a' as usize], 'a'); // printable ASCII is identity
+    }
+
+    /// A tiny byte-level vocab: all 256 byte tokens, then a few merged tokens.
+    fn bpe_tokenizer() -> Tokenizer {
+        let mut tokens = gpt2_byte_tokens();
+        let enc = bytes_to_unicode();
+        let s = |b: u8| enc[b as usize].to_string();
+        // Append merged tokens and the merges that build them.
+        let merged = [
+            (s(b'h'), s(b'i')),                  // "hi"
+            (format!("{}{}", s(b' '), s(b'y')), s(b'o')), // "Ġyo" (" yo")
+        ];
+        let mut merges = Vec::new();
+        for (l, r) in &merged {
+            tokens.push(format!("{l}{r}"));
+            merges.push((l.clone(), r.clone()));
+        }
+        Tokenizer::from_bpe(tokens, merges, Some(1), Some(2))
+    }
+
+    #[test]
+    fn bpe_merges_and_roundtrips() {
+        let tk = bpe_tokenizer();
+        // "hi" should merge into the single appended token (id 256).
+        let ids = tk.encode("hi", false, false);
+        assert_eq!(ids, vec![256]);
+
+        // Decoding returns the original bytes.
+        let mut out = Vec::new();
+        for &id in &ids {
+            out.extend_from_slice(&tk.decode(0, id));
+        }
+        assert_eq!(out, b"hi");
+    }
+
+    #[test]
+    fn bpe_byte_level_roundtrip_without_merges() {
+        // Arbitrary bytes (incl. UTF-8) survive encode→decode even with no
+        // applicable merges, because every byte is its own token.
+        let tk = bpe_tokenizer();
+        let text = "Hé! 42";
+        let ids = tk.encode(text, false, false);
+        let mut out = Vec::new();
+        for &id in &ids {
+            out.extend_from_slice(&tk.decode(0, id));
+        }
+        assert_eq!(out, text.as_bytes());
+    }
+
+    #[test]
+    fn bpe_bos_eos() {
+        let tk = bpe_tokenizer();
+        let ids = tk.encode("hi", true, true);
+        assert_eq!(ids.first(), Some(&1)); // BOS
+        assert_eq!(ids.last(), Some(&2)); // EOS
+    }
+
+    #[test]
+    fn pretokenize_splits_like_gpt2() {
+        assert_eq!(pretokenize_gpt2("hello world"), vec!["hello", " world"]);
+        assert_eq!(pretokenize_gpt2("it's 42!"), vec!["it", "'s", " 42", "!"]);
+        assert_eq!(pretokenize_gpt2(""), Vec::<String>::new());
     }
 }
