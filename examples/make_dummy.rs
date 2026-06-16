@@ -1,30 +1,35 @@
 //! Write a small, randomly-weighted model for trying the CLI without
-//! downloading real weights. The output format is chosen by the file
-//! extension: `.gguf` → GGUF (with an embedded dummy tokenizer), anything else
-//! → llama2.c checkpoint (needs a separate `tokenizer.bin`).
+//! downloading real weights. Format is chosen by the file extension:
+//! `.gguf` → GGUF (with an embedded dummy tokenizer), anything else → llama2.c
+//! checkpoint (needs a separate `tokenizer.bin`). An optional second argument
+//! picks the GGUF matmul weight type (`f32` default, or `q8_0`).
 //!
 //! ```sh
-//! # GGUF (self-contained):
-//! cargo run --release --example make_dummy -- dummy.gguf
+//! cargo run --release --example make_dummy -- dummy.gguf          # F32 GGUF
+//! cargo run --release --example make_dummy -- dummy.gguf q8_0     # quantized
 //! cargo run --release -- dummy.gguf -i "hi" -n 16
 //!
-//! # llama2.c (bring your own tokenizer):
-//! cargo run --release --example make_dummy -- dummy.bin
-//! cargo run --release -- dummy.bin -z tokenizer.bin -i "Once upon a time" -n 32
+//! cargo run --release --example make_dummy -- dummy.bin           # llama2.c
+//! cargo run --release -- dummy.bin -z tokenizer.bin -i "Once upon a time"
 //! ```
 //!
 //! The weights are noise, so the text is gibberish — this only proves the
 //! pipeline runs.
 
-use rusty_llama::dummy::{synthetic_checkpoint, synthetic_gguf};
-use rusty_llama::Config;
+use rusty_llama::dummy::{synthetic_checkpoint, synthetic_gguf_typed};
+use rusty_llama::{Config, GgmlType};
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "dummy.gguf".into());
+    let ty = match std::env::args().nth(2).as_deref() {
+        Some("q8_0") | Some("q8") => GgmlType::Q8_0,
+        _ => GgmlType::F32,
+    };
 
+    // dim / hidden_dim are multiples of 32 so quantized types are representable.
     let config = Config {
         dim: 64,
-        hidden_dim: 176,
+        hidden_dim: 192,
         n_layers: 2,
         n_heads: 8,
         n_kv_heads: 8,
@@ -34,11 +39,11 @@ fn main() -> std::io::Result<()> {
     };
 
     let bytes = if path.ends_with(".gguf") {
-        synthetic_gguf(&config)
+        synthetic_gguf_typed(&config, ty)
     } else {
         synthetic_checkpoint(&config)
     };
     std::fs::write(&path, &bytes)?;
-    println!("wrote {} ({} bytes) {config:?}", path, bytes.len());
+    println!("wrote {} ({} bytes) {ty:?} {config:?}", path, bytes.len());
     Ok(())
 }

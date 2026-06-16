@@ -5,6 +5,7 @@
 //! gibberish — the weights are deterministic noise.
 
 use crate::config::Config;
+use crate::quant::GgmlType;
 use crate::tokenizer::Tokenizer;
 
 /// Serialize a checkpoint with deterministic pseudo-random weights matching
@@ -166,10 +167,26 @@ impl GgufWriter {
 
 /// Serialize a synthetic GGUF `llama` model with F32 weights and a dummy
 /// tokenizer, in the layout [`crate::Model::from_gguf`] expects.
+pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
+    synthetic_gguf_typed(config, GgmlType::F32)
+}
+
+/// Like [`synthetic_gguf`] but stores the 2-D matmul weights in `matmul_type`
+/// (the 1-D RMSNorm vectors stay F32). For quantized types, `dim` and
+/// `hidden_dim` must be multiples of the block size.
 ///
 /// `config.shared_weights` is honoured (no `output.weight` when shared).
-pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
+pub fn synthetic_gguf_typed(config: &Config, matmul_type: GgmlType) -> Vec<u8> {
     let c = config;
+    // 2-D tensors carry the (possibly quantized) matmul weights; 1-D norm
+    // vectors stay full precision.
+    let tensor_type = |dims: &[u64]| {
+        if dims.len() == 2 {
+            matmul_type
+        } else {
+            GgmlType::F32
+        }
+    };
     let kv_dim = c.kv_dim();
 
     // (name, ggml dims) for every tensor, in file order. ggml dims put the
@@ -203,17 +220,24 @@ pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
     let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ tensors.len() as u64;
     for (_, dims) in &tensors {
         let n: usize = dims.iter().product::<u64>() as usize;
-        let off = data.len().next_multiple_of(GGUF_ALIGNMENT);
-        data.resize(off, 0);
-        offsets.push(off as u64);
+        // Deterministic small f32 values for this tensor.
+        let mut vals = Vec::with_capacity(n);
         for _ in 0..n {
             rng ^= rng >> 12;
             rng ^= rng << 25;
             rng ^= rng >> 27;
             let u = (rng.wrapping_mul(0x2545F491_4F6CDD1D) >> 40) as u32;
-            let v = (u as f32 / (1u32 << 24) as f32 - 0.5) * 0.2;
-            data.extend_from_slice(&v.to_le_bytes());
+            vals.push((u as f32 / (1u32 << 24) as f32 - 0.5) * 0.2);
         }
+        let encoded = match tensor_type(dims) {
+            GgmlType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            GgmlType::Q8_0 => crate::quant::quantize_q8_0(&vals),
+            other => panic!("synthetic_gguf_typed does not support {other:?} yet"),
+        };
+        let off = data.len().next_multiple_of(GGUF_ALIGNMENT);
+        data.resize(off, 0);
+        offsets.push(off as u64);
+        data.extend_from_slice(&encoded);
     }
 
     // Metadata.
@@ -242,7 +266,7 @@ pub fn synthetic_gguf(config: &Config) -> Vec<u8> {
         for &d in dims {
             tinfo.u64(d);
         }
-        tinfo.u32(0); // GGML_TYPE_F32
+        tinfo.u32(tensor_type(dims).to_u32());
         tinfo.u64(*off);
     }
 

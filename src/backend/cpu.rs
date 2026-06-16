@@ -10,6 +10,26 @@ use rayon::prelude::*;
 
 use crate::backend::Backend;
 use crate::math::{silu, softmax};
+use crate::quant::{dequant_block, GgmlType, MAX_BLOCK};
+use crate::tensor::QMatrix;
+
+/// Dot product of one quantized weight row (decompressed block by block) with
+/// the activation `x`. Avoids materializing the full f32 row.
+fn dot_quant_row(ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
+    let bs = ty.block_size();
+    let ts = ty.type_size();
+    let mut buf = [0.0f32; MAX_BLOCK];
+    let mut acc = 0.0f32;
+    for (b, chunk) in row.chunks_exact(ts).enumerate() {
+        let block = &mut buf[..bs];
+        dequant_block(ty, chunk, block);
+        let xs = &x[b * bs..b * bs + bs];
+        for (&w, &xi) in block.iter().zip(xs) {
+            acc += w * xi;
+        }
+    }
+    acc
+}
 
 /// A stateless f32 CPU backend.
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,14 +54,24 @@ impl Backend for CpuBackend {
         }
     }
 
-    fn matmul(&self, out: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
-        debug_assert_eq!(out.len(), d);
-        debug_assert_eq!(x.len(), n);
-        debug_assert!(w.len() >= n * d);
-        out.par_iter_mut().enumerate().for_each(|(i, o)| {
-            let row = &w[i * n..i * n + n];
-            *o = row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum();
-        });
+    fn matmul(&self, out: &mut [f32], x: &[f32], w: &QMatrix) {
+        debug_assert_eq!(out.len(), w.rows());
+        debug_assert_eq!(x.len(), w.cols());
+        match w {
+            QMatrix::F32 { data, cols, .. } => {
+                // Fast path: a contiguous f32 row dot product autovectorizes.
+                out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                    let row = &data[i * cols..i * cols + cols];
+                    *o = row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum();
+                });
+            }
+            QMatrix::Quant { ty, data, cols, .. } => {
+                let rb = ty.bytes_for(*cols);
+                out.par_iter_mut().enumerate().for_each(|(i, o)| {
+                    *o = dot_quant_row(*ty, &data[i * rb..i * rb + rb], x);
+                });
+            }
+        }
     }
 
     fn rope(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_size: usize, kv_dim: usize) {
@@ -144,14 +174,36 @@ mod tests {
     }
 
     #[test]
-    fn matmul_basic() {
+    fn matmul_f32_basic() {
         // w = [[1,2],[3,4]], x = [1,1]  ->  [3, 7]
-        let w = [1.0, 2.0, 3.0, 4.0];
+        let w = QMatrix::f32(vec![1.0, 2.0, 3.0, 4.0].into(), 2, 2).unwrap();
         let x = [1.0, 1.0];
         let mut out = [0.0; 2];
-        CpuBackend.matmul(&mut out, &x, &w, 2, 2);
+        CpuBackend.matmul(&mut out, &x, &w);
         approx(out[0], 3.0);
         approx(out[1], 7.0);
+    }
+
+    #[test]
+    fn matmul_quant_matches_f32() {
+        use crate::quant::quantize_q8_0;
+        // Two rows of 32 cols. Quantize to Q8_0, matmul, and compare to the
+        // exact f32 result within Q8_0 tolerance.
+        let row0: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+        let row1: Vec<f32> = (0..32).map(|i| (i as f32 * 0.05) - 0.7).collect();
+        let x: Vec<f32> = (0..32).map(|i| ((i * 7) % 5) as f32 - 2.0).collect();
+
+        let mut all = row0.clone();
+        all.extend_from_slice(&row1);
+        let w = QMatrix::quant(GgmlType::Q8_0, quantize_q8_0(&all).into(), 2, 32).unwrap();
+
+        let mut out = [0.0; 2];
+        CpuBackend.matmul(&mut out, &x, &w);
+
+        let exact0: f32 = row0.iter().zip(&x).map(|(a, b)| a * b).sum();
+        let exact1: f32 = row1.iter().zip(&x).map(|(a, b)| a * b).sum();
+        assert!((out[0] - exact0).abs() < 0.1, "{} vs {}", out[0], exact0);
+        assert!((out[1] - exact1).abs() < 0.1, "{} vs {}", out[1], exact1);
     }
 
     #[test]

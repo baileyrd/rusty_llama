@@ -1,9 +1,11 @@
 //! End-to-end tests for the GGUF path: parse a synthetic GGUF file, load the
 //! weights/tokenizer, and run the forward pass.
 
-use rusty_llama::dummy::synthetic_gguf;
+use rusty_llama::dummy::{synthetic_gguf, synthetic_gguf_typed};
 use rusty_llama::quant::dequantize;
-use rusty_llama::{forward, generate, Config, CpuBackend, Gguf, Model, RunState, Sampler, Tokenizer};
+use rusty_llama::{
+    forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RunState, Sampler, Tokenizer,
+};
 
 fn cfg() -> Config {
     Config {
@@ -60,18 +62,32 @@ fn from_gguf_weights_match_dequantized_tensors() {
     assert_eq!(model.config.vocab_size, c.vocab_size);
     assert!(model.config.shared_weights);
 
-    // The embedding buffer must equal the raw dequantized tensor.
-    let t = gguf.tensor("token_embd.weight").unwrap();
-    let expect = dequantize(t.ggml_type, gguf.tensor_bytes(t).unwrap(), t.n_elements()).unwrap();
-    assert_eq!(&model.weights.token_embedding_table[..], &expect[..]);
+    // Per-layer matmul matrices have the expected shapes.
+    assert_eq!(model.weights.wq.len(), c.n_layers);
+    assert_eq!(model.weights.wq[0].rows(), c.dim);
+    assert_eq!(model.weights.wq[0].cols(), c.dim);
+    assert_eq!(model.weights.wk[0].rows(), c.kv_dim());
+    assert_eq!(model.weights.w2[0].cols(), c.hidden_dim);
 
-    // Layer-0 query projection must equal the first slice of the concatenated wq.
+    // A dequantized embedding row must equal that row of the raw tensor.
+    let t = gguf.tensor("token_embd.weight").unwrap();
+    let full = dequantize(t.ggml_type, gguf.tensor_bytes(t).unwrap(), t.n_elements()).unwrap();
+    let mut row = vec![0.0; c.dim];
+    model.weights.token_embedding_table.dequant_row(3, &mut row);
+    assert_eq!(row, full[3 * c.dim..4 * c.dim]);
+
+    // Layer-0 query row 0 must equal blk.0.attn_q row 0.
     let t = gguf.tensor("blk.0.attn_q.weight").unwrap();
-    let expect = dequantize(t.ggml_type, gguf.tensor_bytes(t).unwrap(), t.n_elements()).unwrap();
-    assert_eq!(&model.weights.wq[..c.dim * c.dim], &expect[..]);
+    let full = dequantize(t.ggml_type, gguf.tensor_bytes(t).unwrap(), t.n_elements()).unwrap();
+    model.weights.wq[0].dequant_row(0, &mut row);
+    assert_eq!(row, full[0..c.dim]);
 
     // Shared classifier aliases the embedding table.
-    assert_eq!(&model.weights.wcls[..], &model.weights.token_embedding_table[..]);
+    let mut a = vec![0.0; c.dim];
+    let mut b = vec![0.0; c.dim];
+    model.weights.wcls.dequant_row(5, &mut a);
+    model.weights.token_embedding_table.dequant_row(5, &mut b);
+    assert_eq!(a, b);
 }
 
 #[test]
@@ -104,4 +120,42 @@ fn gguf_forward_is_finite_deterministic_and_generates() {
         out
     };
     assert_eq!(run(), run());
+}
+
+#[test]
+fn q8_0_forward_approximates_f32() {
+    // Same underlying weights, stored once as F32 and once as Q8_0. Running the
+    // quantized weights on the fly should closely track the full-precision
+    // result — this exercises the on-the-fly dequant matmul path with a real
+    // quant format end-to-end. (dim/hidden must be multiples of 32 for Q8_0.)
+    let c = Config {
+        dim: 32,
+        hidden_dim: 64,
+        n_layers: 2,
+        n_heads: 4,
+        n_kv_heads: 2,
+        vocab_size: 64,
+        seq_len: 8,
+        shared_weights: true,
+    };
+    let backend = CpuBackend::new();
+
+    let logits_for = |bytes: &[u8]| -> Vec<f32> {
+        let gguf = Gguf::parse(bytes).unwrap();
+        let model = Model::from_gguf(&gguf).unwrap();
+        let mut s = RunState::new(&model.config);
+        forward(&model, &mut s, &backend, 7, 0);
+        s.logits().to_vec()
+    };
+
+    let exact = logits_for(&synthetic_gguf_typed(&c, GgmlType::F32));
+    let quant = logits_for(&synthetic_gguf_typed(&c, GgmlType::Q8_0));
+
+    assert!(quant.iter().all(|v| v.is_finite()));
+    let max_diff = exact
+        .iter()
+        .zip(&quant)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff < 0.05, "Q8_0 logits diverge from f32 by {max_diff}");
 }
