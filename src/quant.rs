@@ -280,6 +280,91 @@ fn block_q6_k(blk: &[u8], out: &mut [f32]) {
     }
 }
 
+// --- integer activation dot product -----------------------------------------
+
+/// An activation vector quantized to signed 8-bit, one scale per 32 values.
+///
+/// llama.cpp quantizes the activation once per matmul and then does the row
+/// dot products in integer arithmetic; this is the building block for that.
+pub struct Q8Activation {
+    /// Quantized values (length `n`, a multiple of 32).
+    pub qs: Vec<i8>,
+    /// Per-block scale (`qs.len() / 32` entries).
+    pub scales: Vec<f32>,
+}
+
+impl Q8Activation {
+    /// Reconstruct the (lossy) f32 values — used to check the integer kernels.
+    pub fn dequantized(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.qs.len());
+        for (b, chunk) in self.qs.chunks_exact(32).enumerate() {
+            for &q in chunk {
+                out.push(self.scales[b] * q as f32);
+            }
+        }
+        out
+    }
+}
+
+/// Quantize an activation vector (length a multiple of 32) to [`Q8Activation`].
+pub fn quantize_activation_q8(x: &[f32]) -> Q8Activation {
+    debug_assert!(x.len().is_multiple_of(32));
+    let mut qs = Vec::with_capacity(x.len());
+    let mut scales = Vec::with_capacity(x.len() / 32);
+    for blk in x.chunks_exact(32) {
+        let amax = blk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        scales.push(d);
+        for &v in blk {
+            qs.push(((v * id).round() as i32).clamp(-128, 127) as i8);
+        }
+    }
+    Q8Activation { qs, scales }
+}
+
+/// Dot product of a Q8_0 weight row with a Q8-quantized activation.
+///
+/// Equals `dequantize(Q8_0, weight) · act.dequantized()`, but the per-block
+/// inner sum is done in integer arithmetic with a single f32 scale at the end.
+pub fn vec_dot_q8_0(weight: &[u8], act: &Q8Activation) -> f32 {
+    let mut acc = 0.0f32;
+    for (b, blk) in weight.chunks_exact(34).enumerate() {
+        let dw = rd_f16(blk, 0);
+        let base = b * 32;
+        let mut sum: i32 = 0;
+        for i in 0..32 {
+            sum += (blk[2 + i] as i8 as i32) * (act.qs[base + i] as i32);
+        }
+        acc += dw * act.scales[b] * sum as f32;
+    }
+    acc
+}
+
+/// Dot product of a Q4_0 weight row with a Q8-quantized activation.
+pub fn vec_dot_q4_0(weight: &[u8], act: &Q8Activation) -> f32 {
+    let mut acc = 0.0f32;
+    for (b, blk) in weight.chunks_exact(18).enumerate() {
+        let dw = rd_f16(blk, 0);
+        let qs = &blk[2..18];
+        let base = b * 32;
+        let mut sum: i32 = 0;
+        for (j, &q) in qs.iter().enumerate() {
+            let lo = (q & 0x0f) as i32 - 8;
+            let hi = (q >> 4) as i32 - 8;
+            sum += lo * (act.qs[base + j] as i32);
+            sum += hi * (act.qs[base + j + 16] as i32);
+        }
+        acc += dw * act.scales[b] * sum as f32;
+    }
+    acc
+}
+
+/// True if `ty`'s matmul has an integer (Q8-activation) fast path.
+pub fn has_int8_path(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::Q8_0 | GgmlType::Q4_0)
+}
+
 // --- quantizers -------------------------------------------------------------
 
 /// Quantize `x` (length a multiple of 32) to Q8_0, matching ggml's reference.
@@ -365,5 +450,38 @@ mod tests {
     fn rejects_bad_lengths() {
         assert!(dequantize(GgmlType::Q8_0, &[0; 34], 31).is_err());
         assert!(dequantize(GgmlType::Q8_0, &[0; 10], 32).is_err());
+    }
+
+    #[test]
+    fn vec_dot_q8_0_equals_dequantized_dot() {
+        let cols = 64; // two blocks
+        let wf: Vec<f32> = (0..cols).map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.3).collect();
+        let wbytes = quantize_q8_0(&wf);
+        let x: Vec<f32> = (0..cols).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.2).collect();
+        let act = quantize_activation_q8(&x);
+
+        let wdq = dequantize(GgmlType::Q8_0, &wbytes, cols).unwrap();
+        let reference: f32 = wdq.iter().zip(&act.dequantized()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q8_0(&wbytes, &act);
+        assert!((got - reference).abs() < 1e-2, "{got} vs {reference}");
+    }
+
+    #[test]
+    fn vec_dot_q4_0_equals_dequantized_dot() {
+        let cols = 64; // two blocks of 18 bytes
+        let mut wbytes = Vec::new();
+        for b in 0..2 {
+            wbytes.extend_from_slice(&f32_to_f16(0.05 + b as f32 * 0.01).to_le_bytes());
+            for j in 0..16 {
+                wbytes.push(((b * 16 + j) * 7 % 256) as u8); // arbitrary nibbles
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i * 5 % 9) as f32 - 4.0) * 0.1).collect();
+        let act = quantize_activation_q8(&x);
+
+        let wdq = dequantize(GgmlType::Q4_0, &wbytes, cols).unwrap();
+        let reference: f32 = wdq.iter().zip(&act.dequantized()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q4_0(&wbytes, &act);
+        assert!((got - reference).abs() < 1e-2, "{got} vs {reference}");
     }
 }
