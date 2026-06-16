@@ -11,8 +11,8 @@ use rayon::prelude::*;
 use crate::backend::Backend;
 use crate::math::{silu, softmax};
 use crate::quant::{
-    dequant_block, has_int8_path, quantize_activation_q8, vec_dot_q4_0, vec_dot_q8_0, GgmlType,
-    Q8Activation, MAX_BLOCK,
+    dequant_block, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0, vec_dot_q4_k,
+    vec_dot_q6_k, vec_dot_q8_0, GgmlType, Q8Activation, Q8KActivation, MAX_BLOCK,
 };
 use crate::tensor::QMatrix;
 
@@ -70,23 +70,36 @@ impl Backend for CpuBackend {
             }
             QMatrix::Quant { ty, data, cols, .. } => {
                 let rb = ty.bytes_for(*cols);
-                if has_int8_path(*ty) {
-                    // Fast path: quantize the activation once, then do integer
-                    // block dot products per row.
-                    let act = quantize_activation_q8(x);
-                    let dot: fn(&[u8], &Q8Activation) -> f32 = match ty {
-                        GgmlType::Q8_0 => vec_dot_q8_0,
-                        GgmlType::Q4_0 => vec_dot_q4_0,
-                        _ => unreachable!(),
-                    };
-                    out.par_iter_mut().enumerate().for_each(|(i, o)| {
-                        *o = dot(&data[i * rb..i * rb + rb], &act);
-                    });
-                } else {
-                    // k-quants (Q4_K/Q6_K) and F16: dequantize each block to f32.
-                    out.par_iter_mut().enumerate().for_each(|(i, o)| {
-                        *o = dot_quant_row(*ty, &data[i * rb..i * rb + rb], x);
-                    });
+                let row = |i: usize| &data[i * rb..i * rb + rb];
+                match ty {
+                    // Q8 activation (32-block) for the simple formats.
+                    GgmlType::Q8_0 | GgmlType::Q4_0 => {
+                        let act = quantize_activation_q8(x);
+                        let dot: fn(&[u8], &Q8Activation) -> f32 = match ty {
+                            GgmlType::Q8_0 => vec_dot_q8_0,
+                            _ => vec_dot_q4_0,
+                        };
+                        out.par_iter_mut()
+                            .enumerate()
+                            .for_each(|(i, o)| *o = dot(row(i), &act));
+                    }
+                    // Q8_K activation (256-block) for the k-quants.
+                    GgmlType::Q4_K | GgmlType::Q6_K => {
+                        let act = quantize_activation_q8k(x);
+                        let dot: fn(&[u8], &Q8KActivation) -> f32 = match ty {
+                            GgmlType::Q4_K => vec_dot_q4_k,
+                            _ => vec_dot_q6_k,
+                        };
+                        out.par_iter_mut()
+                            .enumerate()
+                            .for_each(|(i, o)| *o = dot(row(i), &act));
+                    }
+                    // F16: no integer path; dequantize each block to f32.
+                    _ => {
+                        out.par_iter_mut()
+                            .enumerate()
+                            .for_each(|(i, o)| *o = dot_quant_row(*ty, row(i), x));
+                    }
                 }
             }
         }
@@ -259,6 +272,93 @@ mod tests {
 
         eprintln!(
             "Q8_0 {rows}x{cols} x{iters}: dequant={dequant:?} int8={int8:?} \
+             speedup={:.2}x (sink={sink})",
+            dequant.as_secs_f64() / int8.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn matmul_routes_kquants_to_int8() {
+        use crate::quant::{
+            f32_to_f16, pack_scales_q4_k, quantize_activation_q8k, vec_dot_q4_k, vec_dot_q6_k,
+        };
+
+        let x: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+        let act = quantize_activation_q8k(&x);
+
+        // Valid Q4_K block.
+        let mut q4k = Vec::new();
+        q4k.extend_from_slice(&f32_to_f16(0.05).to_le_bytes());
+        q4k.extend_from_slice(&f32_to_f16(0.02).to_le_bytes());
+        q4k.extend_from_slice(&pack_scales_q4_k(
+            [10, 20, 5, 33, 41, 7, 18, 25],
+            [3, 9, 14, 1, 22, 6, 30, 11],
+        ));
+        (0..128u32).for_each(|i| q4k.push(((i * 7 + 3) % 256) as u8));
+
+        let mut bytes = q4k.clone();
+        bytes.extend_from_slice(&q4k); // two identical rows
+        let w = QMatrix::quant(GgmlType::Q4_K, bytes.into(), 2, 256).unwrap();
+        let mut out = [0.0; 2];
+        CpuBackend.matmul(&mut out, &x, &w);
+        let expect = vec_dot_q4_k(&q4k, &act);
+        approx(out[0], expect);
+        approx(out[1], expect);
+
+        // Valid Q6_K block.
+        let mut q6k = Vec::new();
+        (0..128u32).for_each(|i| q6k.push(((i * 5 + 1) % 256) as u8));
+        (0..64u32).for_each(|i| q6k.push(((i * 9 + 2) % 256) as u8));
+        (0..16i32).for_each(|i| q6k.push((i - 8) as i8 as u8));
+        q6k.extend_from_slice(&f32_to_f16(0.03).to_le_bytes());
+
+        let mut bytes = q6k.clone();
+        bytes.extend_from_slice(&q6k);
+        let w = QMatrix::quant(GgmlType::Q6_K, bytes.into(), 2, 256).unwrap();
+        let mut out = [0.0; 2];
+        CpuBackend.matmul(&mut out, &x, &w);
+        let expect = vec_dot_q6_k(&q6k, &act);
+        approx(out[0], expect);
+        approx(out[1], expect);
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_q4_k_matmul() {
+        use crate::quant::{quantize_activation_q8k, vec_dot_q4_k};
+        use std::time::Instant;
+
+        let (rows, cols, iters) = (2048usize, 2048usize, 10);
+        let rb = GgmlType::Q4_K.bytes_for(cols);
+        // Pseudo-random weight bytes (validity doesn't matter for timing).
+        let mut wbytes = vec![0u8; rows * rb];
+        let mut s: u32 = 0x1234_5678;
+        for b in wbytes.iter_mut() {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (s >> 16) as u8;
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let mut sink = 0.0f32;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += dot_quant_row(GgmlType::Q4_K, &wbytes[i * rb..i * rb + rb], &x);
+            }
+        }
+        let dequant = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            let act = quantize_activation_q8k(&x);
+            for i in 0..rows {
+                sink += vec_dot_q4_k(&wbytes[i * rb..i * rb + rb], &act);
+            }
+        }
+        let int8 = t1.elapsed();
+
+        eprintln!(
+            "Q4_K {rows}x{cols} x{iters}: dequant={dequant:?} int8={int8:?} \
              speedup={:.2}x (sink={sink})",
             dequant.as_secs_f64() / int8.as_secs_f64()
         );

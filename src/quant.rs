@@ -264,7 +264,7 @@ fn block_q6_k(blk: &[u8], out: &mut [f32]) {
     for half in 0..2 {
         let ql = &blk[half * 64..];
         let qh = &blk[128 + half * 32..];
-        let sc = &scales[half * 8..];
+        let sc = &scales[half * 8..]; // Q6_K scales are signed int8
         let y = half * 128;
         for l in 0..32 {
             let is = l / 16;
@@ -272,10 +272,10 @@ fn block_q6_k(blk: &[u8], out: &mut [f32]) {
             let q2 = ((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
             let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
             let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
-            out[y + l] = d * sc[is] as f32 * q1 as f32;
-            out[y + l + 32] = d * sc[is + 2] as f32 * q2 as f32;
-            out[y + l + 64] = d * sc[is + 4] as f32 * q3 as f32;
-            out[y + l + 96] = d * sc[is + 6] as f32 * q4 as f32;
+            out[y + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+            out[y + l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+            out[y + l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+            out[y + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
         }
     }
 }
@@ -360,9 +360,145 @@ pub fn vec_dot_q4_0(weight: &[u8], act: &Q8Activation) -> f32 {
     acc
 }
 
+/// An activation vector quantized to the `Q8_K` format used by the k-quant dot
+/// products: one f32 scale per 256-value super-block, plus the sum of quants in
+/// each group of 16 (used to fold in the k-quant per-block mins).
+pub struct Q8KActivation {
+    /// Quantized values (length `n`, a multiple of 256).
+    pub qs: Vec<i8>,
+    /// Per-super-block scale (`qs.len() / 256` entries).
+    pub d: Vec<f32>,
+    /// Sum of quants per group of 16 (`qs.len() / 16` entries).
+    pub bsums: Vec<i16>,
+}
+
+impl Q8KActivation {
+    /// Reconstruct the (lossy) f32 values — used to check the integer kernels.
+    pub fn dequantized(&self) -> Vec<f32> {
+        self.qs
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| self.d[i / 256] * q as f32)
+            .collect()
+    }
+}
+
+/// Quantize an activation vector (length a multiple of 256) to [`Q8KActivation`].
+pub fn quantize_activation_q8k(x: &[f32]) -> Q8KActivation {
+    debug_assert!(x.len().is_multiple_of(256));
+    let mut qs = Vec::with_capacity(x.len());
+    let mut d = Vec::with_capacity(x.len() / 256);
+    let mut bsums = Vec::with_capacity(x.len() / 16);
+    for blk in x.chunks_exact(256) {
+        let (mut amax, mut max) = (0.0f32, 0.0f32);
+        for &v in blk {
+            if v.abs() > amax {
+                amax = v.abs();
+                max = v;
+            }
+        }
+        if amax == 0.0 {
+            d.push(0.0);
+            qs.extend(std::iter::repeat_n(0i8, 256));
+            bsums.extend(std::iter::repeat_n(0i16, 16));
+            continue;
+        }
+        let iscale = -128.0 / max;
+        d.push(1.0 / iscale);
+        let start = qs.len();
+        for &v in blk {
+            qs.push(((iscale * v).round() as i32).clamp(-128, 127) as i8);
+        }
+        for g in 0..16 {
+            let s: i32 = (0..16).map(|k| qs[start + g * 16 + k] as i32).sum();
+            bsums.push(s as i16);
+        }
+    }
+    Q8KActivation { qs, d, bsums }
+}
+
+/// Dot product of a Q4_K weight row with a Q8_K-quantized activation.
+///
+/// Equals `dequantize(Q4_K, weight) · act.dequantized()`: the per-sub-block
+/// products run in integer arithmetic, the per-block min term is folded in via
+/// the activation's `bsums`, and only the two block scales hit f32.
+pub fn vec_dot_q4_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+    let mut total = 0.0f32;
+    for (sb, wblk) in weight.chunks_exact(144).enumerate() {
+        let d = rd_f16(wblk, 0);
+        let dmin = rd_f16(wblk, 2);
+        let scales = &wblk[4..16];
+        let qs = &wblk[16..144];
+        let qx = &act.qs[sb * 256..sb * 256 + 256];
+        let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+        let bigd = act.d[sb];
+
+        let mut acc: i32 = 0;
+        for j in 0..8 {
+            let (sc, _) = get_scale_min_k4(j, scales);
+            let chunk = j / 2;
+            let hi = j % 2 == 1;
+            let mut sub: i32 = 0;
+            for k in 0..32 {
+                let byte = qs[chunk * 32 + k];
+                let nib = if hi { (byte >> 4) as i32 } else { (byte & 0x0f) as i32 };
+                sub += nib * (qx[j * 32 + k] as i32);
+            }
+            acc += sc as i32 * sub;
+        }
+        let mut min_acc: i32 = 0;
+        for (g, &bs) in bsums.iter().enumerate() {
+            let (_, m) = get_scale_min_k4(g / 2, scales);
+            min_acc += bs as i32 * m as i32;
+        }
+        total += d * bigd * acc as f32 - dmin * bigd * min_acc as f32;
+    }
+    total
+}
+
+/// Dot product of a Q6_K weight row with a Q8_K-quantized activation.
+// `>> 0` is kept for visual symmetry with the `>> 2/4/6` shifts.
+#[allow(clippy::identity_op)]
+pub fn vec_dot_q6_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+    let mut total = 0.0f32;
+    for (sb, wblk) in weight.chunks_exact(210).enumerate() {
+        let ql = &wblk[0..128];
+        let qh = &wblk[128..192];
+        let scales = &wblk[192..208];
+        let d = rd_f16(wblk, 208);
+        let qx = &act.qs[sb * 256..sb * 256 + 256];
+        let bigd = act.d[sb];
+
+        // Reconstruct the 6-bit signed weights (q - 32) in natural order.
+        let mut a = [0i32; 256];
+        for half in 0..2 {
+            let ql = &ql[half * 64..];
+            let qh = &qh[half * 32..];
+            let y = half * 128;
+            for l in 0..32 {
+                a[y + l] = ((ql[l] & 0x0f) | (((qh[l] >> 0) & 3) << 4)) as i32 - 32;
+                a[y + l + 32] = ((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                a[y + l + 64] = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                a[y + l + 96] = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+            }
+        }
+        let mut acc: i32 = 0;
+        for sub in 0..16 {
+            let sc = scales[sub] as i8 as i32; // scales are signed
+            let s: i32 = (0..16).map(|k| a[sub * 16 + k] * qx[sub * 16 + k] as i32).sum();
+            acc += sc * s;
+        }
+        total += d * bigd * acc as f32;
+    }
+    total
+}
+
 /// True if `ty`'s matmul has an integer (Q8-activation) fast path.
 pub fn has_int8_path(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::Q8_0 | GgmlType::Q4_0)
+    matches!(
+        ty,
+        GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q6_K
+    )
 }
 
 // --- quantizers -------------------------------------------------------------
@@ -436,14 +572,15 @@ mod tests {
     #[test]
     fn q6_k_constant_block() {
         let mut blk = Vec::new();
-        blk.extend(std::iter::repeat_n(0x11u8, 128));
-        blk.extend(std::iter::repeat_n(0u8, 64));
-        blk.extend(std::iter::repeat_n(1u8, 16));
+        blk.extend(std::iter::repeat_n(0x11u8, 128)); // ql -> nibble 1
+        blk.extend(std::iter::repeat_n(0u8, 64)); // qh -> 0
+        blk.extend(std::iter::repeat_n((-2i8) as u8, 16)); // signed scale -2
         blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
         assert_eq!(blk.len(), GgmlType::Q6_K.type_size());
 
+        // q = 1 - 32 = -31, scale -2 -> 62 (and signed scales must be honoured).
         let y = dequantize(GgmlType::Q6_K, &blk, QK_K).unwrap();
-        assert!(y.iter().all(|&v| (v + 31.0).abs() < 1e-4), "{:?}", &y[..4]);
+        assert!(y.iter().all(|&v| (v - 62.0).abs() < 1e-4), "{:?}", &y[..4]);
     }
 
     #[test]
@@ -482,6 +619,51 @@ mod tests {
         let wdq = dequantize(GgmlType::Q4_0, &wbytes, cols).unwrap();
         let reference: f32 = wdq.iter().zip(&act.dequantized()).map(|(a, b)| a * b).sum();
         let got = vec_dot_q4_0(&wbytes, &act);
+        assert!((got - reference).abs() < 1e-2, "{got} vs {reference}");
+    }
+
+    #[test]
+    fn vec_dot_q4_k_equals_dequantized_dot() {
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&f32_to_f16(0.04).to_le_bytes()); // d
+        blk.extend_from_slice(&f32_to_f16(0.02).to_le_bytes()); // dmin
+        blk.extend_from_slice(&pack_scales_q4_k(
+            [10, 20, 5, 33, 41, 7, 18, 25],
+            [3, 9, 14, 1, 22, 6, 30, 11],
+        ));
+        for i in 0..128u32 {
+            blk.push(((i * 7 + 3) % 256) as u8); // 256 nibbles
+        }
+        assert_eq!(blk.len(), GgmlType::Q4_K.type_size());
+
+        let x: Vec<f32> = (0..256).map(|i| ((i * 11 % 23) as f32 - 11.0) * 0.05).collect();
+        let act = quantize_activation_q8k(&x);
+        let wdq = dequantize(GgmlType::Q4_K, &blk, 256).unwrap();
+        let reference: f32 = wdq.iter().zip(&act.dequantized()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q4_k(&blk, &act);
+        assert!((got - reference).abs() < 1e-2, "{got} vs {reference}");
+    }
+
+    #[test]
+    fn vec_dot_q6_k_equals_dequantized_dot() {
+        let mut blk = Vec::new();
+        for i in 0..128u32 {
+            blk.push(((i * 5 + 1) % 256) as u8); // ql
+        }
+        for i in 0..64u32 {
+            blk.push(((i * 9 + 2) % 256) as u8); // qh
+        }
+        for i in 0..16i32 {
+            blk.push((i - 8) as i8 as u8); // signed scales -8..7
+        }
+        blk.extend_from_slice(&f32_to_f16(0.03).to_le_bytes()); // d
+        assert_eq!(blk.len(), GgmlType::Q6_K.type_size());
+
+        let x: Vec<f32> = (0..256).map(|i| ((i * 13 % 19) as f32 - 9.0) * 0.04).collect();
+        let act = quantize_activation_q8k(&x);
+        let wdq = dequantize(GgmlType::Q6_K, &blk, 256).unwrap();
+        let reference: f32 = wdq.iter().zip(&act.dequantized()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q6_k(&blk, &act);
         assert!((got - reference).abs() < 1e-2, "{got} vs {reference}");
     }
 }

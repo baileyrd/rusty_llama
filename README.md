@@ -89,12 +89,12 @@ parallelize across cores with rayon. If you copy the binary to a different CPU,
 change that to `x86-64-v3` or remove it.
 
 Quantized GGUF weights are **not** expanded to f32 at load time — they're
-memory-mapped and dequantized block-by-block inside the matmul, so a Q4_K/Q8_0
-model uses a fraction of the RAM an f32 copy would. For **Q8_0 / Q4_0** weights
-the matmul also takes an integer fast path: the activation is quantized to int8
-once per matmul and the row dot products run in integer arithmetic (≈1.75×
-faster than per-block f32 dequant on this machine — see the `bench_q8_0_matmul`
-test). K-quants (Q4_K/Q6_K) still use the f32 dequant path for now.
+memory-mapped and the matmul takes an integer fast path: the activation is
+quantized once per matmul (Q8 for Q8_0/Q4_0, Q8_K for Q4_K/Q6_K) and the row
+dot products run in integer arithmetic, with only the per-block scales in f32.
+That's ≈3× faster than per-block f32 dequant on this machine (see the
+`bench_q8_0_matmul` / `bench_q4_k_matmul` tests) and uses a fraction of the RAM
+an f32 copy would.
 
 ## Tests
 
@@ -111,8 +111,8 @@ and that greedy generation reproduces.
 - [x] llama2.c fp32 checkpoints, CPU backend, BPE tokenizer, sampling
 - [x] GGUF container + quantized weights (F16, Q4_0, Q8_0, Q4_K, Q6_K) + GGUF SPM tokenizer
 - [x] On-the-fly quantized matmul — weights stay compressed in RAM (mmap), dequantized per block
-- [x] Integer (Q8) activation fast path for Q8_0 / Q4_0 matmuls (~1.75× over per-block dequant)
-- [ ] Extend the int8 path to k-quants (Q8_K `vec_dot` for Q4_K/Q6_K) + explicit SIMD intrinsics
+- [x] Integer (Q8 / Q8_K) activation fast path for Q8_0/Q4_0/Q4_K/Q6_K matmuls (~3× over per-block dequant)
+- [ ] Explicit SIMD intrinsics (e.g. AVX-512 VNNI) for the integer dot products
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
 - [ ] Llama-3 (RoPE θ / scaling), byte-level BPE (`gpt2`) tokenizers, chat templating
 
