@@ -41,7 +41,7 @@ pub use config::{Config, RopeScaling, RopeTable};
 pub use error::{Error, Result};
 pub use gguf::Gguf;
 pub use loader::Checkpoint;
-pub use model::{forward, generate, Model, RunState, Weights};
+pub use model::{forward, forward_prefill, generate, Model, RunState, Weights};
 pub use quant::GgmlType;
 pub use sampler::Sampler;
 pub use tensor::QMatrix;
