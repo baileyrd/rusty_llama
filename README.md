@@ -74,15 +74,22 @@ so a single f32 matmul shader covers every GGUF quant type. Greedy output is
 **byte-identical** to the CPU backend (verified on `stories15M` and a quantized
 TinyLlama-1.1B Q4_K_M; see `tests/gpu_parity.rs`).
 
+**Prompt prefill is batched.** The whole prompt runs in one set of *large*
+matmuls (`forward_prefill`) rather than one tiny pass per token, via batched
+`Backend` ops (`matmul_batch`/`rmsnorm_batch`/`rope_batch`/`attention_batch`,
+with default impls that loop the single-token ops so the CPU is correct for
+free). That's where the GPU shines: prefilling a 256-token prompt is **~2×
+faster on GPU than CPU** (735 vs 377 tok/s, `bench_prefill_gpu_vs_cpu`).
+
 **Honest performance note.** A single large matmul with the weight resident is
-already faster on the GPU (~1.2× a multi-core CPU matmul at 4096×4096). But
-single-token *decode* issues ~50 tiny, dim-sized ops per token, and this per-op
-backend uploads each activation and reads the result straight back — so the
-host↔device round-trips dominate and end-to-end decode is currently **slower**
-than `CpuBackend` (≈70 vs 420 tok/s on `stories15M`; ≈6 vs 34 tok/s on TinyLlama
-Q4_K_M). Winning on decode needs the KV cache kept resident and a fused layer to
-cut the round-trips — left as future work. See `bench_matmul_gpu_vs_cpu` in
-`src/backend/gpu.rs`.
+already faster on the GPU (~1.2× a multi-core CPU matmul at 4096×4096), and
+batched prefill wins outright. But single-token *decode* issues ~50 tiny,
+dim-sized ops per token, and this per-op backend uploads each activation and
+reads the result straight back — so the host↔device round-trips dominate and
+end-to-end *decode* is still **slower** than `CpuBackend` (TinyLlama Q4_K_M
+≈6 vs 34 tok/s). Winning on decode too needs the KV cache kept resident and a
+fused layer to cut the round-trips — future work. See `bench_matmul_gpu_vs_cpu`
+and `bench_prefill_gpu_vs_cpu` in `src/backend/gpu.rs`.
 
 ## How it fits together
 
