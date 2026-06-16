@@ -17,6 +17,7 @@ fn test_config() -> Config {
         vocab_size: 32,
         seq_len: 8,
         shared_weights: true,
+        ..Default::default()
     }
 }
 

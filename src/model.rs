@@ -126,8 +126,10 @@ impl<'a> Model<'a> {
     /// from `gguf`; only the small RMSNorm vectors are copied to f32. Supports
     /// the `llama` architecture (and anything sharing its tensor naming).
     ///
-    /// Note: RoPE theta is fixed at 10000 and RMSNorm epsilon at 1e-5 — correct
-    /// for Llama-2 / TinyStories / TinyLlama, but not e.g. Llama-3 (theta 500000).
+    /// RoPE base frequency and RMSNorm epsilon are read from the file (so
+    /// Llama-3 / Qwen2-style θ values are honoured). Partial rotary
+    /// (`rope.dimension_count != head_size`) and long-context RoPE scaling are
+    /// not yet handled.
     pub fn from_gguf(gguf: &Gguf<'a>) -> Result<Self> {
         let arch = gguf.meta_str("general.architecture")?.to_owned();
         let key = |k: &str| format!("{arch}.{k}");
@@ -140,6 +142,22 @@ impl<'a> Model<'a> {
             .unwrap_or(n_heads as u64) as usize;
         let hidden_dim = gguf.meta_u64(&key("feed_forward_length"))? as usize;
         let seq_len = gguf.meta_u64(&key("context_length"))? as usize;
+        let rope_freq_base = gguf.meta_f32(&key("rope.freq_base")).unwrap_or(10000.0);
+        let rms_eps = gguf
+            .meta_f32(&key("attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-5);
+
+        // We only implement full rotary; reject partial-rotary models loudly
+        // rather than computing the wrong thing.
+        let head_size = if n_heads == 0 { 0 } else { dim / n_heads };
+        let rope_dim = gguf
+            .meta_u64(&key("rope.dimension_count"))
+            .unwrap_or(head_size as u64) as usize;
+        if head_size != 0 && rope_dim != head_size {
+            return Err(Error::Format(format!(
+                "partial rotary not supported: rope.dimension_count {rope_dim} != head_size {head_size}"
+            )));
+        }
 
         // Vocabulary size = second (row) dimension of the embedding tensor.
         let tok_embd = gguf
@@ -162,6 +180,8 @@ impl<'a> Model<'a> {
             vocab_size,
             seq_len,
             shared_weights,
+            rope_freq_base,
+            rms_eps,
         };
         config.validate()?;
 
@@ -316,7 +336,12 @@ pub fn forward(
 
     for layer in 0..p.n_layers {
         // --- Attention ---------------------------------------------------
-        backend.rmsnorm(&mut state.xb, &state.x, slice(&w.rms_att_weight, layer, dim));
+        backend.rmsnorm(
+            &mut state.xb,
+            &state.x,
+            slice(&w.rms_att_weight, layer, dim),
+            p.rms_eps,
+        );
 
         let loff = layer * p.seq_len * kv_dim;
         let kv_at = loff + pos * kv_dim;
@@ -339,6 +364,7 @@ pub fn forward(
             pos,
             head_size,
             kv_dim,
+            p.rope_freq_base,
         );
 
         backend.attention(
@@ -359,7 +385,12 @@ pub fn forward(
         backend.add(&mut state.x, &state.xb2);
 
         // --- Feed-forward (SwiGLU) --------------------------------------
-        backend.rmsnorm(&mut state.xb, &state.x, slice(&w.rms_ffn_weight, layer, dim));
+        backend.rmsnorm(
+            &mut state.xb,
+            &state.x,
+            slice(&w.rms_ffn_weight, layer, dim),
+            p.rms_eps,
+        );
         backend.matmul(&mut state.hb, &state.xb, &w.w1[layer]);
         backend.matmul(&mut state.hb2, &state.xb, &w.w3[layer]);
         backend.swiglu(&mut state.hb, &state.hb2);
@@ -368,7 +399,7 @@ pub fn forward(
     }
 
     // Final norm (written into `xb` to avoid aliasing `x`) then classifier.
-    backend.rmsnorm(&mut state.xb, &state.x, &w.rms_final_weight);
+    backend.rmsnorm(&mut state.xb, &state.x, &w.rms_final_weight, p.rms_eps);
     backend.matmul(&mut state.logits, &state.xb, &w.wcls);
 }
 

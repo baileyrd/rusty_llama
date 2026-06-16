@@ -17,6 +17,7 @@ fn cfg() -> Config {
         vocab_size: 32,
         seq_len: 8,
         shared_weights: true,
+        ..Default::default()
     }
 }
 
@@ -49,6 +50,21 @@ fn tokenizer_loads_from_gguf() {
     let tk = Tokenizer::from_gguf(&gguf).unwrap();
     assert_eq!(tk.vocab_size(), c.vocab_size);
     assert_eq!(tk.encode("", true, false), vec![1]); // just BOS
+}
+
+#[test]
+fn from_gguf_reads_rope_base_and_eps() {
+    // Distinctive (non-default) values so we know they were read, not defaulted.
+    let c = Config {
+        rope_freq_base: 500000.0, // Llama-3 style
+        rms_eps: 2e-5,
+        ..cfg()
+    };
+    let bytes = synthetic_gguf(&c);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    assert_eq!(model.config.rope_freq_base, 500000.0);
+    assert_eq!(model.config.rms_eps, 2e-5);
 }
 
 #[test]
@@ -137,6 +153,7 @@ fn q8_0_forward_approximates_f32() {
         vocab_size: 64,
         seq_len: 8,
         shared_weights: true,
+        ..Default::default()
     };
     let backend = CpuBackend::new();
 

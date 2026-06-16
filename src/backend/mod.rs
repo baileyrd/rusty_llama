@@ -24,7 +24,7 @@ pub trait Backend: Send + Sync {
     /// RMSNorm: `out = x / sqrt(mean(x²) + eps) * weight`.
     ///
     /// `out`, `x` and `weight` all have the same length.
-    fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32]);
+    fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32);
 
     /// Matrix–vector product `out = W · x`.
     ///
@@ -35,8 +35,17 @@ pub trait Backend: Send + Sync {
     /// Apply rotary positional embeddings (RoPE) in place.
     ///
     /// Rotates the query vector `q` (length `n_heads * head_size`) and the key
-    /// vector `k` (length `kv_dim`) for absolute position `pos`.
-    fn rope(&self, q: &mut [f32], k: &mut [f32], pos: usize, head_size: usize, kv_dim: usize);
+    /// vector `k` (length `kv_dim`) for absolute position `pos`, using base
+    /// frequency `theta` (10000 for Llama-2, 500000 for Llama-3, …).
+    fn rope(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        pos: usize,
+        head_size: usize,
+        kv_dim: usize,
+        theta: f32,
+    );
 
     /// Grouped-query attention for the current position.
     ///
