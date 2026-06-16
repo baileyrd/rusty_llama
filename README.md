@@ -70,9 +70,10 @@ rusty_llama <checkpoint.bin> [options]
 | `config`        | Parse the 7-`int32` checkpoint header into hyper-parameters |
 | `loader`        | `mmap` the checkpoint file (zero-copy weights)              |
 | `gguf`          | Parse the GGUF container (metadata + tensor table)          |
-| `quant`         | GGML type table + dequantizers (Q4_0/Q8_0/Q4_K/Q6_K/F16)    |
+| `quant`         | GGML type table + per-block dequantizers (Q4_0/Q8_0/Q4_K/Q6_K/F16) |
+| `tensor`        | `QMatrix`: an f32-or-quantized weight matrix, dequantized on demand |
 | `model`         | Weight layout, KV-cache scratch, `forward`, and `from_gguf` |
-| `backend`       | `Backend` trait + `CpuBackend` (rayon + autovectorized SIMD)|
+| `backend`       | `Backend` trait + `CpuBackend` (rayon; f32 + on-the-fly quant matmul) |
 | `tokenizer`     | SentencePiece-style BPE encode/decode (from `.bin` or GGUF) |
 | `sampler`       | Greedy / temperature / top-p sampling                       |
 
@@ -86,6 +87,12 @@ the trait — the model code doesn't change.
 AVX2/AVX-512/FMA on this machine. The two hot kernels (`matmul`, `attention`)
 parallelize across cores with rayon. If you copy the binary to a different CPU,
 change that to `x86-64-v3` or remove it.
+
+Quantized GGUF weights are **not** expanded to f32 at load time — they're
+memory-mapped and each weight block is dequantized on the fly inside the
+matmul, so a Q4_K/Q8_0 model uses a fraction of the RAM an f32 copy would.
+(The integer-activation fast path llama.cpp uses for speed is future work; for
+now the dequantized values are multiplied in f32.)
 
 ## Tests
 
@@ -101,8 +108,8 @@ and that greedy generation reproduces.
 
 - [x] llama2.c fp32 checkpoints, CPU backend, BPE tokenizer, sampling
 - [x] GGUF container + quantized weights (F16, Q4_0, Q8_0, Q4_K, Q6_K) + GGUF SPM tokenizer
-- [ ] On-the-fly quantized matmul (keep weights compressed in RAM instead of dequantizing up front)
-- [ ] Explicit SIMD kernels & quantized dot-products
+- [x] On-the-fly quantized matmul — weights stay compressed in RAM (mmap), dequantized per block
+- [ ] Integer (Q8) activation path / explicit SIMD for faster quantized dot-products
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
 - [ ] Llama-3 (RoPE θ / scaling), byte-level BPE (`gpt2`) tokenizers, chat templating
 

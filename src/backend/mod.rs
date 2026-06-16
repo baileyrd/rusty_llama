@@ -12,22 +12,25 @@ mod cpu;
 
 pub use cpu::CpuBackend;
 
+use crate::tensor::QMatrix;
+
 /// The set of primitive operations the transformer is built from.
 ///
-/// Everything operates on plain `f32` slices for now. Shapes are passed
-/// explicitly rather than carried in a tensor type to keep the contract
-/// between the model and the backend completely transparent.
+/// Everything operates on plain `f32` slices for now, except matmul weights
+/// which are passed as a [`QMatrix`] so the kernel can dequantize on the fly.
+/// Shapes are otherwise passed explicitly to keep the contract between the
+/// model and the backend completely transparent.
 pub trait Backend: Send + Sync {
     /// RMSNorm: `out = x / sqrt(mean(x²) + eps) * weight`.
     ///
     /// `out`, `x` and `weight` all have the same length.
     fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32]);
 
-    /// Matrix–vector product `out[i] = Σ_j w[i*n + j] · x[j]`.
+    /// Matrix–vector product `out = W · x`.
     ///
-    /// `w` is a `(d, n)` row-major matrix, `x` has length `n`, `out` has
-    /// length `d`. This is *the* hot path of the whole engine.
-    fn matmul(&self, out: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize);
+    /// `w` is a `(rows, cols)` matrix (possibly quantized); `x` has length
+    /// `w.cols()`, `out` has length `w.rows()`. This is *the* hot path.
+    fn matmul(&self, out: &mut [f32], x: &[f32], w: &QMatrix);
 
     /// Apply rotary positional embeddings (RoPE) in place.
     ///

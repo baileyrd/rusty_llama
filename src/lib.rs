@@ -29,6 +29,7 @@ mod math;
 pub mod model;
 pub mod quant;
 pub mod sampler;
+pub mod tensor;
 pub mod tokenizer;
 
 mod loader;
@@ -41,4 +42,5 @@ pub use loader::Checkpoint;
 pub use model::{forward, generate, Model, RunState, Weights};
 pub use quant::GgmlType;
 pub use sampler::Sampler;
+pub use tensor::QMatrix;
 pub use tokenizer::Tokenizer;
