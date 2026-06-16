@@ -117,6 +117,9 @@ and that greedy generation reproduces.
 - [ ] Explicit SIMD intrinsics (e.g. AVX-512 VNNI) for the integer dot products
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
 
+See [`BACKLOG.md`](BACKLOG.md) for details on the unchecked items (the GPU
+backend is tagged for a local instance with GPU access).
+
 ## Credits
 
 The model format, tokenizer format, and reference math come from Andrej
