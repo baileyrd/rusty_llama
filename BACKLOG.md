@@ -83,15 +83,31 @@ access to a reference tokenizer / small real model):
 
 ---
 
-## 3. Explicit SIMD intrinsics for the integer dot products
+## 3. Explicit SIMD intrinsics for the integer dot products  (mostly done)
 
-**Why deferred:** the integer kernels (`src/quant.rs`: `vec_dot_q8_0`,
-`vec_dot_q4_0`, `vec_dot_q4_k`, `vec_dot_q6_k`) already autovectorize well under
-`target-cpu=native` (~3× over per-block f32 dequant), so the incremental win
-from hand-written AVX-512 VNNI (`_mm512_dpbusd_epi32`) / NEON is uncertain and
-the code is `unsafe` + platform-specific.
+**Done:** `src/quant.rs` now has a hand-written **AVX-512 VNNI** (`vpdpbusd` /
+`_mm256_dpbusd_epi32`) path for `vec_dot_q8_0`, `vec_dot_q4_0` and `vec_dot_q4_k`
+(the `x86` submodule). Each public `vec_dot_*` is a dispatcher that selects the
+SIMD kernel at run time via `is_x86_feature_detected!` (cached), falling back to
+the autovectorized scalar loop — which is also kept as the bit-identical oracle.
 
-If pursued: add a runtime-feature-gated (`is_x86_feature_detected!`) intrinsic
-path with the existing scalar loop as fallback, and a test asserting the SIMD
-result is **bit-identical** to the scalar one. Benchmark against the current
-`bench_q8_0_matmul` / `bench_q4_k_matmul` to confirm it's worth the complexity.
+The reduction stays entirely in integer arithmetic, so the SIMD result is
+**bit-for-bit identical** to the scalar one. `vpdpbusd` needs an unsigned weight
+operand: Q4_K nibbles are already unsigned `[0,15]` so they map straight on;
+Q8_0/Q4_0 weights are signed, so they're biased `+128` and the bias removed
+exactly using the activation's per-block sums (`Q8Activation::block_sums`).
+
+- **Parity:** `q8_0/q4_0/q4_k_simd_matches_scalar` fuzz the kernels and assert
+  `f32::to_bits` equality. An end-to-end greedy run is byte-identical with the
+  SIMD path on vs off (`RUSTY_LLAMA_NO_VNNI=1`).
+- **Benchmark:** `bench_{q8_0,q4_0,q4_k}_simd_vs_scalar` — measured **2.2–2.5×**
+  over the autovectorized path (2048×2048), and ~**2×** end to end on a
+  TinyLlama-width Q8_0 model. So yes, it's worth it.
+
+**Still TODO:**
+- **Q6_K.** `vec_dot_q6_k` is still scalar. Its 6-bit weights are reconstructed
+  from split `ql`/`qh` planes (the bulk of its work) and its scales are per-16,
+  not per-32, so it doesn't fit the 32-wide `vpdpbusd` helper as cleanly; the
+  same bias trick (`a+32`, corrected by the per-16 `bsums`) would apply over
+  128-bit lanes.
+- **NEON.** No aarch64 path yet; the dispatchers fall through to scalar there.
