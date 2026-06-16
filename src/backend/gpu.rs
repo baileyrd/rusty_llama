@@ -785,6 +785,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_matmul_gpu_vs_cpu() {
+        use std::time::Instant;
+        let Some(g) = gpu() else { return };
+
+        let (rows, cols, iters) = (4096usize, 4096usize, 50);
+        let wf = noise(rows * cols, 99);
+        let w = QMatrix::f32(wf.into(), rows, cols).unwrap();
+        let x = noise(cols, 100);
+        let mut out = vec![0.0; rows];
+
+        // Warm up: first GPU matmul uploads + caches the resident weight.
+        g.matmul(&mut out, &x, &w);
+
+        let t = Instant::now();
+        for _ in 0..iters {
+            g.matmul(&mut out, &x, &w);
+        }
+        let gpu = t.elapsed();
+
+        let cpu_backend = CpuBackend::new();
+        let t = Instant::now();
+        for _ in 0..iters {
+            cpu_backend.matmul(&mut out, &x, &w);
+        }
+        let cpu = t.elapsed();
+
+        eprintln!(
+            "matmul {rows}x{cols} x{iters} (weight resident): \
+             gpu={:.3}ms/op cpu={:.3}ms/op  -> gpu is {:.2}x the cpu time",
+            gpu.as_secs_f64() * 1e3 / iters as f64,
+            cpu.as_secs_f64() * 1e3 / iters as f64,
+            gpu.as_secs_f64() / cpu.as_secs_f64(),
+        );
+    }
+
+    #[test]
     fn attention_gqa_parity() {
         let Some(g) = gpu() else { return };
         // 4 query heads, 2 kv heads, head_size 4, a few timesteps populated.
