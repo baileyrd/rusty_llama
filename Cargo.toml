@@ -1,0 +1,17 @@
+[package]
+name = "rusty_llama"
+version = "0.1.0"
+edition = "2021"
+description = "A from-scratch Llama (llama2.c-format) inference engine in Rust"
+license = "MIT"
+repository = "https://github.com/baileyrd/rusty_llama"
+readme = "README.md"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
