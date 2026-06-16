@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rusty_llama::{generate, Checkpoint, CpuBackend, RunState, Sampler, Tokenizer};
+use rusty_llama::{generate, Checkpoint, CpuBackend, Gguf, Model, RunState, Sampler, Tokenizer};
 
 const USAGE: &str = "\
 Usage: rusty_llama <checkpoint.bin> [options]
@@ -54,10 +54,23 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let checkpoint = Checkpoint::open(&args.checkpoint)
         .map_err(|e| format!("failed to open checkpoint '{}': {e}", args.checkpoint))?;
-    let model = checkpoint.model()?;
-    let tokenizer = Tokenizer::load(&args.tokenizer, model.config.vocab_size)
-        .map_err(|e| format!("failed to load tokenizer '{}': {e}", args.tokenizer))?;
 
+    // GGUF files carry their own tokenizer; llama2.c checkpoints need -z.
+    if Gguf::is_gguf(checkpoint.bytes()) {
+        let gguf = Gguf::parse(checkpoint.bytes())?;
+        let model = Model::from_gguf(&gguf)?;
+        let tokenizer = Tokenizer::from_gguf(&gguf)
+            .map_err(|e| format!("failed to read GGUF tokenizer: {e}"))?;
+        run_generation(&model, &tokenizer, &args)
+    } else {
+        let model = checkpoint.model()?;
+        let tokenizer = Tokenizer::load(&args.tokenizer, model.config.vocab_size)
+            .map_err(|e| format!("failed to load tokenizer '{}': {e}", args.tokenizer))?;
+        run_generation(&model, &tokenizer, &args)
+    }
+}
+
+fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
     let backend = CpuBackend::new();
     let mut state = RunState::new(&model.config);
     let mut sampler = Sampler::new(
@@ -71,10 +84,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut out = stdout.lock();
     let start = Instant::now();
     let generated = generate(
-        &model,
+        model,
         &mut state,
         &backend,
-        &tokenizer,
+        tokenizer,
         &mut sampler,
         &args.prompt,
         args.steps,

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::gguf::{Gguf, MetaValue};
 
 /// A trained BPE vocabulary plus the merge logic to apply it.
 pub struct Tokenizer {
@@ -88,6 +89,42 @@ impl Tokenizer {
         let mut tk = Tokenizer::from_vocab(vocab, scores);
         tk.max_token_length = max_token_length;
         Ok(tk)
+    }
+
+    /// Build a tokenizer from a GGUF file's embedded SentencePiece vocabulary.
+    ///
+    /// Reads `tokenizer.ggml.tokens` and `tokenizer.ggml.scores`, converting the
+    /// SentencePiece whitespace marker `▁` (U+2581) to a plain space so the same
+    /// encode/decode logic as the llama2.c `tokenizer.bin` path applies. This
+    /// handles `llama`/SPM tokenizers (Llama-2, TinyLlama); byte-level BPE
+    /// (`gpt2`) tokenizers are not yet supported.
+    pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        if let Ok(model) = gguf.meta_str("tokenizer.ggml.model") {
+            if model != "llama" {
+                return Err(Error::Format(format!(
+                    "unsupported GGUF tokenizer model '{model}' (only 'llama'/SPM)"
+                )));
+            }
+        }
+        let tokens = match gguf.meta("tokenizer.ggml.tokens") {
+            Some(MetaValue::Array(a)) => a,
+            _ => return Err(Error::Format("GGUF missing tokenizer.ggml.tokens".into())),
+        };
+        let vocab: Vec<Vec<u8>> = tokens
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map(normalize_spm_piece)
+                    .ok_or_else(|| Error::Format("non-string token in GGUF vocab".into()))
+            })
+            .collect::<Result<_>>()?;
+
+        let scores = match gguf.meta("tokenizer.ggml.scores") {
+            Some(MetaValue::Array(a)) => a.iter().map(|v| v.as_f32().unwrap_or(0.0)).collect(),
+            _ => vec![0.0; vocab.len()], // some models omit scores
+        };
+
+        Ok(Tokenizer::from_vocab(vocab, scores))
     }
 
     /// Encode `text` into token ids, optionally bracketing with BOS/EOS.
@@ -177,6 +214,12 @@ impl Tokenizer {
     }
 }
 
+/// Convert a SentencePiece piece to the byte form this tokenizer uses,
+/// replacing the `▁` whitespace marker (U+2581) with a regular space.
+fn normalize_spm_piece(s: &str) -> Vec<u8> {
+    s.replace('\u{2581}', " ").into_bytes()
+}
+
 /// Parse a `<0xXX>` raw-byte token into its byte value, if it is one.
 fn parse_byte_token(bytes: &[u8]) -> Option<u8> {
     if bytes.len() == 6 && bytes.starts_with(b"<0x") && bytes.last() == Some(&b'>') {
@@ -242,6 +285,12 @@ mod tests {
             prev = id;
         }
         assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn spm_marker_becomes_space() {
+        assert_eq!(normalize_spm_piece("\u{2581}the"), b" the");
+        assert_eq!(normalize_spm_piece("of"), b"of");
     }
 
     #[test]

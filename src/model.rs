@@ -1,41 +1,46 @@
 //! Weight layout, run-time scratch buffers, and the transformer forward pass.
 
+use std::borrow::Cow;
+
 use crate::backend::Backend;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::gguf::Gguf;
+use crate::quant::dequantize;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
 
-/// Borrowed views into the (memory-mapped) weight tensors.
+/// The transformer's weight tensors.
 ///
-/// Every field points directly into the checkpoint bytes — loading a model is
-/// zero-copy. Per-layer weights are stored contiguously and indexed with plain
-/// slice arithmetic in [`forward`].
+/// Each field is a [`Cow`] so a tensor can either *borrow* directly from a
+/// memory-mapped checkpoint (the zero-copy llama2.c path) or *own* a freshly
+/// dequantized buffer (the GGUF path). Per-layer weights are stored
+/// contiguously and indexed with plain slice arithmetic in [`forward`].
 pub struct Weights<'a> {
     /// `(vocab_size, dim)` token embedding table.
-    pub token_embedding_table: &'a [f32],
+    pub token_embedding_table: Cow<'a, [f32]>,
     /// `(n_layers, dim)` attention RMSNorm weights.
-    pub rms_att_weight: &'a [f32],
+    pub rms_att_weight: Cow<'a, [f32]>,
     /// `(n_layers, dim, dim)` query projection.
-    pub wq: &'a [f32],
+    pub wq: Cow<'a, [f32]>,
     /// `(n_layers, kv_dim, dim)` key projection.
-    pub wk: &'a [f32],
+    pub wk: Cow<'a, [f32]>,
     /// `(n_layers, kv_dim, dim)` value projection.
-    pub wv: &'a [f32],
+    pub wv: Cow<'a, [f32]>,
     /// `(n_layers, dim, dim)` attention output projection.
-    pub wo: &'a [f32],
+    pub wo: Cow<'a, [f32]>,
     /// `(n_layers, dim)` feed-forward RMSNorm weights.
-    pub rms_ffn_weight: &'a [f32],
+    pub rms_ffn_weight: Cow<'a, [f32]>,
     /// `(n_layers, hidden_dim, dim)` SwiGLU gate projection.
-    pub w1: &'a [f32],
+    pub w1: Cow<'a, [f32]>,
     /// `(n_layers, dim, hidden_dim)` SwiGLU down projection.
-    pub w2: &'a [f32],
+    pub w2: Cow<'a, [f32]>,
     /// `(n_layers, hidden_dim, dim)` SwiGLU up projection.
-    pub w3: &'a [f32],
+    pub w3: Cow<'a, [f32]>,
     /// `(dim,)` final RMSNorm weights.
-    pub rms_final_weight: &'a [f32],
+    pub rms_final_weight: Cow<'a, [f32]>,
     /// `(vocab_size, dim)` output classifier (may alias `token_embedding_table`).
-    pub wcls: &'a [f32],
+    pub wcls: Cow<'a, [f32]>,
 }
 
 /// A parsed model: hyper-parameters plus borrowed weights.
@@ -98,21 +103,149 @@ impl<'a> Model<'a> {
         Ok(Model {
             config,
             weights: Weights {
-                token_embedding_table,
-                rms_att_weight,
-                wq,
-                wk,
-                wv,
-                wo,
-                rms_ffn_weight,
-                w1,
-                w2,
-                w3,
-                rms_final_weight,
-                wcls,
+                token_embedding_table: Cow::Borrowed(token_embedding_table),
+                rms_att_weight: Cow::Borrowed(rms_att_weight),
+                wq: Cow::Borrowed(wq),
+                wk: Cow::Borrowed(wk),
+                wv: Cow::Borrowed(wv),
+                wo: Cow::Borrowed(wo),
+                rms_ffn_weight: Cow::Borrowed(rms_ffn_weight),
+                w1: Cow::Borrowed(w1),
+                w2: Cow::Borrowed(w2),
+                w3: Cow::Borrowed(w3),
+                rms_final_weight: Cow::Borrowed(rms_final_weight),
+                wcls: Cow::Borrowed(wcls),
             },
         })
     }
+}
+
+impl Model<'static> {
+    /// Build a model from a parsed GGUF file, dequantizing every weight to f32.
+    ///
+    /// Supports the `llama` architecture (and anything sharing its tensor
+    /// naming). The returned model owns its (dequantized) weights, so it does
+    /// not borrow from `gguf`.
+    ///
+    /// Note: RoPE theta is fixed at 10000 and RMSNorm epsilon at 1e-5, which is
+    /// correct for Llama-2 / TinyStories / TinyLlama. Models that override
+    /// those (e.g. Llama-3's theta of 500000) are not yet handled.
+    pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let arch = gguf.meta_str("general.architecture")?.to_owned();
+        let key = |k: &str| format!("{arch}.{k}");
+
+        let dim = gguf.meta_u64(&key("embedding_length"))? as usize;
+        let n_layers = gguf.meta_u64(&key("block_count"))? as usize;
+        let n_heads = gguf.meta_u64(&key("attention.head_count"))? as usize;
+        let n_kv_heads = gguf
+            .meta_u64(&key("attention.head_count_kv"))
+            .unwrap_or(n_heads as u64) as usize;
+        let hidden_dim = gguf.meta_u64(&key("feed_forward_length"))? as usize;
+        let seq_len = gguf.meta_u64(&key("context_length"))? as usize;
+
+        // Vocabulary size = second dimension of the embedding tensor.
+        let tok_embd = gguf
+            .tensor("token_embd.weight")
+            .ok_or_else(|| Error::Format("GGUF missing token_embd.weight".into()))?;
+        let vocab_size = *tok_embd
+            .dims
+            .get(1)
+            .ok_or_else(|| Error::Format("token_embd.weight is not 2-D".into()))?
+            as usize;
+
+        // A separate classifier tensor means weights are not shared.
+        let shared_weights = gguf.tensor("output.weight").is_none();
+
+        let config = Config {
+            dim,
+            hidden_dim,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            vocab_size,
+            seq_len,
+            shared_weights,
+        };
+        config.validate()?;
+        let kv_dim = config.kv_dim();
+
+        // Per-layer tensors are concatenated into the contiguous layout
+        // `forward` expects.
+        let concat = |suffix: &str| -> Result<Vec<f32>> {
+            let mut v = Vec::new();
+            for i in 0..n_layers {
+                v.extend_from_slice(&deq_tensor(gguf, &format!("blk.{i}.{suffix}"))?);
+            }
+            Ok(v)
+        };
+
+        let token_embedding_table = deq_tensor(gguf, "token_embd.weight")?;
+        let rms_final_weight = deq_tensor(gguf, "output_norm.weight")?;
+        let wcls = if shared_weights {
+            token_embedding_table.clone()
+        } else {
+            deq_tensor(gguf, "output.weight")?
+        };
+        let rms_att_weight = concat("attn_norm.weight")?;
+        let wq = concat("attn_q.weight")?;
+        let wk = concat("attn_k.weight")?;
+        let wv = concat("attn_v.weight")?;
+        let wo = concat("attn_output.weight")?;
+        let rms_ffn_weight = concat("ffn_norm.weight")?;
+        let w1 = concat("ffn_gate.weight")?;
+        let w2 = concat("ffn_down.weight")?;
+        let w3 = concat("ffn_up.weight")?;
+
+        // Make sure every tensor matched the shape the forward pass assumes.
+        check_len("token_embd", token_embedding_table.len(), vocab_size * dim)?;
+        check_len("output_norm", rms_final_weight.len(), dim)?;
+        check_len("output/wcls", wcls.len(), vocab_size * dim)?;
+        check_len("attn_norm", rms_att_weight.len(), n_layers * dim)?;
+        check_len("attn_q", wq.len(), n_layers * dim * dim)?;
+        check_len("attn_k", wk.len(), n_layers * kv_dim * dim)?;
+        check_len("attn_v", wv.len(), n_layers * kv_dim * dim)?;
+        check_len("attn_output", wo.len(), n_layers * dim * dim)?;
+        check_len("ffn_norm", rms_ffn_weight.len(), n_layers * dim)?;
+        check_len("ffn_gate", w1.len(), n_layers * hidden_dim * dim)?;
+        check_len("ffn_down", w2.len(), n_layers * dim * hidden_dim)?;
+        check_len("ffn_up", w3.len(), n_layers * hidden_dim * dim)?;
+
+        Ok(Model {
+            config,
+            weights: Weights {
+                token_embedding_table: Cow::Owned(token_embedding_table),
+                rms_att_weight: Cow::Owned(rms_att_weight),
+                wq: Cow::Owned(wq),
+                wk: Cow::Owned(wk),
+                wv: Cow::Owned(wv),
+                wo: Cow::Owned(wo),
+                rms_ffn_weight: Cow::Owned(rms_ffn_weight),
+                w1: Cow::Owned(w1),
+                w2: Cow::Owned(w2),
+                w3: Cow::Owned(w3),
+                rms_final_weight: Cow::Owned(rms_final_weight),
+                wcls: Cow::Owned(wcls),
+            },
+        })
+    }
+}
+
+/// Dequantize a named GGUF tensor to a fresh `f32` buffer.
+fn deq_tensor(gguf: &Gguf, name: &str) -> Result<Vec<f32>> {
+    let info = gguf
+        .tensor(name)
+        .ok_or_else(|| Error::Format(format!("GGUF missing tensor '{name}'")))?;
+    dequantize(info.ggml_type, gguf.tensor_bytes(info)?, info.n_elements())
+}
+
+/// Error unless `got == want` elements were produced for `name`.
+fn check_len(name: &str, got: usize, want: usize) -> Result<()> {
+    if got != want {
+        return Err(Error::Format(format!(
+            "tensor '{name}': expected {want} elements, got {got}"
+        )));
+    }
+    Ok(())
 }
 
 /// Mutable scratch space reused across forward passes, including the KV cache.
@@ -184,7 +317,7 @@ pub fn forward(
 
     for layer in 0..p.n_layers {
         // --- Attention ---------------------------------------------------
-        backend.rmsnorm(&mut state.xb, &state.x, slice(w.rms_att_weight, layer, dim));
+        backend.rmsnorm(&mut state.xb, &state.x, slice(&w.rms_att_weight, layer, dim));
 
         let loff = layer * p.seq_len * kv_dim;
         let kv_at = loff + pos * kv_dim;
@@ -192,21 +325,21 @@ pub fn forward(
         backend.matmul(
             &mut state.q,
             &state.xb,
-            slice(w.wq, layer, dim * dim),
+            slice(&w.wq, layer, dim * dim),
             dim,
             dim,
         );
         backend.matmul(
             &mut state.key_cache[kv_at..kv_at + kv_dim],
             &state.xb,
-            slice(w.wk, layer, dim * kv_dim),
+            slice(&w.wk, layer, dim * kv_dim),
             dim,
             kv_dim,
         );
         backend.matmul(
             &mut state.value_cache[kv_at..kv_at + kv_dim],
             &state.xb,
-            slice(w.wv, layer, dim * kv_dim),
+            slice(&w.wv, layer, dim * kv_dim),
             dim,
             kv_dim,
         );
@@ -236,25 +369,25 @@ pub fn forward(
         backend.matmul(
             &mut state.xb2,
             &state.xb,
-            slice(w.wo, layer, dim * dim),
+            slice(&w.wo, layer, dim * dim),
             dim,
             dim,
         );
         backend.add(&mut state.x, &state.xb2);
 
         // --- Feed-forward (SwiGLU) --------------------------------------
-        backend.rmsnorm(&mut state.xb, &state.x, slice(w.rms_ffn_weight, layer, dim));
+        backend.rmsnorm(&mut state.xb, &state.x, slice(&w.rms_ffn_weight, layer, dim));
         backend.matmul(
             &mut state.hb,
             &state.xb,
-            slice(w.w1, layer, dim * hidden),
+            slice(&w.w1, layer, dim * hidden),
             dim,
             hidden,
         );
         backend.matmul(
             &mut state.hb2,
             &state.xb,
-            slice(w.w3, layer, dim * hidden),
+            slice(&w.w3, layer, dim * hidden),
             dim,
             hidden,
         );
@@ -262,7 +395,7 @@ pub fn forward(
         backend.matmul(
             &mut state.xb,
             &state.hb,
-            slice(w.w2, layer, hidden * dim),
+            slice(&w.w2, layer, hidden * dim),
             hidden,
             dim,
         );
@@ -270,8 +403,8 @@ pub fn forward(
     }
 
     // Final norm (written into `xb` to avoid aliasing `x`) then classifier.
-    backend.rmsnorm(&mut state.xb, &state.x, w.rms_final_weight);
-    backend.matmul(&mut state.logits, &state.xb, w.wcls, dim, p.vocab_size);
+    backend.rmsnorm(&mut state.xb, &state.x, &w.rms_final_weight);
+    backend.matmul(&mut state.logits, &state.xb, &w.wcls, dim, p.vocab_size);
 }
 
 /// Autoregressively generate from `prompt`, streaming decoded bytes to

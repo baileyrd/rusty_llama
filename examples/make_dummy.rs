@@ -1,22 +1,26 @@
-//! Write a small, randomly-weighted checkpoint in the llama2.c format.
-//!
-//! Useful for trying the CLI end-to-end without downloading real weights:
+//! Write a small, randomly-weighted model for trying the CLI without
+//! downloading real weights. The output format is chosen by the file
+//! extension: `.gguf` → GGUF (with an embedded dummy tokenizer), anything else
+//! → llama2.c checkpoint (needs a separate `tokenizer.bin`).
 //!
 //! ```sh
+//! # GGUF (self-contained):
+//! cargo run --release --example make_dummy -- dummy.gguf
+//! cargo run --release -- dummy.gguf -i "hi" -n 16
+//!
+//! # llama2.c (bring your own tokenizer):
 //! cargo run --release --example make_dummy -- dummy.bin
-//! ./scripts/download_assets.sh        # just for a real tokenizer.bin
 //! cargo run --release -- dummy.bin -z tokenizer.bin -i "Once upon a time" -n 32
 //! ```
 //!
-//! The vocabulary size matches the real Llama tokenizer (32000) so the output
-//! decodes to genuine sub-words — it's just gibberish because the weights are
-//! noise.
+//! The weights are noise, so the text is gibberish — this only proves the
+//! pipeline runs.
 
-use rusty_llama::dummy::synthetic_checkpoint;
+use rusty_llama::dummy::{synthetic_checkpoint, synthetic_gguf};
 use rusty_llama::Config;
 
 fn main() -> std::io::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "dummy.bin".into());
+    let path = std::env::args().nth(1).unwrap_or_else(|| "dummy.gguf".into());
 
     let config = Config {
         dim: 64,
@@ -29,7 +33,11 @@ fn main() -> std::io::Result<()> {
         shared_weights: true,
     };
 
-    let bytes = synthetic_checkpoint(&config);
+    let bytes = if path.ends_with(".gguf") {
+        synthetic_gguf(&config)
+    } else {
+        synthetic_checkpoint(&config)
+    };
     std::fs::write(&path, &bytes)?;
     println!("wrote {} ({} bytes) {config:?}", path, bytes.len());
     Ok(())
