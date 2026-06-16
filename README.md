@@ -70,7 +70,7 @@ rusty_llama <checkpoint.bin> [options]
 | `config`        | Parse the 7-`int32` checkpoint header into hyper-parameters |
 | `loader`        | `mmap` the checkpoint file (zero-copy weights)              |
 | `gguf`          | Parse the GGUF container (metadata + tensor table)          |
-| `quant`         | GGML type table + per-block dequantizers (Q4_0/Q8_0/Q4_K/Q6_K/F16) |
+| `quant`         | GGML type table, per-block dequantizers, integer dot kernels (scalar + AVX-512 VNNI) |
 | `tensor`        | `QMatrix`: an f32-or-quantized weight matrix, dequantized on demand |
 | `model`         | Weight layout, KV-cache scratch, `forward`, and `from_gguf` |
 | `backend`       | `Backend` trait + `CpuBackend` (rayon; f32 + on-the-fly quant matmul) |
@@ -96,6 +96,16 @@ That's ≈3× faster than per-block f32 dequant on this machine (see the
 `bench_q8_0_matmul` / `bench_q4_k_matmul` tests) and uses a fraction of the RAM
 an f32 copy would.
 
+On CPUs with **AVX-512 VNNI**, the Q8_0/Q4_0/Q4_K integer dot products use a
+hand-written `vpdpbusd` kernel (`src/quant.rs`, the `x86` module) selected at
+run time via `is_x86_feature_detected!`, with the autovectorized scalar loop as
+the fallback everywhere else. Because the whole reduction stays in integer
+arithmetic, the SIMD result is **bit-for-bit identical** to the scalar one (the
+`*_simd_matches_scalar` tests assert this), so it's a pure speed swap with no
+effect on output. It runs ≈2.2–2.5× faster than the autovectorized path at the
+kernel level (`bench_*_simd_vs_scalar`) and ≈2× end to end on a quantized model.
+Set `RUSTY_LLAMA_NO_VNNI=1` to force the scalar path (handy for A/B timing).
+
 ## Tests
 
 ```sh
@@ -115,7 +125,7 @@ and that greedy generation reproduces.
 - [x] Per-model RoPE base (θ) and RMSNorm epsilon read from GGUF (Llama-3 / Qwen2 θ honoured)
 - [x] Byte-level BPE (`gpt2`) tokenizer — Llama-3 / Qwen2 vocabularies load
 - [ ] RoPE long-context scaling (`linear`/`yarn`/`llama3`) + byte-exact pretokenizer regex
-- [ ] Explicit SIMD intrinsics (e.g. AVX-512 VNNI) for the integer dot products
+- [x] Explicit AVX-512 VNNI (`vpdpbusd`) integer dot products for Q8_0/Q4_0/Q4_K (~2.2–2.5×, bit-identical to scalar)
 - [ ] GPU backend (`wgpu`/CUDA) behind the existing `Backend` trait
 
 See [`BACKLOG.md`](BACKLOG.md) for details on the unchecked items (the GPU
