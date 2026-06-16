@@ -8,8 +8,8 @@
 
 use rusty_llama::dummy::synthetic_gguf_typed;
 use rusty_llama::{
-    forward, generate, Backend, Config, CpuBackend, GgmlType, Gguf, GpuBackend, Model, RunState,
-    Sampler, Tokenizer,
+    forward, forward_prefill, generate, Backend, Config, CpuBackend, GgmlType, Gguf, GpuBackend,
+    Model, RunState, Sampler, Tokenizer,
 };
 
 /// dim/hidden are multiples of 32 so the same config serializes as Q8_0 too.
@@ -78,6 +78,37 @@ fn forward_logits_match_cpu() {
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-2, "{ty:?}: logits diverge by {max_diff}");
         assert_eq!(argmax(&cpu), argmax(&gpu_l), "{ty:?}: greedy token differs");
+    }
+}
+
+/// The whole batched prefill path (every batched GPU op, through all layers)
+/// must track the CPU result and pick the same next token, for F32 and Q8_0.
+#[test]
+fn prefill_matches_cpu() {
+    let c = cfg();
+    for ty in [GgmlType::F32, GgmlType::Q8_0] {
+        let Some(g) = gpu() else { return };
+        let bytes = synthetic_gguf_typed(&c, ty);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let model = Model::from_gguf(&gguf).unwrap();
+        let tokens: Vec<usize> = vec![3, 8, 1, 5, 9, 2, 40, 17];
+
+        let logits = |backend: &dyn Backend| -> Vec<f32> {
+            let mut s = RunState::new(&model.config);
+            forward_prefill(&model, &mut s, backend, &tokens, 0);
+            s.logits().to_vec()
+        };
+        let cpu = logits(&CpuBackend::new());
+        let gpu_l = logits(&g);
+
+        assert!(gpu_l.iter().all(|v| v.is_finite()));
+        let max_diff = cpu
+            .iter()
+            .zip(&gpu_l)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-2, "{ty:?}: prefill logits diverge by {max_diff}");
+        assert_eq!(argmax(&cpu), argmax(&gpu_l), "{ty:?}: prefill greedy token differs");
     }
 }
 
