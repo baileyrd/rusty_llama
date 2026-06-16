@@ -291,6 +291,12 @@ pub struct Q8Activation {
     pub qs: Vec<i8>,
     /// Per-block scale (`qs.len() / 32` entries).
     pub scales: Vec<f32>,
+    /// Sum of the quantized values in each 32-block (`qs.len() / 32` entries).
+    ///
+    /// Only the AVX-512 VNNI dot products read this: `vpdpbusd` needs an
+    /// *unsigned* weight operand, so the signed Q8_0/Q4_0 weights are biased by
+    /// `+128` and this exact `Σx` per block lets us subtract the bias back out.
+    pub block_sums: Vec<i32>,
 }
 
 impl Q8Activation {
@@ -311,23 +317,45 @@ pub fn quantize_activation_q8(x: &[f32]) -> Q8Activation {
     debug_assert!(x.len().is_multiple_of(32));
     let mut qs = Vec::with_capacity(x.len());
     let mut scales = Vec::with_capacity(x.len() / 32);
+    let mut block_sums = Vec::with_capacity(x.len() / 32);
     for blk in x.chunks_exact(32) {
         let amax = blk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         let d = amax / 127.0;
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         scales.push(d);
+        let mut bs: i32 = 0;
         for &v in blk {
-            qs.push(((v * id).round() as i32).clamp(-128, 127) as i8);
+            let q = ((v * id).round() as i32).clamp(-128, 127) as i8;
+            qs.push(q);
+            bs += q as i32;
         }
+        block_sums.push(bs);
     }
-    Q8Activation { qs, scales }
+    Q8Activation {
+        qs,
+        scales,
+        block_sums,
+    }
 }
 
 /// Dot product of a Q8_0 weight row with a Q8-quantized activation.
 ///
 /// Equals `dequantize(Q8_0, weight) · act.dequantized()`, but the per-block
 /// inner sum is done in integer arithmetic with a single f32 scale at the end.
+///
+/// Dispatches to an AVX-512 VNNI implementation when the CPU supports it (see
+/// the [`x86`] module); the SIMD result is *bit-identical* to the scalar one.
 pub fn vec_dot_q8_0(weight: &[u8], act: &Q8Activation) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if x86::vnni_supported() {
+        // SAFETY: the required AVX-512 features were just feature-detected.
+        return unsafe { x86::vec_dot_q8_0(weight, act) };
+    }
+    vec_dot_q8_0_scalar(weight, act)
+}
+
+/// Scalar reference for [`vec_dot_q8_0`] (portable; also the SIMD oracle).
+fn vec_dot_q8_0_scalar(weight: &[u8], act: &Q8Activation) -> f32 {
     let mut acc = 0.0f32;
     for (b, blk) in weight.chunks_exact(34).enumerate() {
         let dw = rd_f16(blk, 0);
@@ -342,7 +370,19 @@ pub fn vec_dot_q8_0(weight: &[u8], act: &Q8Activation) -> f32 {
 }
 
 /// Dot product of a Q4_0 weight row with a Q8-quantized activation.
+///
+/// Dispatches to AVX-512 VNNI when available (bit-identical to the scalar path).
 pub fn vec_dot_q4_0(weight: &[u8], act: &Q8Activation) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if x86::vnni_supported() {
+        // SAFETY: the required AVX-512 features were just feature-detected.
+        return unsafe { x86::vec_dot_q4_0(weight, act) };
+    }
+    vec_dot_q4_0_scalar(weight, act)
+}
+
+/// Scalar reference for [`vec_dot_q4_0`] (portable; also the SIMD oracle).
+fn vec_dot_q4_0_scalar(weight: &[u8], act: &Q8Activation) -> f32 {
     let mut acc = 0.0f32;
     for (b, blk) in weight.chunks_exact(18).enumerate() {
         let dw = rd_f16(blk, 0);
@@ -422,7 +462,19 @@ pub fn quantize_activation_q8k(x: &[f32]) -> Q8KActivation {
 /// Equals `dequantize(Q4_K, weight) · act.dequantized()`: the per-sub-block
 /// products run in integer arithmetic, the per-block min term is folded in via
 /// the activation's `bsums`, and only the two block scales hit f32.
+///
+/// Dispatches to AVX-512 VNNI when available (bit-identical to the scalar path).
 pub fn vec_dot_q4_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if x86::vnni_supported() {
+        // SAFETY: the required AVX-512 features were just feature-detected.
+        return unsafe { x86::vec_dot_q4_k(weight, act) };
+    }
+    vec_dot_q4_k_scalar(weight, act)
+}
+
+/// Scalar reference for [`vec_dot_q4_k`] (portable; also the SIMD oracle).
+fn vec_dot_q4_k_scalar(weight: &[u8], act: &Q8KActivation) -> f32 {
     let mut total = 0.0f32;
     for (sb, wblk) in weight.chunks_exact(144).enumerate() {
         let d = rd_f16(wblk, 0);
@@ -499,6 +551,159 @@ pub fn has_int8_path(ty: GgmlType) -> bool {
         ty,
         GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q4_K | GgmlType::Q6_K
     )
+}
+
+// --- AVX-512 VNNI integer dot products (x86_64) -----------------------------
+//
+// The scalar `vec_dot_*` kernels above already autovectorize under
+// `target-cpu=native`. On CPUs with AVX-512 VNNI we can do better: a single
+// `vpdpbusd` (`_mm256_dpbusd_epi32`) multiplies 32 `u8`×`i8` byte pairs and
+// accumulates the products into i32 lanes — the exact integer inner product the
+// scalar loop computes by hand. Because the whole reduction stays in *integer*
+// arithmetic and the surrounding per-block f32 scaling is left untouched, the
+// SIMD result is bit-for-bit identical to the scalar one (asserted by the
+// `*_simd_matches_scalar` tests), so this is a pure speed swap that the
+// dispatchers above select at run time via `is_x86_feature_detected!`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86 {
+    use super::{get_scale_min_k4, rd_f16, Q8Activation, Q8KActivation};
+    use core::arch::x86_64::*;
+    use std::sync::OnceLock;
+
+    /// Whether the VNNI kernels should be used: this CPU has the required
+    /// AVX-512 subset (`vpdpbusd` plus the 256-bit byte ops around it) and the
+    /// `RUSTY_LLAMA_NO_VNNI` escape hatch is unset. Cached after the first query
+    /// so the hot dispatch path is a single load. The env var lets you A/B the
+    /// SIMD path against the scalar fallback end to end (`RUSTY_LLAMA_NO_VNNI=1`).
+    pub fn vnni_supported() -> bool {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            std::env::var_os("RUSTY_LLAMA_NO_VNNI").is_none()
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512vnni")
+        })
+    }
+
+    /// Horizontal sum of the eight i32 lanes of a 256-bit vector.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum_i32_x8(v: __m256i) -> i32 {
+        let s = _mm_add_epi32(
+            _mm256_castsi256_si128(v),
+            _mm256_extracti128_si256::<1>(v),
+        );
+        let s = _mm_hadd_epi32(s, s);
+        let s = _mm_hadd_epi32(s, s);
+        _mm_cvtsi128_si32(s)
+    }
+
+    /// Exact `Σ_{i<32} w[i]·x[i]` for one 32-element block where both operands
+    /// are signed `i8`. `vpdpbusd` needs an *unsigned* weight operand, so `w` is
+    /// biased by `+128` (`^ 0x80`) and the bias removed exactly afterwards using
+    /// the precomputed `xsum = Σx`: `Σ(w+128)·x = Σ w·x + 128·Σx`.
+    #[inline]
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+    unsafe fn dot32_signed(w: __m256i, x: __m256i, xsum: i32) -> i32 {
+        let wu = _mm256_xor_si256(w, _mm256_set1_epi8(0x80u8 as i8));
+        let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), wu, x);
+        hsum_i32_x8(dot) - 128 * xsum
+    }
+
+    /// AVX-512 VNNI implementation of [`super::vec_dot_q8_0`].
+    ///
+    /// # Safety
+    /// [`vnni_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+    pub unsafe fn vec_dot_q8_0(weight: &[u8], act: &Q8Activation) -> f32 {
+        let mut acc = 0.0f32;
+        for (b, blk) in weight.chunks_exact(34).enumerate() {
+            let dw = rd_f16(blk, 0);
+            let w = _mm256_loadu_si256(blk.as_ptr().add(2) as *const __m256i);
+            let x = _mm256_loadu_si256(act.qs.as_ptr().add(b * 32) as *const __m256i);
+            let sum = dot32_signed(w, x, act.block_sums[b]);
+            acc += dw * act.scales[b] * sum as f32;
+        }
+        acc
+    }
+
+    /// AVX-512 VNNI implementation of [`super::vec_dot_q4_0`].
+    ///
+    /// # Safety
+    /// [`vnni_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+    pub unsafe fn vec_dot_q4_0(weight: &[u8], act: &Q8Activation) -> f32 {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let eight = _mm256_set1_epi8(8);
+        let mut acc = 0.0f32;
+        for (b, blk) in weight.chunks_exact(18).enumerate() {
+            let dw = rd_f16(blk, 0);
+            // The 16 packed bytes hold element j's low nibble (output index j)
+            // and high nibble (output index j+16). Broadcast them to both
+            // halves, keep low nibbles in the lower half and high nibbles in the
+            // upper half, then subtract the Q4_0 zero point of 8.
+            let packed = _mm_loadu_si128(blk.as_ptr().add(2) as *const __m128i);
+            let v = _mm256_broadcastsi128_si256(packed);
+            let lo = _mm256_and_si256(v, lomask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), lomask);
+            let nibs = _mm256_blend_epi32::<0xF0>(lo, hi);
+            let w = _mm256_sub_epi8(nibs, eight);
+            let x = _mm256_loadu_si256(act.qs.as_ptr().add(b * 32) as *const __m256i);
+            let sum = dot32_signed(w, x, act.block_sums[b]);
+            acc += dw * act.scales[b] * sum as f32;
+        }
+        acc
+    }
+
+    /// AVX-512 VNNI implementation of [`super::vec_dot_q4_k`].
+    ///
+    /// Q4_K nibbles are unsigned `[0,15]`, so they feed `vpdpbusd` directly with
+    /// no bias; only the per-block min term (folded in via `bsums`) stays
+    /// scalar, exactly as in the reference.
+    ///
+    /// # Safety
+    /// [`vnni_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+    pub unsafe fn vec_dot_q4_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let mut total = 0.0f32;
+        for (sb, wblk) in weight.chunks_exact(144).enumerate() {
+            let d = rd_f16(wblk, 0);
+            let dmin = rd_f16(wblk, 2);
+            let scales = &wblk[4..16];
+            let qs = wblk[16..144].as_ptr();
+            let qx = act.qs.as_ptr().add(sb * 256);
+            let bigd = act.d[sb];
+
+            // Eight sub-blocks (two per 32-byte chunk: low then high nibbles),
+            // each scaled by its 6-bit `sc` and summed into `acc` in i32 — the
+            // same order the scalar loop uses, so `acc` is identical.
+            let mut acc: i32 = 0;
+            for chunk in 0..4 {
+                let v = _mm256_loadu_si256(qs.add(chunk * 32) as *const __m256i);
+                let lo = _mm256_and_si256(v, lomask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), lomask);
+                let xlo = _mm256_loadu_si256(qx.add((2 * chunk) * 32) as *const __m256i);
+                let xhi = _mm256_loadu_si256(qx.add((2 * chunk + 1) * 32) as *const __m256i);
+                let dlo = hsum_i32_x8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), lo, xlo));
+                let dhi = hsum_i32_x8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), hi, xhi));
+                let (sc_lo, _) = get_scale_min_k4(2 * chunk, scales);
+                let (sc_hi, _) = get_scale_min_k4(2 * chunk + 1, scales);
+                acc += sc_lo as i32 * dlo;
+                acc += sc_hi as i32 * dhi;
+            }
+            let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+            let mut min_acc: i32 = 0;
+            for (g, &bs) in bsums.iter().enumerate() {
+                let (_, m) = get_scale_min_k4(g / 2, scales);
+                min_acc += bs as i32 * m as i32;
+            }
+            total += d * bigd * acc as f32 - dmin * bigd * min_acc as f32;
+        }
+        total
+    }
 }
 
 // --- quantizers -------------------------------------------------------------
@@ -665,5 +870,217 @@ mod tests {
         let reference: f32 = wdq.iter().zip(&act.dequantized()).map(|(a, b)| a * b).sum();
         let got = vec_dot_q6_k(&blk, &act);
         assert!((got - reference).abs() < 1e-2, "{got} vs {reference}");
+    }
+
+    // --- AVX-512 VNNI: bit-identical parity + timing --------------------------
+
+    /// `n` pseudo-random bytes from a seed (LCG) for fuzzing the SIMD kernels
+    /// against their scalar oracles.
+    #[cfg(target_arch = "x86_64")]
+    fn prng_bytes(seed: u32, n: usize) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(2654435761).wrapping_add(12345);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 16) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q8_0_simd_matches_scalar() {
+        if !x86::vnni_supported() {
+            return; // No VNNI here; the dispatcher already equals the scalar path.
+        }
+        let cols = 256; // 8 blocks
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2654435761) % 509) as f32 * 0.011 - 2.8)
+                .collect();
+            let act = quantize_activation_q8(&xf);
+            // Random valid Q8_0 row: f16 scale + 32 i8 (full byte range) per block.
+            let mut w = Vec::new();
+            for (b, blk) in prng_bytes(seed + 1, cols).chunks_exact(32).enumerate() {
+                w.extend_from_slice(&f32_to_f16(0.02 + b as f32 * 0.003).to_le_bytes());
+                w.extend_from_slice(blk);
+            }
+            let s = vec_dot_q8_0_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q8_0(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != simd {v}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q4_0_simd_matches_scalar() {
+        if !x86::vnni_supported() {
+            return;
+        }
+        let cols = 256; // 8 blocks of 18 bytes
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(40503) % 251) as f32 * 0.02 - 2.5)
+                .collect();
+            let act = quantize_activation_q8(&xf);
+            let mut w = Vec::new();
+            for (b, blk) in prng_bytes(seed + 100, (cols / 32) * 16)
+                .chunks_exact(16)
+                .enumerate()
+            {
+                w.extend_from_slice(&f32_to_f16(0.03 + b as f32 * 0.002).to_le_bytes());
+                w.extend_from_slice(blk); // 16 packed nibble bytes
+            }
+            let s = vec_dot_q4_0_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q4_0(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != simd {v}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q4_k_simd_matches_scalar() {
+        if !x86::vnni_supported() {
+            return;
+        }
+        let cols = 512; // 2 super-blocks
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2246822519) % 263) as f32 * 0.013 - 1.7)
+                .collect();
+            let act = quantize_activation_q8k(&xf);
+            // Valid Q4_K super-blocks: f16 d, f16 dmin, then 12 packed-scale +
+            // 128 nibble bytes that can be *anything* (both paths read them
+            // through `get_scale_min_k4` identically, so random maximises cover).
+            let mut w = Vec::new();
+            for sb in 0..(cols / 256) {
+                w.extend_from_slice(&f32_to_f16(0.05 + sb as f32 * 0.01).to_le_bytes());
+                w.extend_from_slice(&f32_to_f16(0.02 + sb as f32 * 0.005).to_le_bytes());
+                w.extend_from_slice(&prng_bytes(seed * 31 + sb as u32 + 7, 140));
+            }
+            let s = vec_dot_q4_k_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q4_k(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != simd {v}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_q8_0_simd_vs_scalar() {
+        use std::time::Instant;
+        if !x86::vnni_supported() {
+            eprintln!("AVX-512 VNNI not available; skipping");
+            return;
+        }
+        let (rows, cols, iters) = (2048usize, 2048usize, 10);
+        let wf: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.01)
+            .collect();
+        let wbytes = quantize_q8_0(&wf);
+        let rb = GgmlType::Q8_0.bytes_for(cols);
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let act = quantize_activation_q8(&x);
+        let mut sink = 0.0f32;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += vec_dot_q8_0_scalar(&wbytes[i * rb..i * rb + rb], &act);
+            }
+        }
+        let scalar = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += unsafe { x86::vec_dot_q8_0(&wbytes[i * rb..i * rb + rb], &act) };
+            }
+        }
+        let simd = t1.elapsed();
+
+        eprintln!(
+            "Q8_0 {rows}x{cols} x{iters}: scalar={scalar:?} vnni={simd:?} \
+             speedup={:.2}x (sink={sink})",
+            scalar.as_secs_f64() / simd.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_q4_0_simd_vs_scalar() {
+        use std::time::Instant;
+        if !x86::vnni_supported() {
+            eprintln!("AVX-512 VNNI not available; skipping");
+            return;
+        }
+        let (rows, cols, iters) = (2048usize, 2048usize, 10);
+        let rb = GgmlType::Q4_0.bytes_for(cols);
+        let wbytes = prng_bytes(1, rows * rb); // validity irrelevant for timing
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let act = quantize_activation_q8(&x);
+        let mut sink = 0.0f32;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += vec_dot_q4_0_scalar(&wbytes[i * rb..i * rb + rb], &act);
+            }
+        }
+        let scalar = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += unsafe { x86::vec_dot_q4_0(&wbytes[i * rb..i * rb + rb], &act) };
+            }
+        }
+        let simd = t1.elapsed();
+
+        eprintln!(
+            "Q4_0 {rows}x{cols} x{iters}: scalar={scalar:?} vnni={simd:?} \
+             speedup={:.2}x (sink={sink})",
+            scalar.as_secs_f64() / simd.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_q4_k_simd_vs_scalar() {
+        use std::time::Instant;
+        if !x86::vnni_supported() {
+            eprintln!("AVX-512 VNNI not available; skipping");
+            return;
+        }
+        let (rows, cols, iters) = (2048usize, 2048usize, 10);
+        let rb = GgmlType::Q4_K.bytes_for(cols);
+        let wbytes = prng_bytes(2, rows * rb); // validity irrelevant for timing
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let act = quantize_activation_q8k(&x);
+        let mut sink = 0.0f32;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += vec_dot_q4_k_scalar(&wbytes[i * rb..i * rb + rb], &act);
+            }
+        }
+        let scalar = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += unsafe { x86::vec_dot_q4_k(&wbytes[i * rb..i * rb + rb], &act) };
+            }
+        }
+        let simd = t1.elapsed();
+
+        eprintln!(
+            "Q4_K {rows}x{cols} x{iters}: scalar={scalar:?} vnni={simd:?} \
+             speedup={:.2}x (sink={sink})",
+            scalar.as_secs_f64() / simd.as_secs_f64()
+        );
     }
 }
