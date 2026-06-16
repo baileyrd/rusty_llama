@@ -54,9 +54,10 @@ fn argmax(v: &[f32]) -> usize {
 /// next token, for both F32 and Q8_0 weights.
 #[test]
 fn forward_logits_match_cpu() {
-    let Some(g) = gpu() else { return };
     let c = cfg();
     for ty in [GgmlType::F32, GgmlType::Q8_0] {
+        // Fresh backend per model: the weight cache keys on data pointers.
+        let Some(g) = gpu() else { return };
         let bytes = synthetic_gguf_typed(&c, ty);
         let gguf = Gguf::parse(&bytes).unwrap();
         let model = Model::from_gguf(&gguf).unwrap();
@@ -84,9 +85,10 @@ fn forward_logits_match_cpu() {
 /// CPU (greedy is argmax, so matching logits => matching tokens).
 #[test]
 fn greedy_stream_matches_cpu() {
-    let Some(g) = gpu() else { return };
     let c = cfg();
     for ty in [GgmlType::F32, GgmlType::Q8_0] {
+        // Fresh backend per model: the weight cache keys on data pointers.
+        let Some(g) = gpu() else { return };
         let bytes = synthetic_gguf_typed(&c, ty);
         let gguf = Gguf::parse(&bytes).unwrap();
         let model = Model::from_gguf(&gguf).unwrap();

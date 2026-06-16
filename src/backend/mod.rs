@@ -61,8 +61,10 @@ pub trait Backend: Send + Sync {
     ///
     /// For each head, scores the query against every cached key up to and
     /// including `pos`, softmaxes them, and writes the value-weighted sum into
-    /// `out` (length `n_heads * head_size`). `att` is scratch of length
-    /// `n_heads * seq_len`.
+    /// `out` (length `n_heads * head_size`). `att` is caller-provided scratch of
+    /// length `n_heads * seq_len`; its contents are unspecified after the call
+    /// (the CPU backend leaves the softmaxed scores there, the GPU backend does
+    /// not — callers must not rely on either).
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,

@@ -192,7 +192,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         workgroupBarrier();
     }
     let sum = red[0];
-    workgroupBarrier();
+    // `att` is in the storage address space; workgroupBarrier() orders only
+    // workgroup memory, so a storageBarrier() is required to publish step 3's
+    // per-lane writes to the other lanes that read the whole row in step 4
+    // (per the WGSL memory model — unlike CUDA's __syncthreads()).
+    storageBarrier();
 
     // 4. value-weighted sum (normalized by the softmax denominator).
     for (var d = tid; d < hs; d = d + 64u) {
@@ -221,12 +225,24 @@ pub struct GpuBackend {
     queue: wgpu::Queue,
     pipelines: Pipelines,
     /// Resident matmul weights (f32), keyed by source data pointer.
+    ///
+    /// The pointer is a stable, unique key only while the source weights stay
+    /// alive — which holds for a backend used with a single [`Model`] (the
+    /// CLI's pattern). Reusing one backend across *different* models could in
+    /// principle alias a freed-then-recycled address, so don't: make one
+    /// backend per model.
     weights: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
     /// Resident RoPE inverse-frequency tables, keyed by source data pointer.
     tables: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
+    /// The granted device limits (used to pre-check oversized weight buffers).
+    limits: wgpu::Limits,
     /// Human-readable adapter name, for logging.
     adapter_name: String,
 }
+
+/// Storage buffers the `attention` shader binds in one group (q, key, value,
+/// att, out, params) — the most of any kernel here.
+const ATTENTION_STORAGE_BUFFERS: u32 = 6;
 
 impl GpuBackend {
     /// Initialize wgpu and compile the shaders. Prefers a high-performance
@@ -256,6 +272,18 @@ impl GpuBackend {
         }))
         .map_err(|e| format!("failed to create GPU device: {e}"))?;
 
+        // The attention kernel binds 6 storage buffers in one stage; a downlevel
+        // adapter capped at 4 would otherwise pass `new()` and then panic on the
+        // first token. Reject up front so callers can fall back to the CPU.
+        let limits = device.limits();
+        if limits.max_storage_buffers_per_shader_stage < ATTENTION_STORAGE_BUFFERS {
+            return Err(format!(
+                "adapter '{adapter_name}' allows only {} storage buffers per shader stage; \
+                 the attention kernel needs {ATTENTION_STORAGE_BUFFERS}",
+                limits.max_storage_buffers_per_shader_stage
+            ));
+        }
+
         let pipelines = Pipelines {
             matmul: make_pipeline(&device, WGSL_MATMUL, "matmul"),
             rmsnorm: make_pipeline(&device, WGSL_RMSNORM, "rmsnorm"),
@@ -271,6 +299,7 @@ impl GpuBackend {
             pipelines,
             weights: Mutex::new(HashMap::new()),
             tables: Mutex::new(HashMap::new()),
+            limits,
             adapter_name,
         })
     }
@@ -443,6 +472,22 @@ impl GpuBackend {
         let mut cache = self.weights.lock().unwrap();
         if let Some(b) = cache.get(&key) {
             return b.clone();
+        }
+        // A weight is uploaded as one buffer and bound whole, so it must fit
+        // both caps. Fail with an actionable message rather than wgpu's opaque
+        // uncaptured-error panic. (Tiling the matmul would lift this; future
+        // work — see the perf notes in cpu.rs / the PR.)
+        let bytes = (f32data.len() * 4) as u64;
+        let binding_cap = self.limits.max_storage_buffer_binding_size;
+        if bytes > binding_cap || bytes > self.limits.max_buffer_size {
+            panic!(
+                "weight matrix ({} rows × {} cols → {bytes} bytes f32) exceeds this GPU's limits \
+                 (max_storage_buffer_binding_size {binding_cap}, max_buffer_size {}); \
+                 this model is too large for the GPU backend — use --backend cpu",
+                w.rows(),
+                w.cols(),
+                self.limits.max_buffer_size,
+            );
         }
         let buf = Arc::new(self.storage_ro("weight", f32_bytes(&f32data)));
         cache.insert(key, buf.clone());
