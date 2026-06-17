@@ -57,10 +57,34 @@ separable from the CLI but is far below llama.cpp regardless).
    (`*_avx2_matches_scalar` tests) and measured **+36% CPU decode** on TinyLlama
    Q4_K_M (36.7 → 49.8 tok/s), narrowing the gap to llama.cpp's CPU from ~2.1× to
    ~1.48×. Toggle off with `RUSTY_LLAMA_NO_AVX2=1`.
-2. **GPU: int8 (DP4A `dot4I8Packed`) + f16 GEMV — medium ROI, no tensor cores.**
-   Quantize the activation to int8 (the GPU analog of the CPU integer path; the
-   Vulkan device reports `int dot: 1`) and/or compute in f16 to ~halve memory
-   traffic. Narrows the decode gap without tensor cores.
+2. **GPU: int8 (DP4A `dot4I8Packed`) decode — Stage 1 (Q8_0) DONE; Stage 2 (Q4_K/Q6_K) measured, not adopted.**
+   Quantize each activation to int8 on-device (per-32 scale) and run the decode
+   matmuls as `dot4I8Packed` cooperative GEMVs against relaid int8 weights (the
+   GPU analog of the CPU integer path; the Vulkan device reports `int dot: 1`).
+   Wired into the fused decode behind an all-Q8_0 eligibility gate (toggle off
+   with `RUSTY_LLAMA_NO_INT8` / `set_int8_decode`), with per-op parity vs the
+   exact integer dot and an end-to-end coherence check. Measured on a
+   TinyLlama-1.1B-**shaped** synthetic Q8_0 model (dim 2048 × 22L, vocab 32k):
+   decode **~59 → ~91 tok/s, ≈1.5–1.6×** over the in-shader dequant GEMV. That's
+   below the ~2.5× single-kernel microbench because only the seven matmuls +
+   classifier go int8 — rmsnorm/rope/attention/swiglu stay f32 and the path adds
+   five quantize passes per step (Amdahl).
+
+   **Stage 2 (Q4_K/Q6_K) — built, proven, and measured *not* worth adopting.**
+   The three int8 kernels (Q8K-activation quantize + Q4_K/Q6_K unpack-in-shader
+   `dot4I8Packed`) are implemented and **bit-exact** against the CPU integer-dot
+   oracles (`vec_dot_q4_k`/`vec_dot_q6_k`). But k-quant weights stay *packed*, so
+   the int8 GEMV streams the **same bytes** as the dequant GEMV — int8 saves **no
+   weight bandwidth** — and decode is bandwidth-bound, so the in-shader unpack +
+   DP4A is pure added compute. The gating microbench
+   (`bench_kquant_int8_vs_dequant_gemv`) measures int8 at **~0.94–0.98× (Q4_K)**
+   and **~0.70× (Q6_K)** of the dequant GEMV on this GPU — break-even to slower.
+   Per the pre-agreed kill-criterion the kernels are **kept (behind their tests)
+   but not wired**, so TinyLlama Q4_K_M decode stays on the dequant path. The
+   lesson: scalar DP4A only helps when ALU-bound; over already-bandwidth-minimal
+   4-/6-bit weights the real GPU decode win needs **tensor cores** (item 3), not
+   `dot4I8Packed`. (Pre-expanding k-quants to int8 in VRAM would inflate weight
+   bandwidth ~1.8× and lose outright — never attempted.)
 3. **GPU: tensor cores — the big swing (most of the prefill/decode gap).**
    Either wgpu's `EXPERIMENTAL_COOPERATIVE_MATRIX` (portable: Vulkan coopmat /
    Metal simdgroup-matrix, but experimental in wgpu 29 with an immature WGSL

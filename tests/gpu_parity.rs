@@ -118,7 +118,10 @@ fn prefill_matches_cpu() {
 fn decode_step_matches_cpu() {
     let c = cfg();
     for ty in [GgmlType::F32, GgmlType::Q8_0] {
-        let Some(g) = gpu() else { return };
+        // int8 decode has its own (looser) coherence tests; this one holds the
+        // fused dequant path to exact CPU parity, so force the int8 path off.
+        let Some(mut g) = gpu() else { return };
+        g.set_int8_decode(false);
         let bytes = synthetic_gguf_typed(&c, ty);
         let gguf = Gguf::parse(&bytes).unwrap();
         let model = Model::from_gguf(&gguf).unwrap();
@@ -154,7 +157,10 @@ fn greedy_stream_matches_cpu() {
     let c = cfg();
     for ty in [GgmlType::F32, GgmlType::Q8_0] {
         // Fresh backend per model: the weight cache keys on data pointers.
-        let Some(g) = gpu() else { return };
+        // int8 greedy decode has its own coherence test; this exact-parity test
+        // pins the fused dequant path, so force the int8 path off.
+        let Some(mut g) = gpu() else { return };
+        g.set_int8_decode(false);
         let bytes = synthetic_gguf_typed(&c, ty);
         let gguf = Gguf::parse(&bytes).unwrap();
         let model = Model::from_gguf(&gguf).unwrap();
@@ -172,4 +178,45 @@ fn greedy_stream_matches_cpu() {
 
         assert_eq!(run(&CpuBackend::new()), run(&g), "{ty:?}: greedy stream differs");
     }
+}
+
+/// The int8 (DP4A) fused decode stays COHERENT with the exact CPU forward: same
+/// greedy next token, logits within a loose bound. int8 activation quantization
+/// is lossy, so this is deliberately not exact parity — the gpu module's per-op
+/// `matmul_q8_0_i8_*` tests pin the kernel against the exact integer dot.
+#[test]
+fn decode_step_int8_coherent_with_cpu() {
+    let c = cfg();
+    let Some(mut g) = gpu() else { return };
+    g.set_int8_decode(true); // the synthetic model is Q8_0-eligible
+    let bytes = synthetic_gguf_typed(&c, GgmlType::Q8_0);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    let prompt: Vec<usize> = vec![3, 8, 1, 5, 9];
+    let next = 7usize;
+
+    // Prefill is the (exact) batched dequant path for both backends; only the
+    // single fused decode step differs — so this isolates the int8 decode error.
+    let decode = |backend: &dyn Backend| -> Vec<f32> {
+        let mut s = RunState::new(&model.config);
+        forward_prefill(&model, &mut s, backend, &prompt, 0);
+        backend.forward_step(&model, &mut s, next, prompt.len());
+        s.logits().to_vec()
+    };
+    let cpu = decode(&CpuBackend::new());
+    let int8 = decode(&g);
+
+    assert!(int8.iter().all(|v| v.is_finite()), "int8 logits must be finite");
+    let max_diff = cpu
+        .iter()
+        .zip(&int8)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("[int8] decode logits maxdiff vs cpu = {max_diff}");
+    // Loose, documents the scale: int8 activation quant perturbs the logits a
+    // little (observed ~2e-4 on this tiny model; the prototype saw ~0.07 on
+    // TinyLlama-1.1B). A wiring regression (bad scale/barrier) would diverge by
+    // O(1), so this bound cleanly separates "coherent" from "broken".
+    assert!(max_diff < 0.05, "int8 decode diverges from CPU by {max_diff}");
+    assert_eq!(argmax(&cpu), argmax(&int8), "int8 decode greedy token differs");
 }
