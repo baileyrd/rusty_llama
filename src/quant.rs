@@ -509,9 +509,22 @@ fn vec_dot_q4_k_scalar(weight: &[u8], act: &Q8KActivation) -> f32 {
 }
 
 /// Dot product of a Q6_K weight row with a Q8_K-quantized activation.
+///
+/// Equals `dequantize(Q6_K, weight) · act.dequantized()`. Dispatches to AVX-512
+/// VNNI when available (bit-identical to the scalar path).
+pub fn vec_dot_q6_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if x86::vnni_supported() {
+        // SAFETY: the required AVX-512 features were just feature-detected.
+        return unsafe { x86::vec_dot_q6_k(weight, act) };
+    }
+    vec_dot_q6_k_scalar(weight, act)
+}
+
+/// Scalar reference for [`vec_dot_q6_k`] (portable; also the SIMD oracle).
 // `>> 0` is kept for visual symmetry with the `>> 2/4/6` shifts.
 #[allow(clippy::identity_op)]
-pub fn vec_dot_q6_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+fn vec_dot_q6_k_scalar(weight: &[u8], act: &Q8KActivation) -> f32 {
     let mut total = 0.0f32;
     for (sb, wblk) in weight.chunks_exact(210).enumerate() {
         let ql = &wblk[0..128];
@@ -701,6 +714,79 @@ pub(crate) mod x86 {
                 min_acc += bs as i32 * m as i32;
             }
             total += d * bigd * acc as f32 - dmin * bigd * min_acc as f32;
+        }
+        total
+    }
+
+    /// Horizontal sum of the four i32 lanes of a 128-bit vector.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum_i32_x4(v: __m128i) -> i32 {
+        let s = _mm_hadd_epi32(v, v);
+        let s = _mm_hadd_epi32(s, s);
+        _mm_cvtsi128_si32(s)
+    }
+
+    /// AVX-512 VNNI implementation of [`super::vec_dot_q6_k`].
+    ///
+    /// The 6-bit weights are reconstructed (in natural order) to unsigned
+    /// `[0,63]` — directly usable as `vpdpbusd`'s unsigned operand, no `+128`
+    /// bias. Each reconstructed 32-element group is one `vpdpbusd`; its eight i32
+    /// lanes split into the two 16-element scale sub-blocks (lanes 0–3 / 4–7).
+    /// The weights' `-32` zero point is corrected exactly per sub-block via the
+    /// activation's per-16 `bsums` (`Σ(q-32)·x = Σq·x − 32·Σx`), so `acc` is
+    /// accumulated in the same order and is bit-identical to the scalar path.
+    ///
+    /// # Safety
+    /// [`vnni_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+    pub unsafe fn vec_dot_q6_k(weight: &[u8], act: &Q8KActivation) -> f32 {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let three = _mm256_set1_epi8(3);
+        let mut total = 0.0f32;
+        for (sb, wblk) in weight.chunks_exact(210).enumerate() {
+            let ql = wblk.as_ptr();
+            let qh = wblk.as_ptr().add(128);
+            let scales = &wblk[192..208];
+            let d = rd_f16(wblk, 208);
+            let qx = act.qs.as_ptr().add(sb * 256);
+            let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+            let bigd = act.d[sb];
+
+            let mut acc: i32 = 0;
+            for half in 0..2usize {
+                let ql_lo = _mm256_loadu_si256(ql.add(half * 64) as *const __m256i);
+                let ql_hi = _mm256_loadu_si256(ql.add(half * 64 + 32) as *const __m256i);
+                let qhv = _mm256_loadu_si256(qh.add(half * 32) as *const __m256i);
+                // Reconstruct the four 32-element groups (natural order) of this
+                // half: low/high nibble of ql OR'd with the matching 2-bit qh
+                // plane shifted into bits 4–5. All u8 in [0,63].
+                let hi2 = |sh: __m256i| _mm256_slli_epi16::<4>(_mm256_and_si256(sh, three));
+                let q1 = _mm256_or_si256(_mm256_and_si256(ql_lo, lomask), hi2(qhv));
+                let q2 = _mm256_or_si256(
+                    _mm256_and_si256(ql_hi, lomask),
+                    hi2(_mm256_srli_epi16::<2>(qhv)),
+                );
+                let q3 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(ql_lo), lomask),
+                    hi2(_mm256_srli_epi16::<4>(qhv)),
+                );
+                let q4 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(ql_hi), lomask),
+                    hi2(_mm256_srli_epi16::<6>(qhv)),
+                );
+                for (qi, qv) in [q1, q2, q3, q4].into_iter().enumerate() {
+                    let nb = half * 128 + qi * 32; // natural base of this group
+                    let xv = _mm256_loadu_si256(qx.add(nb) as *const __m256i);
+                    let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qv, xv);
+                    let da = hsum_i32_x4(_mm256_castsi256_si128(dot)); // first 16
+                    let db = hsum_i32_x4(_mm256_extracti128_si256::<1>(dot)); // next 16
+                    let ga = nb / 16;
+                    acc += scales[ga] as i8 as i32 * (da - 32 * bsums[ga] as i32);
+                    acc += scales[ga + 1] as i8 as i32 * (db - 32 * bsums[ga + 1] as i32);
+                }
+            }
+            total += d * bigd * acc as f32;
         }
         total
     }
@@ -966,6 +1052,100 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
+    fn q6_k_simd_matches_scalar() {
+        if !x86::vnni_supported() {
+            return;
+        }
+        let cols = 512; // 2 super-blocks
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2246822519) % 263) as f32 * 0.013 - 1.7)
+                .collect();
+            let act = quantize_activation_q8k(&xf);
+            // Valid Q6_K super-blocks: 128 ql + 64 qh + 16 i8 scales (any bytes —
+            // both paths reconstruct/read them identically) then f16 d.
+            let mut w = Vec::new();
+            for sb in 0..(cols / 256) {
+                w.extend_from_slice(&prng_bytes(seed * 41 + sb as u32 + 3, 208));
+                w.extend_from_slice(&f32_to_f16(0.03 + sb as f32 * 0.01).to_le_bytes());
+            }
+            let s = vec_dot_q6_k_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q6_k(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != simd {v}");
+        }
+    }
+
+    /// Scalar re-implementation of the *algorithm* the Q6_K VNNI kernel uses
+    /// (unsigned 6-bit reconstruction in natural order; each 32-element group
+    /// split into two 16-element scale sub-blocks; the `-32` zero point folded
+    /// in via the per-16 `bsums`). Lets us verify that index/bias logic against
+    /// the scalar oracle on a CPU without AVX-512 VNNI (where the real kernel
+    /// can't run).
+    #[allow(clippy::identity_op)]
+    fn vec_dot_q6_k_vnni_emulated(weight: &[u8], act: &Q8KActivation) -> f32 {
+        let mut total = 0.0f32;
+        for (sb, wblk) in weight.chunks_exact(210).enumerate() {
+            let scales = &wblk[192..208];
+            let d = rd_f16(wblk, 208);
+            let qx = &act.qs[sb * 256..sb * 256 + 256];
+            let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+            let bigd = act.d[sb];
+            // Unsigned [0,63] weights in natural order.
+            let mut q6 = [0u32; 256];
+            for half in 0..2 {
+                let ql = &wblk[half * 64..];
+                let qh = &wblk[128 + half * 32..];
+                let y = half * 128;
+                for l in 0..32 {
+                    q6[y + l] = ((ql[l] & 0x0f) | (((qh[l] >> 0) & 3) << 4)) as u32;
+                    q6[y + l + 32] = ((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) as u32;
+                    q6[y + l + 64] = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as u32;
+                    q6[y + l + 96] = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as u32;
+                }
+            }
+            let mut acc: i32 = 0;
+            for half in 0..2 {
+                for qi in 0..4 {
+                    let nb = half * 128 + qi * 32;
+                    for sh in 0..2 {
+                        let g = nb / 16 + sh;
+                        let dot: i32 = (0..16)
+                            .map(|k| q6[nb + sh * 16 + k] as i32 * qx[nb + sh * 16 + k] as i32)
+                            .sum();
+                        acc += scales[g] as i8 as i32 * (dot - 32 * bsums[g] as i32);
+                    }
+                }
+            }
+            total += d * bigd * acc as f32;
+        }
+        total
+    }
+
+    /// The Q6_K VNNI kernel can't run on this (AVX2-only) CPU, so check the
+    /// algorithm it encodes against the scalar oracle. The real intrinsics are a
+    /// mechanical translation of this, mirroring the run-verified Q4_K kernel,
+    /// and `q6_k_simd_matches_scalar` checks them where VNNI is available.
+    #[test]
+    fn q6_k_vnni_algorithm_matches_scalar() {
+        let cols = 512;
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2246822519) % 263) as f32 * 0.013 - 1.7)
+                .collect();
+            let act = quantize_activation_q8k(&xf);
+            let mut w = Vec::new();
+            for sb in 0..(cols / 256) {
+                w.extend_from_slice(&prng_bytes(seed * 41 + sb as u32 + 3, 208));
+                w.extend_from_slice(&f32_to_f16(0.03 + sb as f32 * 0.01).to_le_bytes());
+            }
+            let s = vec_dot_q6_k_scalar(&w, &act);
+            let e = vec_dot_q6_k_vnni_emulated(&w, &act);
+            assert_eq!(s.to_bits(), e.to_bits(), "seed {seed}: scalar {s} != emulated {e}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
     #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
     fn bench_q8_0_simd_vs_scalar() {
         use std::time::Instant;
@@ -1079,6 +1259,45 @@ mod tests {
 
         eprintln!(
             "Q4_K {rows}x{cols} x{iters}: scalar={scalar:?} vnni={simd:?} \
+             speedup={:.2}x (sink={sink})",
+            scalar.as_secs_f64() / simd.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "timing benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_q6_k_simd_vs_scalar() {
+        use std::time::Instant;
+        if !x86::vnni_supported() {
+            eprintln!("AVX-512 VNNI not available; skipping");
+            return;
+        }
+        let (rows, cols, iters) = (2048usize, 2048usize, 10);
+        let rb = GgmlType::Q6_K.bytes_for(cols);
+        let wbytes = prng_bytes(5, rows * rb); // validity irrelevant for timing
+        let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let act = quantize_activation_q8k(&x);
+        let mut sink = 0.0f32;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += vec_dot_q6_k_scalar(&wbytes[i * rb..i * rb + rb], &act);
+            }
+        }
+        let scalar = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            for i in 0..rows {
+                sink += unsafe { x86::vec_dot_q6_k(&wbytes[i * rb..i * rb + rb], &act) };
+            }
+        }
+        let simd = t1.elapsed();
+
+        eprintln!(
+            "Q6_K {rows}x{cols} x{iters}: scalar={scalar:?} vnni={simd:?} \
              speedup={:.2}x (sink={sink})",
             scalar.as_secs_f64() / simd.as_secs_f64()
         );

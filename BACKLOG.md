@@ -84,10 +84,21 @@ exactly using the activation's per-block sums (`Q8Activation::block_sums`).
   over the autovectorized path (2048×2048), and ~**2×** end to end on a
   TinyLlama-width Q8_0 model. So yes, it's worth it.
 
+**Q6_K — done.** `vec_dot_q6_k` now has an AVX-512 VNNI path (`x86::vec_dot_q6_k`).
+The 6-bit weights are reconstructed (in natural order) to **unsigned** `[0,63]`
+with AVX2 nibble/2-bit-plane ops — directly usable as `vpdpbusd`'s unsigned
+operand, no `+128` bias. Each 32-element group is one `vpdpbusd`; its eight i32
+lanes split into the two 16-element scale sub-blocks (lanes 0–3 / 4–7, summed via
+`hsum_i32_x4`). The `-32` zero point is corrected exactly per sub-block via the
+activation's per-16 `bsums` (`Σ(q-32)·x = Σq·x − 32·Σx`), so the integer `acc` is
+bit-for-bit identical to the scalar path.
+- **Parity:** `q6_k_simd_matches_scalar` asserts `f32::to_bits` equality (runs
+  where AVX-512 VNNI is present). Because this dev machine is an Intel Core Ultra
+  (AVX2, **no** AVX-512), the SIMD kernels can't run here, so
+  `q6_k_vnni_algorithm_matches_scalar` re-checks the kernel's exact index/bias
+  *algorithm* in scalar against the oracle — verifying the logic without VNNI
+  hardware. `bench_q6_k_simd_vs_scalar` mirrors the other benches.
+
 **Still TODO:**
-- **Q6_K.** `vec_dot_q6_k` is still scalar. Its 6-bit weights are reconstructed
-  from split `ql`/`qh` planes (the bulk of its work) and its scales are per-16,
-  not per-32, so it doesn't fit the 32-wide `vpdpbusd` helper as cleanly; the
-  same bias trick (`a+32`, corrected by the per-16 `bsums`) would apply over
-  128-bit lanes.
 - **NEON.** No aarch64 path yet; the dispatchers fall through to scalar there.
+  (Can't be built/verified on this x86 machine.)
