@@ -347,9 +347,14 @@ pub fn quantize_activation_q8(x: &[f32]) -> Q8Activation {
 /// the [`x86`] module); the SIMD result is *bit-identical* to the scalar one.
 pub fn vec_dot_q8_0(weight: &[u8], act: &Q8Activation) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if x86::vnni_supported() {
-        // SAFETY: the required AVX-512 features were just feature-detected.
-        return unsafe { x86::vec_dot_q8_0(weight, act) };
+    {
+        // SAFETY (both arms): the required features were just feature-detected.
+        if x86::vnni_supported() {
+            return unsafe { x86::vec_dot_q8_0(weight, act) };
+        }
+        if x86::avx2_supported() {
+            return unsafe { x86::vec_dot_q8_0_avx2(weight, act) };
+        }
     }
     vec_dot_q8_0_scalar(weight, act)
 }
@@ -374,9 +379,13 @@ fn vec_dot_q8_0_scalar(weight: &[u8], act: &Q8Activation) -> f32 {
 /// Dispatches to AVX-512 VNNI when available (bit-identical to the scalar path).
 pub fn vec_dot_q4_0(weight: &[u8], act: &Q8Activation) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if x86::vnni_supported() {
-        // SAFETY: the required AVX-512 features were just feature-detected.
-        return unsafe { x86::vec_dot_q4_0(weight, act) };
+    {
+        if x86::vnni_supported() {
+            return unsafe { x86::vec_dot_q4_0(weight, act) };
+        }
+        if x86::avx2_supported() {
+            return unsafe { x86::vec_dot_q4_0_avx2(weight, act) };
+        }
     }
     vec_dot_q4_0_scalar(weight, act)
 }
@@ -466,9 +475,13 @@ pub fn quantize_activation_q8k(x: &[f32]) -> Q8KActivation {
 /// Dispatches to AVX-512 VNNI when available (bit-identical to the scalar path).
 pub fn vec_dot_q4_k(weight: &[u8], act: &Q8KActivation) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if x86::vnni_supported() {
-        // SAFETY: the required AVX-512 features were just feature-detected.
-        return unsafe { x86::vec_dot_q4_k(weight, act) };
+    {
+        if x86::vnni_supported() {
+            return unsafe { x86::vec_dot_q4_k(weight, act) };
+        }
+        if x86::avx2_supported() {
+            return unsafe { x86::vec_dot_q4_k_avx2(weight, act) };
+        }
     }
     vec_dot_q4_k_scalar(weight, act)
 }
@@ -514,9 +527,13 @@ fn vec_dot_q4_k_scalar(weight: &[u8], act: &Q8KActivation) -> f32 {
 /// VNNI when available (bit-identical to the scalar path).
 pub fn vec_dot_q6_k(weight: &[u8], act: &Q8KActivation) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if x86::vnni_supported() {
-        // SAFETY: the required AVX-512 features were just feature-detected.
-        return unsafe { x86::vec_dot_q6_k(weight, act) };
+    {
+        if x86::vnni_supported() {
+            return unsafe { x86::vec_dot_q6_k(weight, act) };
+        }
+        if x86::avx2_supported() {
+            return unsafe { x86::vec_dot_q6_k_avx2(weight, act) };
+        }
     }
     vec_dot_q6_k_scalar(weight, act)
 }
@@ -790,6 +807,178 @@ pub(crate) mod x86 {
         }
         total
     }
+
+    // --- AVX2 fallback (no AVX-512 VNNI) --------------------------------
+    //
+    // The AVX2 analog of `vpdpbusd`: `vpmaddubsw` (u8×i8 → i16, summing adjacent
+    // pairs) then `vpmaddwd` against ones (i16 pairs → i32). The eight i32 lanes
+    // have the same layout as `_mm256_dpbusd_epi32`, so these kernels mirror the
+    // VNNI ones with the dot primitive swapped. For 4-/6-bit weights the i16
+    // intermediate can't overflow, so the result is bit-identical to scalar; the
+    // signed 8-bit formats widen to i16 first to stay exact. The dispatchers
+    // prefer VNNI and fall back here, so this is the path most consumer x86
+    // (AVX2 without AVX-512) actually runs.
+
+    /// AVX2 available and not disabled (`RUSTY_LLAMA_NO_AVX2`). Cached.
+    pub fn avx2_supported() -> bool {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            std::env::var_os("RUSTY_LLAMA_NO_AVX2").is_none() && is_x86_feature_detected!("avx2")
+        })
+    }
+
+    /// `Σ_{i<32} w[i]·x[i]` as eight i32 lanes (4 products each) — the same lane
+    /// layout as `vpdpbusd`. `w` is unsigned `u8`, `x` signed `i8`. Exact while
+    /// each `vpmaddubsw` i16 (sum of two products) stays in range — true for the
+    /// 4-/6-bit weights this is used with.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn madd_u8_i8(w: __m256i, x: __m256i) -> __m256i {
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), _mm256_set1_epi16(1))
+    }
+
+    /// Exact `Σ_{i<32} w[i]·x[i]` for two signed-`i8` operands, via i16 widening
+    /// (`vpmovsxbw` + `vpmaddwd`) so nothing saturates.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot32_signed_avx2(w: __m256i, x: __m256i) -> i32 {
+        let wlo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+        let whi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(w));
+        let xlo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
+        let xhi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(x));
+        let p = _mm256_add_epi32(_mm256_madd_epi16(wlo, xlo), _mm256_madd_epi16(whi, xhi));
+        hsum_i32_x8(p)
+    }
+
+    /// AVX2 (non-VNNI) implementation of [`super::vec_dot_q8_0`].
+    /// # Safety
+    /// [`avx2_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q8_0_avx2(weight: &[u8], act: &Q8Activation) -> f32 {
+        let mut acc = 0.0f32;
+        for (b, blk) in weight.chunks_exact(34).enumerate() {
+            let dw = rd_f16(blk, 0);
+            let w = _mm256_loadu_si256(blk.as_ptr().add(2) as *const __m256i);
+            let x = _mm256_loadu_si256(act.qs.as_ptr().add(b * 32) as *const __m256i);
+            acc += dw * act.scales[b] * dot32_signed_avx2(w, x) as f32;
+        }
+        acc
+    }
+
+    /// AVX2 (non-VNNI) implementation of [`super::vec_dot_q4_0`].
+    /// # Safety
+    /// [`avx2_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q4_0_avx2(weight: &[u8], act: &Q8Activation) -> f32 {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let eight = _mm256_set1_epi8(8);
+        let mut acc = 0.0f32;
+        for (b, blk) in weight.chunks_exact(18).enumerate() {
+            let dw = rd_f16(blk, 0);
+            let packed = _mm_loadu_si128(blk.as_ptr().add(2) as *const __m128i);
+            let v = _mm256_broadcastsi128_si256(packed);
+            let lo = _mm256_and_si256(v, lomask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), lomask);
+            let nibs = _mm256_blend_epi32::<0xF0>(lo, hi);
+            let w = _mm256_sub_epi8(nibs, eight);
+            let x = _mm256_loadu_si256(act.qs.as_ptr().add(b * 32) as *const __m256i);
+            acc += dw * act.scales[b] * dot32_signed_avx2(w, x) as f32;
+        }
+        acc
+    }
+
+    /// AVX2 (non-VNNI) implementation of [`super::vec_dot_q4_k`]. Q4_K nibbles
+    /// are `[0,15]`, so `vpmaddubsw` can't overflow — bit-identical to scalar.
+    /// # Safety
+    /// [`avx2_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q4_k_avx2(weight: &[u8], act: &Q8KActivation) -> f32 {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let mut total = 0.0f32;
+        for (sb, wblk) in weight.chunks_exact(144).enumerate() {
+            let d = rd_f16(wblk, 0);
+            let dmin = rd_f16(wblk, 2);
+            let scales = &wblk[4..16];
+            let qs = wblk[16..144].as_ptr();
+            let qx = act.qs.as_ptr().add(sb * 256);
+            let bigd = act.d[sb];
+            let mut acc: i32 = 0;
+            for chunk in 0..4 {
+                let v = _mm256_loadu_si256(qs.add(chunk * 32) as *const __m256i);
+                let lo = _mm256_and_si256(v, lomask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), lomask);
+                let xlo = _mm256_loadu_si256(qx.add((2 * chunk) * 32) as *const __m256i);
+                let xhi = _mm256_loadu_si256(qx.add((2 * chunk + 1) * 32) as *const __m256i);
+                let dlo = hsum_i32_x8(madd_u8_i8(lo, xlo));
+                let dhi = hsum_i32_x8(madd_u8_i8(hi, xhi));
+                let (sc_lo, _) = get_scale_min_k4(2 * chunk, scales);
+                let (sc_hi, _) = get_scale_min_k4(2 * chunk + 1, scales);
+                acc += sc_lo as i32 * dlo;
+                acc += sc_hi as i32 * dhi;
+            }
+            let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+            let mut min_acc: i32 = 0;
+            for (g, &bs) in bsums.iter().enumerate() {
+                let (_, m) = get_scale_min_k4(g / 2, scales);
+                min_acc += bs as i32 * m as i32;
+            }
+            total += d * bigd * acc as f32 - dmin * bigd * min_acc as f32;
+        }
+        total
+    }
+
+    /// AVX2 (non-VNNI) implementation of [`super::vec_dot_q6_k`]. Reconstructed
+    /// 6-bit weights are `[0,63]`, so `vpmaddubsw` can't overflow — bit-identical
+    /// to scalar.
+    /// # Safety
+    /// [`avx2_supported`] must return true on this CPU.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q6_k_avx2(weight: &[u8], act: &Q8KActivation) -> f32 {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let three = _mm256_set1_epi8(3);
+        let mut total = 0.0f32;
+        for (sb, wblk) in weight.chunks_exact(210).enumerate() {
+            let ql = wblk.as_ptr();
+            let qh = wblk.as_ptr().add(128);
+            let scales = &wblk[192..208];
+            let d = rd_f16(wblk, 208);
+            let qx = act.qs.as_ptr().add(sb * 256);
+            let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+            let bigd = act.d[sb];
+            let mut acc: i32 = 0;
+            for half in 0..2usize {
+                let ql_lo = _mm256_loadu_si256(ql.add(half * 64) as *const __m256i);
+                let ql_hi = _mm256_loadu_si256(ql.add(half * 64 + 32) as *const __m256i);
+                let qhv = _mm256_loadu_si256(qh.add(half * 32) as *const __m256i);
+                let hi2 = |sh: __m256i| _mm256_slli_epi16::<4>(_mm256_and_si256(sh, three));
+                let q1 = _mm256_or_si256(_mm256_and_si256(ql_lo, lomask), hi2(qhv));
+                let q2 = _mm256_or_si256(
+                    _mm256_and_si256(ql_hi, lomask),
+                    hi2(_mm256_srli_epi16::<2>(qhv)),
+                );
+                let q3 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(ql_lo), lomask),
+                    hi2(_mm256_srli_epi16::<4>(qhv)),
+                );
+                let q4 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(ql_hi), lomask),
+                    hi2(_mm256_srli_epi16::<6>(qhv)),
+                );
+                for (qi, qv) in [q1, q2, q3, q4].into_iter().enumerate() {
+                    let nb = half * 128 + qi * 32;
+                    let xv = _mm256_loadu_si256(qx.add(nb) as *const __m256i);
+                    let dot = madd_u8_i8(qv, xv);
+                    let da = hsum_i32_x4(_mm256_castsi256_si128(dot));
+                    let db = hsum_i32_x4(_mm256_extracti128_si256::<1>(dot));
+                    let ga = nb / 16;
+                    acc += scales[ga] as i8 as i32 * (da - 32 * bsums[ga] as i32);
+                    acc += scales[ga + 1] as i8 as i32 * (db - 32 * bsums[ga + 1] as i32);
+                }
+            }
+            total += d * bigd * acc as f32;
+        }
+        total
+    }
 }
 
 // --- quantizers -------------------------------------------------------------
@@ -971,6 +1160,102 @@ mod tests {
                 (s >> 16) as u8
             })
             .collect()
+    }
+
+    // AVX2 (non-VNNI) bit-identity: these RUN on any AVX2 CPU (incl. this one,
+    // which has no AVX-512), so the AVX2 kernels are run-verified, not just
+    // built. 4-/6-bit weights => no vpmaddubsw saturation => exact.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q8_0_avx2_matches_scalar() {
+        if !x86::avx2_supported() {
+            return;
+        }
+        let cols = 256;
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2654435761) % 509) as f32 * 0.011 - 2.8)
+                .collect();
+            let act = quantize_activation_q8(&xf);
+            let mut w = Vec::new();
+            for (b, blk) in prng_bytes(seed + 1, cols).chunks_exact(32).enumerate() {
+                w.extend_from_slice(&f32_to_f16(0.02 + b as f32 * 0.003).to_le_bytes());
+                w.extend_from_slice(blk);
+            }
+            let s = vec_dot_q8_0_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q8_0_avx2(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != avx2 {v}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q4_0_avx2_matches_scalar() {
+        if !x86::avx2_supported() {
+            return;
+        }
+        let cols = 256;
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(40503) % 251) as f32 * 0.02 - 2.5)
+                .collect();
+            let act = quantize_activation_q8(&xf);
+            let mut w = Vec::new();
+            for (b, blk) in prng_bytes(seed + 100, (cols / 32) * 16).chunks_exact(16).enumerate() {
+                w.extend_from_slice(&f32_to_f16(0.03 + b as f32 * 0.002).to_le_bytes());
+                w.extend_from_slice(blk);
+            }
+            let s = vec_dot_q4_0_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q4_0_avx2(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != avx2 {v}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q4_k_avx2_matches_scalar() {
+        if !x86::avx2_supported() {
+            return;
+        }
+        let cols = 512;
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2246822519) % 263) as f32 * 0.013 - 1.7)
+                .collect();
+            let act = quantize_activation_q8k(&xf);
+            let mut w = Vec::new();
+            for sb in 0..(cols / 256) {
+                w.extend_from_slice(&f32_to_f16(0.05 + sb as f32 * 0.01).to_le_bytes());
+                w.extend_from_slice(&f32_to_f16(0.02 + sb as f32 * 0.005).to_le_bytes());
+                w.extend_from_slice(&prng_bytes(seed * 31 + sb as u32 + 7, 140));
+            }
+            let s = vec_dot_q4_k_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q4_k_avx2(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != avx2 {v}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn q6_k_avx2_matches_scalar() {
+        if !x86::avx2_supported() {
+            return;
+        }
+        let cols = 512;
+        for seed in 0..16u32 {
+            let xf: Vec<f32> = (0..cols)
+                .map(|i| ((i as u32 ^ seed).wrapping_mul(2246822519) % 263) as f32 * 0.013 - 1.7)
+                .collect();
+            let act = quantize_activation_q8k(&xf);
+            let mut w = Vec::new();
+            for sb in 0..(cols / 256) {
+                w.extend_from_slice(&prng_bytes(seed * 41 + sb as u32 + 3, 208));
+                w.extend_from_slice(&f32_to_f16(0.03 + sb as f32 * 0.01).to_le_bytes());
+            }
+            let s = vec_dot_q6_k_scalar(&w, &act);
+            let v = unsafe { x86::vec_dot_q6_k_avx2(&w, &act) };
+            assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != avx2 {v}");
+        }
     }
 
     #[test]
