@@ -40,22 +40,33 @@ use crate::tensor::QMatrix;
 // ride in a small read-only storage buffer to dodge uniform-buffer's 16-byte
 // size rules; f32 scalars are passed through `f32::to_bits`.
 
+// Cooperative GEMV: one workgroup per output row, 256 threads cooperatively
+// reduce the dot product. Threads read consecutive weight elements (coalesced),
+// unlike one-thread-per-row which strides by `cols`. Dispatch `rows` workgroups.
 const WGSL_MATMUL: &str = r#"
 struct P { rows: u32, cols: u32 };
 @group(0) @binding(0) var<storage, read> w: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
     if (row >= p.rows) { return; }
-    var acc = 0.0;
+    let tid = lid.x;
     let base = row * p.cols;
-    for (var j = 0u; j < p.cols; j = j + 1u) {
+    var acc = 0.0;
+    for (var j = tid; j < p.cols; j = j + 256u) {
         acc = acc + w[base + j] * x[j];
     }
-    outp[row] = acc;
+    red[tid] = acc;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { outp[row] = red[0]; }
 }
 "#;
 
@@ -374,21 +385,24 @@ fn scale_min_k4(j: u32, base: u32) -> vec2<u32> {
 }
 "#;
 
-// Q8_0: 34-byte blocks of (f16 scale, 32 x i8). out[row] = sum_b sum_i d*q*x.
+// Q8_0 cooperative GEMV: one workgroup per row, threads split the 34-byte
+// blocks and reduce. out[row] = sum_b sum_i d*q*x. Dispatch `rows` workgroups.
 const WGSL_MATMUL_Q8_0: &str = r#"
 struct P { rows: u32, cols: u32 };
 @group(0) @binding(0) var<storage, read> wb: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
+var<workgroup> red: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
     if (row >= p.rows) { return; }
+    let tid = lid.x;
     let nb = p.cols / 32u;
     let row_base = row * nb * 34u;
     var acc = 0.0;
-    for (var b = 0u; b < nb; b = b + 1u) {
+    for (var b = tid; b < nb; b = b + 64u) {
         let bb = row_base + b * 34u;
         let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
         let xb = b * 32u;
@@ -397,7 +411,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             acc = acc + d * f32(q) * x[xb + i];
         }
     }
-    outp[row] = acc;
+    red[tid] = acc;
+    workgroupBarrier();
+    for (var s = 32u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { outp[row] = red[0]; }
 }
 "#;
 
@@ -432,48 +452,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Q4_K: 144-byte superblocks of 256 (f16 d, f16 dmin, 12B packed 6-bit
 // scale/min, 128B of 4-bit quants). Mirrors quant::block_q4_k.
+// Q4_K cooperative GEMV: one workgroup per row; threads split the 32-element
+// output chunks (8 per 144-byte superblock). out-chunk oc => qs-chunk oc/2,
+// low/high nibble by oc&1, sub-block scale scale_min_k4(oc). Dispatch `rows` wg.
 const WGSL_MATMUL_Q4_K: &str = r#"
 struct P { rows: u32, cols: u32 };
 @group(0) @binding(0) var<storage, read> wb: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
-fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    if (row >= p.rows) { return; }
+    let tid = lid.x;
+    let nchunks = p.cols / 32u;
+    let row_base = row * (p.cols / 256u) * 144u;
     var acc = 0.0;
-    for (var b = 0u; b < nb; b = b + 1u) {
-        let bb = row_base + b * 144u;
+    for (var c = tid; c < nchunks; c = c + 64u) {
+        let sb = c / 8u;
+        let oc = c % 8u;
+        let bb = row_base + sb * 144u;
         let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
         let dmin = f16f32(gb(bb + 2u) | (gb(bb + 3u) << 8u));
-        let sbase = bb + 4u;
-        let qbase = bb + 16u;
-        let xb = xoff + b * 256u;
-        var y = 0u;
-        var is = 0u;
-        for (var chunk = 0u; chunk < 4u; chunk = chunk + 1u) {
-            let sm1 = scale_min_k4(is, sbase);
-            let sm2 = scale_min_k4(is + 1u, sbase);
-            let d1 = d * f32(sm1.x); let min1 = dmin * f32(sm1.y);
-            let d2 = d * f32(sm2.x); let min2 = dmin * f32(sm2.y);
-            let cbase = qbase + chunk * 32u;
-            for (var j = 0u; j < 32u; j = j + 1u) {
-                acc = acc + (d1 * f32(gb(cbase + j) & 0x0fu) - min1) * x[xb + y];
-                y = y + 1u;
-            }
-            for (var j = 0u; j < 32u; j = j + 1u) {
-                acc = acc + (d2 * f32(gb(cbase + j) >> 4u) - min2) * x[xb + y];
-                y = y + 1u;
-            }
-            is = is + 2u;
+        let sm = scale_min_k4(oc, bb + 4u);
+        let sc = d * f32(sm.x);
+        let mn = dmin * f32(sm.y);
+        let qbase = bb + 16u + (oc / 2u) * 32u;
+        let high = (oc & 1u) == 1u;
+        let xbase = sb * 256u + oc * 32u;
+        for (var i = 0u; i < 32u; i = i + 1u) {
+            let byte = gb(qbase + i);
+            let nib = select(byte & 0x0fu, byte >> 4u, high);
+            acc = acc + (sc * f32(nib) - mn) * x[xbase + i];
         }
     }
-    return acc;
-}
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let nb = p.cols / 256u;
-    outp[row] = dot_q4k_row(row * nb * 144u, nb, 0u);
+    red[tid] = acc;
+    workgroupBarrier();
+    for (var s = 32u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { outp[row] = red[0]; }
 }
 "#;
 
@@ -525,47 +546,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Q6_K: 210-byte superblocks of 256 (128B ql, 64B qh, 16 signed-i8 scales,
 // f16 d). Mirrors quant::block_q6_k.
+// Q6_K cooperative GEMV: one workgroup per row; threads split the 32-element
+// output chunks (8 per 210-byte superblock). out-chunk oc => half oc/4, group
+// oc%4 (ql nibble + 2 qh bits + signed scale). Dispatch `rows` workgroups.
 const WGSL_MATMUL_Q6_K: &str = r#"
 struct P { rows: u32, cols: u32 };
 @group(0) @binding(0) var<storage, read> wb: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
-fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    if (row >= p.rows) { return; }
+    let tid = lid.x;
+    let nchunks = p.cols / 32u;
+    let row_base = row * (p.cols / 256u) * 210u;
     var acc = 0.0;
-    for (var b = 0u; b < nb; b = b + 1u) {
-        let bb = row_base + b * 210u;
+    for (var c = tid; c < nchunks; c = c + 64u) {
+        let sb = c / 8u;
+        let oc = c % 8u;
+        let bb = row_base + sb * 210u;
         let d = f16f32(gb(bb + 208u) | (gb(bb + 209u) << 8u));
-        let xb = xoff + b * 256u;
-        for (var half = 0u; half < 2u; half = half + 1u) {
-            let qlb = bb + half * 64u;
-            let qhb = bb + 128u + half * 32u;
-            let scb = bb + 192u + half * 8u;
-            let y = half * 128u;
-            for (var l = 0u; l < 32u; l = l + 1u) {
-                let is = l / 16u;
-                let qll = gb(qlb + l);
-                let qll32 = gb(qlb + l + 32u);
-                let qhl = gb(qhb + l);
-                let q1 = i32((qll & 0x0fu) | (((qhl >> 0u) & 3u) << 4u)) - 32;
-                let q2 = i32((qll32 & 0x0fu) | (((qhl >> 2u) & 3u) << 4u)) - 32;
-                let q3 = i32((qll >> 4u) | (((qhl >> 4u) & 3u) << 4u)) - 32;
-                let q4 = i32((qll32 >> 4u) | (((qhl >> 6u) & 3u) << 4u)) - 32;
-                acc = acc + d * f32(sext8(gb(scb + is))) * f32(q1) * x[xb + y + l];
-                acc = acc + d * f32(sext8(gb(scb + is + 2u))) * f32(q2) * x[xb + y + l + 32u];
-                acc = acc + d * f32(sext8(gb(scb + is + 4u))) * f32(q3) * x[xb + y + l + 64u];
-                acc = acc + d * f32(sext8(gb(scb + is + 6u))) * f32(q4) * x[xb + y + l + 96u];
-            }
+        let half = oc / 4u;
+        let group = oc % 4u;
+        let qlb = bb + half * 64u;
+        let qhb = bb + 128u + half * 32u;
+        let scb = bb + 192u + half * 8u;
+        let xbase = sb * 256u + oc * 32u;
+        let lo_l32 = (group & 1u) == 1u;
+        let hi_nib = group >= 2u;
+        let shift = group * 2u;
+        for (var l = 0u; l < 32u; l = l + 1u) {
+            let is = l / 16u;
+            let qlbyte = gb(qlb + select(l, l + 32u, lo_l32));
+            let nib = select(qlbyte & 0x0fu, qlbyte >> 4u, hi_nib);
+            let qhi = (gb(qhb + l) >> shift) & 3u;
+            let q = i32(nib | (qhi << 4u)) - 32;
+            let sc = sext8(gb(scb + is + group * 2u));
+            acc = acc + d * f32(sc) * f32(q) * x[xbase + l];
         }
     }
-    return acc;
-}
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= p.rows) { return; }
-    let nb = p.cols / 256u;
-    outp[row] = dot_q6k_row(row * nb * 210u, nb, 0u);
+    red[tid] = acc;
+    workgroupBarrier();
+    for (var s = 32u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { outp[row] = red[0]; }
 }
 "#;
 
@@ -1304,10 +1333,12 @@ impl GpuBackend {
 
         // Record the whole step into one encoder (one pass per op => wgpu
         // inserts the read-after-write barriers between dependent dispatches).
-        let wg_dim = ceil_div(d.dim, 64);
-        let wg_kv = ceil_div(d.kv_dim, 64);
-        let wg_hidden = ceil_div(d.hidden, 64);
-        let wg_vocab = ceil_div(d.vocab, 64);
+        // Cooperative matmuls dispatch one workgroup per output row; the
+        // elementwise add/swiglu keep one thread per element.
+        let (mm_dim, mm_kv, mm_hidden, mm_vocab) =
+            (d.dim as u32, d.kv_dim as u32, d.hidden as u32, d.vocab as u32);
+        let add_wg = ceil_div(d.dim, 64);
+        let sw_wg = ceil_div(d.hidden, 64);
         let wg_rope = ceil_div(d.dim / 2, 64);
         let wg_heads = d.n_heads as u32;
         let pos_off = (pos * d.kv_dim * 4) as u64;
@@ -1320,25 +1351,25 @@ impl GpuBackend {
             let lb = &d.layers[l];
             let mm = lb.mm_ty.map(|t| self.matmul_pipeline(t)); // [wq,wk,wv,wo,w1,w3,w2]
             pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_att, 1);
-            pass(&mut enc, mm[0], &lb.mq, wg_dim);
-            pass(&mut enc, mm[1], &lb.mk, wg_kv);
-            pass(&mut enc, mm[2], &lb.mv, wg_kv);
+            pass(&mut enc, mm[0], &lb.mq, mm_dim);
+            pass(&mut enc, mm[1], &lb.mk, mm_kv);
+            pass(&mut enc, mm[2], &lb.mv, mm_kv);
             pass(&mut enc, &self.pipelines.rope, &lb.rope, wg_rope);
             // Stash the rotated K/V for this position into the resident cache.
             enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
             enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
             pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
-            pass(&mut enc, mm[3], &lb.mo, wg_dim);
-            pass(&mut enc, &self.pipelines.add, &lb.add_attn, wg_dim);
+            pass(&mut enc, mm[3], &lb.mo, mm_dim);
+            pass(&mut enc, &self.pipelines.add, &lb.add_attn, add_wg);
             pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
-            pass(&mut enc, mm[4], &lb.m1, wg_hidden);
-            pass(&mut enc, mm[5], &lb.m3, wg_hidden);
-            pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, wg_hidden);
-            pass(&mut enc, mm[6], &lb.m2, wg_dim);
-            pass(&mut enc, &self.pipelines.add, &lb.add_ffn, wg_dim);
+            pass(&mut enc, mm[4], &lb.m1, mm_hidden);
+            pass(&mut enc, mm[5], &lb.m3, mm_hidden);
+            pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, sw_wg);
+            pass(&mut enc, mm[6], &lb.m2, mm_dim);
+            pass(&mut enc, &self.pipelines.add, &lb.add_ffn, add_wg);
         }
         pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
-        pass(&mut enc, self.matmul_pipeline(d.final_cls_ty), &d.final_cls, wg_vocab);
+        pass(&mut enc, self.matmul_pipeline(d.final_cls_ty), &d.final_cls, mm_vocab);
         enc.copy_buffer_to_buffer(&d.logits, 0, &d.logits_staging, 0, (d.vocab * 4) as u64);
         self.queue.submit(Some(enc.finish()));
         d.kv_filled = pos + 1;
@@ -1364,7 +1395,8 @@ impl Backend for GpuBackend {
         let ob = self.alloc_out(out.len());
         let pb = self.params(&[w.rows() as u32, w.cols() as u32]);
         let bind = self.bind(pipe, &[&gw.buf, &xb, &ob, &pb]);
-        self.run(pipe, &bind, ceil_div(w.rows(), 64), &ob, out);
+        // Cooperative GEMV: one workgroup per output row.
+        self.run(pipe, &bind, w.rows() as u32, &ob, out);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2060,6 +2092,48 @@ mod tests {
                 bytes_per_elem,
             );
         }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_dispatch_overhead() {
+        use std::time::Instant;
+        let Some(g) = gpu() else { return };
+        // A trivial 1-workgroup pass, to isolate the fixed per-compute-pass cost.
+        let a = g.buffer("a", 64, wgpu::BufferUsages::STORAGE);
+        let b = g.buffer("b", 64, wgpu::BufferUsages::STORAGE);
+        let pp = g.params(&[64u32]);
+        let bind = g.bind(&g.pipelines.add, &[&a, &b, &pp]);
+        let run = |k: usize| {
+            let mut enc = g
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            for _ in 0..k {
+                pass(&mut enc, &g.pipelines.add, &bind, 1);
+            }
+            g.queue.submit(Some(enc.finish()));
+            g.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        };
+        run(308); // warm
+        let reps = 50;
+        let timeit = |k: usize| {
+            let t = Instant::now();
+            for _ in 0..reps {
+                run(k);
+            }
+            t.elapsed().as_secs_f64() / reps as f64
+        };
+        let t1 = timeit(1);
+        let t308 = timeit(308);
+        let per_pass_us = (t308 - t1) / 307.0 * 1e6;
+        eprintln!(
+            "per-pass overhead: 1 pass={:.1}us, 308 passes={:.1}us -> ~{:.1}us/pass; \
+             a 308-dispatch decode token spends ~{:.2}ms here (TinyLlama decode ~40ms/token)",
+            t1 * 1e6,
+            t308 * 1e6,
+            per_pass_us,
+            per_pass_us * 308.0 / 1000.0,
+        );
     }
 
     #[test]

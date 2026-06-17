@@ -83,22 +83,24 @@ with default impls that loop the single-token ops so the CPU is correct for
 free). That's where the GPU shines: prefilling a 256-token prompt is **~2×
 faster on GPU than CPU** (735 vs 377 tok/s, `bench_prefill_gpu_vs_cpu`).
 
-**Decode is fused on-device.** A single decode step (`Backend::forward_step`)
-keeps the KV cache and activations resident and records the whole step into one
-command encoder — one submission, one logits read-back — instead of a
-host↔device round-trip per op. That cut decode round-trips from ~300/token to
-one and, combined with the on-device quantized weights above, took TinyLlama
-Q4_K_M decode from **6 → ~25 tok/s** (the naive per-op f32-resident path → fused
-quantized) and **VRAM from ~4.5 GB → ~1.0 GB**.
+**Decode is fused on-device with a cooperative GEMV.** A single decode step
+(`Backend::forward_step`) keeps the KV cache and activations resident and records
+the whole step into one command encoder — one submission, one logits read-back.
+The matmuls use a **cooperative GEMV** (one workgroup per output row, threads
+reduce the dot product with coalesced weight reads) instead of one thread per
+row; profiling showed the old kernel — not dispatch overhead — was the
+bottleneck (only ~18 GB/s effective). Together these took TinyLlama Q4_K_M decode
+from **6 → ~37 tok/s** and **VRAM from ~4.5 GB → ~1.0 GB**.
 
-**Honest performance note.** A large matmul with the weight resident is faster
-on the GPU (~1.2× a multi-core CPU matmul at 4096²); batched prefill wins
-outright (~2×); and decode is now competitive — TinyLlama Q4_K_M ≈25 tok/s on
-GPU vs ≈33 on CPU. It still doesn't quite beat a strong multi-core CPU on
-single-stream decode, which is dominated by per-token dispatch overhead
-(hundreds of small dispatches); the next lever there is a **fused-layer
-megakernel** to cut the dispatch count. Greedy output stays **byte-identical**
-to the CPU throughout. See the `bench_*_gpu_vs_cpu` benchmarks in
+**Performance summary.** The GPU now wins across the board on this hardware
+(RTX 5070 Ti): a resident 4096² matmul ~1.2× a multi-core CPU; batched prefill
+~2× (`bench_prefill_gpu_vs_cpu`); and **decode now beats the CPU** — TinyLlama
+Q4_K_M ≈37 vs ≈34 tok/s, and a synthetic dim-1024 model 587 vs 229 tok/s
+(`bench_decode_gpu_vs_cpu`). One caveat: the cooperative reduction sums in a
+different (parallel) order than the CPU's sequential dot, so over a long greedy
+run the GPU's output can eventually diverge from the CPU's *exact* token
+sequence by a near-tie tie-break — both remain coherent, and per-op outputs
+match within f32 tolerance. See the `bench_*_gpu_vs_cpu` benchmarks in
 `src/backend/gpu.rs`.
 
 ## How it fits together
