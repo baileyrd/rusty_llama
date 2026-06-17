@@ -2091,6 +2091,118 @@ mod tests {
         }
     }
 
+    // Prototype: does a DP4A int8 GEMV beat the f32 dequant GEMV for Q8_0?
+    // Self-contained (ad-hoc pipeline); decides whether to build out roadmap #2.
+    #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_q8_0_int8_vs_f32_gemv() {
+        use std::time::Instant;
+        let Some(g) = gpu() else { return };
+        let (rows, cols, iters) = (4096usize, 4096usize, 50);
+        let wf = noise(rows * cols, 99);
+        let wbytes = crate::quant::quantize_q8_0(&wf);
+        let x = noise(cols, 100);
+
+        // f32 path: the existing cooperative dequant GEMV (matmul_q8_0).
+        let w = QMatrix::quant(GgmlType::Q8_0, wbytes.clone().into(), rows, cols).unwrap();
+        let mut out_f32 = vec![0.0f32; rows];
+        g.matmul(&mut out_f32, &x, &w); // warm: upload resident weight
+        let t = Instant::now();
+        for _ in 0..iters {
+            g.matmul(&mut out_f32, &x, &w);
+        }
+        let f32_t = t.elapsed();
+
+        // int8 path: re-lay Q8_0 to contiguous int8 (4-aligned) + f32 scales,
+        // quantize the activation to int8 + scales, dot with dot4I8Packed.
+        let nb = cols / 32;
+        let rb = 34 * nb;
+        let mut wq = Vec::<u8>::with_capacity(rows * cols);
+        let mut wscale = Vec::<f32>::with_capacity(rows * nb);
+        for r in 0..rows {
+            for b in 0..nb {
+                let off = r * rb + b * 34;
+                wscale.push(crate::quant::f16_to_f32(u16::from_le_bytes([
+                    wbytes[off],
+                    wbytes[off + 1],
+                ])));
+                wq.extend_from_slice(&wbytes[off + 2..off + 34]);
+            }
+        }
+        let act = crate::quant::quantize_activation_q8(&x);
+        let aq: &[u8] =
+            unsafe { std::slice::from_raw_parts(act.qs.as_ptr() as *const u8, act.qs.len()) };
+
+        let src = r#"
+struct P { rows: u32, cols: u32 };
+@group(0) @binding(0) var<storage, read> wq: array<u32>;
+@group(0) @binding(1) var<storage, read> wscale: array<f32>;
+@group(0) @binding(2) var<storage, read> aq: array<u32>;
+@group(0) @binding(3) var<storage, read> ascale: array<f32>;
+@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(5) var<storage, read> p: P;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    if (row >= p.rows) { return; }
+    let tid = lid.x;
+    let nb = p.cols / 32u;
+    let wbase = row * (p.cols / 4u);
+    let sbase = row * nb;
+    var acc = 0.0;
+    for (var b = tid; b < nb; b = b + 64u) {
+        var dot: i32 = 0;
+        let wu = wbase + b * 8u;
+        let au = b * 8u;
+        for (var k = 0u; k < 8u; k = k + 1u) {
+            dot = dot + dot4I8Packed(wq[wu + k], aq[au + k]);
+        }
+        acc = acc + wscale[sbase + b] * ascale[b] * f32(dot);
+    }
+    red[tid] = acc;
+    workgroupBarrier();
+    for (var s = 32u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { outp[row] = red[0]; }
+}
+"#;
+        let pipe = make_pipeline(&g.device, src, "q8_0_i8");
+        let wq_buf = g.storage_ro("wq", &wq);
+        let wscale_buf = g.storage_ro("wscale", f32_bytes(&wscale));
+        let aq_buf = g.storage_ro("aq", aq);
+        let ascale_buf = g.storage_ro("ascale", f32_bytes(&act.scales));
+        let out_buf = g.alloc_out(rows);
+        let pb = g.params(&[rows as u32, cols as u32]);
+        let bind = g.bind(
+            &pipe,
+            &[&wq_buf, &wscale_buf, &aq_buf, &ascale_buf, &out_buf, &pb],
+        );
+        let mut out_i8 = vec![0.0f32; rows];
+        g.run_grid(&pipe, &bind, [rows as u32, 1, 1], &out_buf, &mut out_i8);
+        let t = Instant::now();
+        for _ in 0..iters {
+            g.run_grid(&pipe, &bind, [rows as u32, 1, 1], &out_buf, &mut out_i8);
+        }
+        let i8_t = t.elapsed();
+
+        // int8 uses the quantized activation, f32 uses exact x — expect close.
+        let maxdiff = out_f32
+            .iter()
+            .zip(&out_i8)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "Q8_0 GEMV {rows}x{cols} x{iters}: f32={:.3}ms/op int8(DP4A)={:.3}ms/op \
+             -> int8 is {:.2}x the f32 time (maxdiff={maxdiff:.4})",
+            f32_t.as_secs_f64() * 1e3 / iters as f64,
+            i8_t.as_secs_f64() * 1e3 / iters as f64,
+            i8_t.as_secs_f64() / f32_t.as_secs_f64(),
+        );
+    }
+
     #[test]
     #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
     fn bench_dispatch_overhead() {
