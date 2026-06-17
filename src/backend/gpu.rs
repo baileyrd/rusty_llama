@@ -352,6 +352,7 @@ const MAX_BATCH_HEAD: usize = 128;
 
 const WGSL_QUANT_PRELUDE: &str = r#"
 fn gb(i: u32) -> u32 { return (wb[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu; }
+fn sext8(b: u32) -> i32 { return (i32(b) << 24u) >> 24u; }   // signed 8-bit
 fn f16f32(h: u32) -> f32 {
     let s = (h >> 15u) & 1u;
     let e = (h >> 10u) & 0x1fu;
@@ -361,6 +362,15 @@ fn f16f32(h: u32) -> f32 {
     else if (e == 0x1fu) { v = 0.0; }   // weight scales are never inf/nan
     else { v = (1.0 + f32(m) / 1024.0) * exp2(f32(i32(e) - 15)); }
     return select(v, -v, s == 1u);
+}
+// Q4_K 6-bit packed scale+min for sub-block j (scales at byte `base`).
+fn scale_min_k4(j: u32, base: u32) -> vec2<u32> {
+    if (j < 4u) {
+        return vec2<u32>(gb(base + j) & 63u, gb(base + j + 4u) & 63u);
+    }
+    let d = (gb(base + j + 4u) & 0x0fu) | ((gb(base + j - 4u) >> 6u) << 4u);
+    let m = (gb(base + j + 4u) >> 4u) | ((gb(base + j) >> 6u) << 4u);
+    return vec2<u32>(d, m);
 }
 "#;
 
@@ -420,6 +430,190 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Q4_K: 144-byte superblocks of 256 (f16 d, f16 dmin, 12B packed 6-bit
+// scale/min, 128B of 4-bit quants). Mirrors quant::block_q4_k.
+const WGSL_MATMUL_Q4_K: &str = r#"
+struct P { rows: u32, cols: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 144u;
+        let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
+        let dmin = f16f32(gb(bb + 2u) | (gb(bb + 3u) << 8u));
+        let sbase = bb + 4u;
+        let qbase = bb + 16u;
+        let xb = xoff + b * 256u;
+        var y = 0u;
+        var is = 0u;
+        for (var chunk = 0u; chunk < 4u; chunk = chunk + 1u) {
+            let sm1 = scale_min_k4(is, sbase);
+            let sm2 = scale_min_k4(is + 1u, sbase);
+            let d1 = d * f32(sm1.x); let min1 = dmin * f32(sm1.y);
+            let d2 = d * f32(sm2.x); let min2 = dmin * f32(sm2.y);
+            let cbase = qbase + chunk * 32u;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d1 * f32(gb(cbase + j) & 0x0fu) - min1) * x[xb + y];
+                y = y + 1u;
+            }
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d2 * f32(gb(cbase + j) >> 4u) - min2) * x[xb + y];
+                y = y + 1u;
+            }
+            is = is + 2u;
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= p.rows) { return; }
+    let nb = p.cols / 256u;
+    outp[row] = dot_q4k_row(row * nb * 144u, nb, 0u);
+}
+"#;
+
+const WGSL_MATMUL_Q4_K_BATCH: &str = r#"
+struct P { rows: u32, cols: u32, n: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 144u;
+        let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
+        let dmin = f16f32(gb(bb + 2u) | (gb(bb + 3u) << 8u));
+        let sbase = bb + 4u;
+        let qbase = bb + 16u;
+        let xb = xoff + b * 256u;
+        var y = 0u;
+        var is = 0u;
+        for (var chunk = 0u; chunk < 4u; chunk = chunk + 1u) {
+            let sm1 = scale_min_k4(is, sbase);
+            let sm2 = scale_min_k4(is + 1u, sbase);
+            let d1 = d * f32(sm1.x); let min1 = dmin * f32(sm1.y);
+            let d2 = d * f32(sm2.x); let min2 = dmin * f32(sm2.y);
+            let cbase = qbase + chunk * 32u;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d1 * f32(gb(cbase + j) & 0x0fu) - min1) * x[xb + y];
+                y = y + 1u;
+            }
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d2 * f32(gb(cbase + j) >> 4u) - min2) * x[xb + y];
+                y = y + 1u;
+            }
+            is = is + 2u;
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = gid.y;
+    if (row >= p.rows || r >= p.n) { return; }
+    let nb = p.cols / 256u;
+    outp[r * p.rows + row] = dot_q4k_row(row * nb * 144u, nb, r * p.cols);
+}
+"#;
+
+// Q6_K: 210-byte superblocks of 256 (128B ql, 64B qh, 16 signed-i8 scales,
+// f16 d). Mirrors quant::block_q6_k.
+const WGSL_MATMUL_Q6_K: &str = r#"
+struct P { rows: u32, cols: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 210u;
+        let d = f16f32(gb(bb + 208u) | (gb(bb + 209u) << 8u));
+        let xb = xoff + b * 256u;
+        for (var half = 0u; half < 2u; half = half + 1u) {
+            let qlb = bb + half * 64u;
+            let qhb = bb + 128u + half * 32u;
+            let scb = bb + 192u + half * 8u;
+            let y = half * 128u;
+            for (var l = 0u; l < 32u; l = l + 1u) {
+                let is = l / 16u;
+                let qll = gb(qlb + l);
+                let qll32 = gb(qlb + l + 32u);
+                let qhl = gb(qhb + l);
+                let q1 = i32((qll & 0x0fu) | (((qhl >> 0u) & 3u) << 4u)) - 32;
+                let q2 = i32((qll32 & 0x0fu) | (((qhl >> 2u) & 3u) << 4u)) - 32;
+                let q3 = i32((qll >> 4u) | (((qhl >> 4u) & 3u) << 4u)) - 32;
+                let q4 = i32((qll32 >> 4u) | (((qhl >> 6u) & 3u) << 4u)) - 32;
+                acc = acc + d * f32(sext8(gb(scb + is))) * f32(q1) * x[xb + y + l];
+                acc = acc + d * f32(sext8(gb(scb + is + 2u))) * f32(q2) * x[xb + y + l + 32u];
+                acc = acc + d * f32(sext8(gb(scb + is + 4u))) * f32(q3) * x[xb + y + l + 64u];
+                acc = acc + d * f32(sext8(gb(scb + is + 6u))) * f32(q4) * x[xb + y + l + 96u];
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= p.rows) { return; }
+    let nb = p.cols / 256u;
+    outp[row] = dot_q6k_row(row * nb * 210u, nb, 0u);
+}
+"#;
+
+const WGSL_MATMUL_Q6_K_BATCH: &str = r#"
+struct P { rows: u32, cols: u32, n: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 210u;
+        let d = f16f32(gb(bb + 208u) | (gb(bb + 209u) << 8u));
+        let xb = xoff + b * 256u;
+        for (var half = 0u; half < 2u; half = half + 1u) {
+            let qlb = bb + half * 64u;
+            let qhb = bb + 128u + half * 32u;
+            let scb = bb + 192u + half * 8u;
+            let y = half * 128u;
+            for (var l = 0u; l < 32u; l = l + 1u) {
+                let is = l / 16u;
+                let qll = gb(qlb + l);
+                let qll32 = gb(qlb + l + 32u);
+                let qhl = gb(qhb + l);
+                let q1 = i32((qll & 0x0fu) | (((qhl >> 0u) & 3u) << 4u)) - 32;
+                let q2 = i32((qll32 & 0x0fu) | (((qhl >> 2u) & 3u) << 4u)) - 32;
+                let q3 = i32((qll >> 4u) | (((qhl >> 4u) & 3u) << 4u)) - 32;
+                let q4 = i32((qll32 >> 4u) | (((qhl >> 6u) & 3u) << 4u)) - 32;
+                acc = acc + d * f32(sext8(gb(scb + is))) * f32(q1) * x[xb + y + l];
+                acc = acc + d * f32(sext8(gb(scb + is + 2u))) * f32(q2) * x[xb + y + l + 32u];
+                acc = acc + d * f32(sext8(gb(scb + is + 4u))) * f32(q3) * x[xb + y + l + 64u];
+                acc = acc + d * f32(sext8(gb(scb + is + 6u))) * f32(q4) * x[xb + y + l + 96u];
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = gid.y;
+    if (row >= p.rows || r >= p.n) { return; }
+    let nb = p.cols / 256u;
+    outp[r * p.rows + row] = dot_q6k_row(row * nb * 210u, nb, r * p.cols);
+}
+"#;
+
 /// The compiled compute pipelines, one per primitive.
 struct Pipelines {
     matmul: wgpu::ComputePipeline,
@@ -434,6 +628,10 @@ struct Pipelines {
     attention_batch: wgpu::ComputePipeline,
     matmul_q8_0: wgpu::ComputePipeline,
     matmul_q8_0_batch: wgpu::ComputePipeline,
+    matmul_q4_k: wgpu::ComputePipeline,
+    matmul_q4_k_batch: wgpu::ComputePipeline,
+    matmul_q6_k: wgpu::ComputePipeline,
+    matmul_q6_k_batch: wgpu::ComputePipeline,
 }
 
 /// A resident weight: its device buffer and the format it's stored in (`F32`
@@ -609,6 +807,26 @@ impl GpuBackend {
                 &device,
                 &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q8_0_BATCH}"),
                 "matmul_q8_0_batch",
+            ),
+            matmul_q4_k: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q4_K}"),
+                "matmul_q4_k",
+            ),
+            matmul_q4_k_batch: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q4_K_BATCH}"),
+                "matmul_q4_k_batch",
+            ),
+            matmul_q6_k: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q6_K}"),
+                "matmul_q6_k",
+            ),
+            matmul_q6_k_batch: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q6_K_BATCH}"),
+                "matmul_q6_k_batch",
             ),
         };
 
@@ -809,7 +1027,7 @@ impl GpuBackend {
             // In-shader formats: keep the raw blocks (padded to a u32 boundary
             // so the shader can read them as array<u32>).
             QMatrix::Quant {
-                ty: ty @ GgmlType::Q8_0,
+                ty: ty @ (GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K),
                 data,
                 ..
             } => {
@@ -850,6 +1068,8 @@ impl GpuBackend {
     fn matmul_pipeline(&self, ty: GgmlType) -> &wgpu::ComputePipeline {
         match ty {
             GgmlType::Q8_0 => &self.pipelines.matmul_q8_0,
+            GgmlType::Q4_K => &self.pipelines.matmul_q4_k,
+            GgmlType::Q6_K => &self.pipelines.matmul_q6_k,
             _ => &self.pipelines.matmul, // F32 (incl. host-dequantized weights)
         }
     }
@@ -858,6 +1078,8 @@ impl GpuBackend {
     fn matmul_batch_pipeline(&self, ty: GgmlType) -> &wgpu::ComputePipeline {
         match ty {
             GgmlType::Q8_0 => &self.pipelines.matmul_q8_0_batch,
+            GgmlType::Q4_K => &self.pipelines.matmul_q4_k_batch,
+            GgmlType::Q6_K => &self.pipelines.matmul_q6_k_batch,
             _ => &self.pipelines.matmul_batch,
         }
     }
@@ -1474,6 +1696,88 @@ mod tests {
         let exact: Vec<f32> = (0..rows)
             .map(|r| (0..cols).map(|j| deq[r * cols + j] * x[j]).sum())
             .collect();
+        close(&out, &exact);
+    }
+
+    /// Build `rows` valid Q4_K superblocks (256 cols each), varied per row.
+    fn q4_k_weight(rows: usize) -> Vec<u8> {
+        use crate::quant::{f32_to_f16, pack_scales_q4_k};
+        let mut bytes = Vec::new();
+        for r in 0..rows as u32 {
+            bytes.extend_from_slice(&f32_to_f16(0.05).to_le_bytes());
+            bytes.extend_from_slice(&f32_to_f16(0.02).to_le_bytes());
+            bytes.extend_from_slice(&pack_scales_q4_k(
+                [10, 20, 5, 33, 41, 7, 18, 25],
+                [3, 9, 14, 1, 22, 6, 30, 11],
+            ));
+            (0..128u32).for_each(|i| bytes.push(((i * 7 + 3 + r) % 256) as u8));
+        }
+        bytes
+    }
+
+    /// Build `rows` valid Q6_K superblocks (256 cols each).
+    fn q6_k_weight(rows: usize) -> Vec<u8> {
+        use crate::quant::f32_to_f16;
+        let mut bytes = Vec::new();
+        for r in 0..rows as u32 {
+            (0..128u32).for_each(|i| bytes.push(((i * 5 + 1 + r) % 256) as u8));
+            (0..64u32).for_each(|i| bytes.push(((i * 9 + 2) % 256) as u8));
+            (0..16i32).for_each(|i| bytes.push((i - 8) as i8 as u8));
+            bytes.extend_from_slice(&f32_to_f16(0.03).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn matmul_q4_k_matches_exact() {
+        let Some(g) = gpu() else { return };
+        let (rows, cols) = (3usize, 256usize);
+        let bytes = q4_k_weight(rows);
+        let deq = crate::quant::dequantize(GgmlType::Q4_K, &bytes, rows * cols).unwrap();
+        let x = noise(cols, 13);
+        let w = QMatrix::quant(GgmlType::Q4_K, bytes.into(), rows, cols).unwrap();
+        let mut out = vec![0.0; rows];
+        g.matmul(&mut out, &x, &w);
+        let exact: Vec<f32> = (0..rows)
+            .map(|r| (0..cols).map(|j| deq[r * cols + j] * x[j]).sum())
+            .collect();
+        close(&out, &exact);
+    }
+
+    #[test]
+    fn matmul_q6_k_matches_exact() {
+        let Some(g) = gpu() else { return };
+        let (rows, cols) = (2usize, 256usize);
+        let bytes = q6_k_weight(rows);
+        let deq = crate::quant::dequantize(GgmlType::Q6_K, &bytes, rows * cols).unwrap();
+        let x = noise(cols, 14);
+        let w = QMatrix::quant(GgmlType::Q6_K, bytes.into(), rows, cols).unwrap();
+        let mut out = vec![0.0; rows];
+        g.matmul(&mut out, &x, &w);
+        let exact: Vec<f32> = (0..rows)
+            .map(|r| (0..cols).map(|j| deq[r * cols + j] * x[j]).sum())
+            .collect();
+        close(&out, &exact);
+    }
+
+    #[test]
+    fn matmul_q4_k_batch_matches_exact() {
+        let Some(g) = gpu() else { return };
+        // Two batch rows of x against a 3-row Q4_K weight; checks the batch
+        // kernel's x/out indexing (the dequant is shared with the single kernel).
+        let (rows, cols, n) = (3usize, 256usize, 2usize);
+        let bytes = q4_k_weight(rows);
+        let deq = crate::quant::dequantize(GgmlType::Q4_K, &bytes, rows * cols).unwrap();
+        let x = noise(n * cols, 15);
+        let w = QMatrix::quant(GgmlType::Q4_K, bytes.into(), rows, cols).unwrap();
+        let mut out = vec![0.0; n * rows];
+        g.matmul_batch(&mut out, &x, &w, n);
+        let mut exact = vec![0.0f32; n * rows];
+        for r in 0..n {
+            for o in 0..rows {
+                exact[r * rows + o] = (0..cols).map(|j| deq[o * cols + j] * x[r * cols + j]).sum();
+            }
+        }
         close(&out, &exact);
     }
 
