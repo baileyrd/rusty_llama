@@ -450,6 +450,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// --- int8 (DP4A) decode path -----------------------------------------------
+//
+// On the GPU, dequantizing to f32 and doing an f32 dot is ~2.5× slower than an
+// int8 dot via `dot4I8Packed` (one DP4A = 4 i8×i8 MACs). For decode we quantize
+// each f32 activation to int8 (+per-32 scale) on-device once, then matmul reads
+// int8 weights (re-laid contiguous + per-block scale) and the int8 activation.
+
+// f32 activation -> int8 (4 packed per u32) + per-32-block f32 scale. One thread
+// per 32-block; dispatch ceil(nblocks/64) workgroups.
+const WGSL_QUANTIZE_Q8: &str = r#"
+struct P { nblocks: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> qout: array<u32>;
+@group(0) @binding(2) var<storage, read_write> scout: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= p.nblocks) { return; }
+    let base = b * 32u;
+    var amax = 0.0;
+    for (var i = 0u; i < 32u; i = i + 1u) { amax = max(amax, abs(x[base + i])); }
+    let scale = amax / 127.0;
+    let inv = select(0.0, 1.0 / scale, scale > 0.0);
+    scout[b] = scale;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        var packed: u32 = 0u;
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let q = clamp(i32(round(x[base + k * 4u + j] * inv)), -128, 127);
+            packed = packed | ((u32(q) & 0xffu) << (j * 8u));
+        }
+        qout[b * 8u + k] = packed;
+    }
+}
+"#;
+
+// int8 Q8_0 cooperative GEMV via dot4I8Packed. Weights are re-laid to contiguous
+// int8 (`wq`, 4 per u32) + per-32 scale (`wscale`); activation is int8 (`aq`) +
+// scale (`ascale`). `acc != 0` folds the residual add in (out[row] += dot).
+const WGSL_MATMUL_Q8_0_I8: &str = r#"
+struct P { rows: u32, cols: u32, acc: u32 };
+@group(0) @binding(0) var<storage, read> wq: array<u32>;
+@group(0) @binding(1) var<storage, read> wscale: array<f32>;
+@group(0) @binding(2) var<storage, read> aq: array<u32>;
+@group(0) @binding(3) var<storage, read> ascale: array<f32>;
+@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(5) var<storage, read> p: P;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    if (row >= p.rows) { return; }
+    let tid = lid.x;
+    let nb = p.cols / 32u;
+    let wbase = row * (p.cols / 4u);
+    let sbase = row * nb;
+    var acc = 0.0;
+    for (var b = tid; b < nb; b = b + 64u) {
+        var dot: i32 = 0;
+        let wu = wbase + b * 8u;
+        let au = b * 8u;
+        for (var k = 0u; k < 8u; k = k + 1u) {
+            dot = dot + dot4I8Packed(wq[wu + k], aq[au + k]);
+        }
+        acc = acc + wscale[sbase + b] * ascale[b] * f32(dot);
+    }
+    red[tid] = acc;
+    workgroupBarrier();
+    for (var s = 32u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    if (tid == 0u) { outp[row] = select(red[0], outp[row] + red[0], p.acc != 0u); }
+}
+"#;
+
 // Q4_K: 144-byte superblocks of 256 (f16 d, f16 dmin, 12B packed 6-bit
 // scale/min, 128B of 4-bit quants). Mirrors quant::block_q4_k.
 // Q4_K cooperative GEMV: one workgroup per row; threads split the 32-element
@@ -661,6 +737,12 @@ struct Pipelines {
     matmul_q4_k_batch: wgpu::ComputePipeline,
     matmul_q6_k: wgpu::ComputePipeline,
     matmul_q6_k_batch: wgpu::ComputePipeline,
+    // Stage-1 int8 decode kernels; verified by tests, wired into the fused
+    // decode in the next commit (hence not yet read by the lib).
+    #[allow(dead_code)]
+    quantize_q8: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    matmul_q8_0_i8: wgpu::ComputePipeline,
 }
 
 /// A resident weight: its device buffer and the format it's stored in (`F32`
@@ -855,6 +937,8 @@ impl GpuBackend {
                 &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q6_K_BATCH}"),
                 "matmul_q6_k_batch",
             ),
+            quantize_q8: make_pipeline(&device, WGSL_QUANTIZE_Q8, "quantize_q8"),
+            matmul_q8_0_i8: make_pipeline(&device, WGSL_MATMUL_Q8_0_I8, "matmul_q8_0_i8"),
         };
 
         Ok(GpuBackend {
@@ -1808,6 +1892,97 @@ mod tests {
             }
         }
         close(&out, &exact);
+    }
+
+    // --- int8 DP4A decode path (Stage 1) --------------------------------
+
+    /// Re-lay a Q8_0 weight to contiguous int8 (as bytes) + per-32 f32 scales.
+    fn q8_0_relayout(wbytes: &[u8], rows: usize, nb: usize) -> (Vec<u8>, Vec<f32>) {
+        let mut wq = Vec::with_capacity(rows * nb * 32);
+        let mut wscale = Vec::with_capacity(rows * nb);
+        for blk in 0..rows * nb {
+            let off = blk * 34;
+            wscale.push(crate::quant::f16_to_f32(u16::from_le_bytes([
+                wbytes[off],
+                wbytes[off + 1],
+            ])));
+            wq.extend_from_slice(&wbytes[off + 2..off + 34]);
+        }
+        (wq, wscale)
+    }
+
+    #[test]
+    fn matmul_q8_0_i8_matches_int_dot() {
+        let Some(g) = gpu() else { return };
+        // Feed a host-quantized activation so the kernel is checked against the
+        // exact integer dot (no GPU-quantize round-mode ambiguity).
+        let (rows, cols) = (5usize, 256usize);
+        let nb = cols / 32;
+        let wbytes = crate::quant::quantize_q8_0(&noise(rows * cols, 7));
+        let (wq, wscale) = q8_0_relayout(&wbytes, rows, nb);
+        let act = crate::quant::quantize_activation_q8(&noise(cols, 8));
+        let aq: &[u8] =
+            unsafe { std::slice::from_raw_parts(act.qs.as_ptr() as *const u8, act.qs.len()) };
+
+        // Reference: exact integer dot, scaled, in the same per-block order.
+        let mut want = vec![0.0f32; rows];
+        for (r, w) in want.iter_mut().enumerate() {
+            for b in 0..nb {
+                let dot: i32 = (0..32)
+                    .map(|i| wq[(r * nb + b) * 32 + i] as i8 as i32 * act.qs[b * 32 + i] as i32)
+                    .sum();
+                *w += wscale[r * nb + b] * act.scales[b] * dot as f32;
+            }
+        }
+
+        let wqb = g.storage_ro("wq", &wq);
+        let wsb = g.storage_ro("wscale", f32_bytes(&wscale));
+        let aqb = g.storage_ro("aq", aq);
+        let asb = g.storage_ro("ascale", f32_bytes(&act.scales));
+        let ob = g.alloc_out(rows);
+        let pb = g.params(&[rows as u32, cols as u32, 0]);
+        let bind = g.bind(
+            &g.pipelines.matmul_q8_0_i8,
+            &[&wqb, &wsb, &aqb, &asb, &ob, &pb],
+        );
+        let mut got = vec![0.0f32; rows];
+        g.run_grid(&g.pipelines.matmul_q8_0_i8, &bind, [rows as u32, 1, 1], &ob, &mut got);
+        close(&got, &want);
+    }
+
+    #[test]
+    fn quantize_q8_kernel_is_valid() {
+        let Some(g) = gpu() else { return };
+        let n = 256usize;
+        let x = noise(n, 21);
+        let host = crate::quant::quantize_activation_q8(&x);
+        // GPU quantize.
+        let xb = g.storage_ro("x", f32_bytes(&x));
+        let qb = g.buffer("q", n / 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let sb = g.buffer(
+            "s",
+            n / 32,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let pb = g.params(&[(n / 32) as u32]);
+        let bind = g.bind(&g.pipelines.quantize_q8, &[&xb, &qb, &sb, &pb]);
+        g.dispatch(&g.pipelines.quantize_q8, &bind, ceil_div(n / 32, 64));
+        let mut qbytes = vec![0.0f32; n / 4]; // read u32s as f32 bits then reinterpret
+        g.read_back(&qb, &mut qbytes);
+        let mut scales = vec![0.0f32; n / 32];
+        g.read_back(&sb, &mut scales);
+        // int8 values within ±1 of host (round-to-even vs away), scales close.
+        let gpu_q: Vec<i8> = qbytes
+            .iter()
+            .flat_map(|w| w.to_bits().to_le_bytes())
+            .map(|b| b as i8)
+            .collect();
+        for (i, (&hq, &gq)) in host.qs.iter().zip(&gpu_q).enumerate() {
+            assert!((hq as i32 - gq as i32).abs() <= 1, "idx {i}: host {hq} gpu {gq}");
+        }
+        for (hs, gs) in host.scales.iter().zip(&scales) {
+            assert!((hs - gs).abs() <= 1e-6 * hs.abs().max(1.0) + 1e-9);
+        }
     }
 
     #[test]
