@@ -89,13 +89,15 @@ the whole step into one command encoder — one submission, one logits read-back
 The matmuls use a **cooperative GEMV** (one workgroup per output row, threads
 reduce the dot product with coalesced weight reads) instead of one thread per
 row; profiling showed the old kernel — not dispatch overhead — was the
-bottleneck (only ~18 GB/s effective). Together these took TinyLlama Q4_K_M decode
-from **6 → ~37 tok/s** and **VRAM from ~4.5 GB → ~1.0 GB**.
+bottleneck (only ~18 GB/s effective). The per-layer residual adds are folded
+into the matmul (it accumulates into the residual stream), trimming two
+dispatches per layer. Together these took TinyLlama Q4_K_M decode from
+**6 → ~41 tok/s** and **VRAM from ~4.5 GB → ~1.0 GB**.
 
 **Performance summary.** The GPU now wins across the board on this hardware
 (RTX 5070 Ti): a resident 4096² matmul ~1.2× a multi-core CPU; batched prefill
 ~2× (`bench_prefill_gpu_vs_cpu`); and **decode now beats the CPU** — TinyLlama
-Q4_K_M ≈37 vs ≈34 tok/s, and a synthetic dim-1024 model 587 vs 229 tok/s
+Q4_K_M ≈41 vs ≈34 tok/s, and a synthetic dim-1024 model ~560 vs ~220 tok/s
 (`bench_decode_gpu_vs_cpu`). One caveat: the cooperative reduction sums in a
 different (parallel) order than the CPU's sequential dot, so over a long greedy
 run the GPU's output can eventually diverge from the CPU's *exact* token
