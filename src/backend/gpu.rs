@@ -882,6 +882,18 @@ impl Backend for GpuBackend {
         self.run_grid(&self.pipelines.attention_batch, &bind, grid, &ob, out);
         let _ = att; // GPU path keeps softmax state in registers; att unused.
     }
+
+    fn forward_step(
+        &self,
+        model: &crate::model::Model,
+        state: &mut crate::model::RunState,
+        token: usize,
+        pos: usize,
+    ) {
+        // TODO(M2): fused on-device step. For now, the per-op path (correct,
+        // just round-trip-bound).
+        crate::model::forward(model, state, self, token, pos);
+    }
 }
 
 /// Compile a single-entry-point compute pipeline from WGSL source.

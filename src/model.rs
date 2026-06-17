@@ -605,7 +605,7 @@ pub fn generate(
     let mut generated = 0;
 
     while pos < steps {
-        forward(model, state, backend, token, pos);
+        backend.forward_step(model, state, token, pos);
 
         // While we still have prompt tokens to ingest, force the next token;
         // otherwise sample it.
@@ -676,7 +676,7 @@ fn generate_prefilled(
         if pos >= steps {
             break;
         }
-        forward(model, state, backend, token, pos);
+        backend.forward_step(model, state, token, pos);
         next = sampler.sample(state.logits_mut());
     }
 
