@@ -737,11 +737,8 @@ struct Pipelines {
     matmul_q4_k_batch: wgpu::ComputePipeline,
     matmul_q6_k: wgpu::ComputePipeline,
     matmul_q6_k_batch: wgpu::ComputePipeline,
-    // Stage-1 int8 decode kernels; verified by tests, wired into the fused
-    // decode in the next commit (hence not yet read by the lib).
-    #[allow(dead_code)]
+    // Stage-1 int8 (DP4A) decode kernels, driven by the int8 fused-decode path.
     quantize_q8: wgpu::ComputePipeline,
-    #[allow(dead_code)]
     matmul_q8_0_i8: wgpu::ComputePipeline,
 }
 
@@ -758,8 +755,6 @@ struct GpuWeight {
 /// int8 values (4 packed per `u32`) plus the per-32-block f32 scales — the
 /// layout `matmul_q8_0_i8` expects. The int8 analogue of [`GpuWeight`]; always
 /// Q8_0-derived, so it carries no format tag.
-// Wired into the fused decode in the next commit (Stage 1).
-#[allow(dead_code)]
 #[derive(Clone)]
 struct GpuWeightI8 {
     q: Arc<wgpu::Buffer>,
@@ -786,6 +781,38 @@ struct LayerBinds {
     /// On-device format of each matmul weight, to pick the matmul pipeline
     /// (order: wq, wk, wv, wo, w1, w3, w2).
     mm_ty: [GgmlType; 7],
+}
+
+/// Per-layer bind groups for the int8 (DP4A) fused decode — the seven matmuls
+/// run as `matmul_q8_0_i8` against relaid int8 weights and the on-device-
+/// quantized activation. The rmsnorm/rope/attention/swiglu ops stay f32 and
+/// reuse the matching [`LayerBinds`] groups; the quantize bind groups aren't
+/// per-layer (they reference fixed resident buffers) and live on [`DecodeInt8`].
+struct LayerBindsInt8 {
+    mq: wgpu::BindGroup,
+    mk: wgpu::BindGroup,
+    mv: wgpu::BindGroup,
+    mo: wgpu::BindGroup,
+    m1: wgpu::BindGroup,
+    m3: wgpu::BindGroup,
+    m2: wgpu::BindGroup,
+}
+
+/// The int8 (DP4A) overlay for [`DecodeState`], present only when every matmul
+/// weight is Q8_0 and the int8 path is enabled. Holds the two reusable quantize
+/// bind groups (one per activation width) and the per-layer + classifier int8
+/// matmul bind groups. The resident int8 activation buffers it writes/reads
+/// (`xb_i8`/`xb_scale`/`hb_i8`/`hb_scale`) and the f32 `DecodeState` buffers it
+/// shares are all kept alive by these bind groups, so they need no field here.
+struct DecodeInt8 {
+    /// `quantize_q8` for the dim-wide xb: reused before every xb-consuming
+    /// matmul group (after attn-rmsnorm, after attention, after ffn-rmsnorm) and
+    /// before the classifier.
+    quant_xb: wgpu::BindGroup,
+    /// `quantize_q8` for the hidden-wide swiglu output, before `m2`.
+    quant_hb: wgpu::BindGroup,
+    layers: Vec<LayerBindsInt8>,
+    final_cls: wgpu::BindGroup,
 }
 
 /// Device-resident state for fused single-token decode: the KV cache, the
@@ -817,6 +844,10 @@ struct DecodeState {
     final_rms: wgpu::BindGroup,
     final_cls: wgpu::BindGroup,
     final_cls_ty: GgmlType,
+    /// int8 (DP4A) overlay; `Some` when the int8 decode path is active for this
+    /// model. The f32 fields above stay built either way (the Stage-1 2× weight-
+    /// VRAM shortcut), so toggling the path needs no rebuild of the f32 state.
+    int8: Option<DecodeInt8>,
     /// Number of KV positions already resident on the device.
     kv_filled: usize,
     /// Scratch for the per-step token embedding upload.
@@ -857,8 +888,6 @@ pub struct GpuBackend {
     /// by the *same* source data pointer as [`weights`] (so the raw-Q8_0 and
     /// int8 copies of one weight coexist — the Stage-1 2× weight-VRAM shortcut).
     /// Same one-backend-per-model rule as `weights`.
-    // Wired into the fused decode in the next commit (Stage 1).
-    #[allow(dead_code)]
     weights_i8: Mutex<HashMap<usize, GpuWeightI8>>,
     /// Resident RoPE inverse-frequency tables, keyed by source data pointer.
     tables: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
@@ -867,6 +896,10 @@ pub struct GpuBackend {
     /// Resident decode state (KV cache + activations + bind groups), built lazily
     /// on the first [`Backend::forward_step`] and reused across decode steps.
     decode: Mutex<Option<DecodeState>>,
+    /// Whether the int8 (DP4A) fused-decode path may be used when the model is
+    /// Q8_0-eligible. Defaults from the `RUSTY_LLAMA_NO_INT8` env var (set =>
+    /// disabled); override with [`set_int8_decode`] for A/B measurement & tests.
+    int8_decode: bool,
     /// Human-readable adapter name, for logging.
     adapter_name: String,
 }
@@ -969,6 +1002,7 @@ impl GpuBackend {
             tables: Mutex::new(HashMap::new()),
             limits,
             decode: Mutex::new(None),
+            int8_decode: std::env::var_os("RUSTY_LLAMA_NO_INT8").is_none(),
             adapter_name,
         })
     }
@@ -976,6 +1010,15 @@ impl GpuBackend {
     /// The selected GPU adapter's name (for logging / benchmarks).
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    /// Force the int8 (DP4A) decode path on or off, overriding the
+    /// `RUSTY_LLAMA_NO_INT8` env default. Drops any cached decode state so the
+    /// next step rebuilds with the new setting — the seam A/B benchmarks and
+    /// tests use to compare int8 vs f32 on one model without env races.
+    pub fn set_int8_decode(&mut self, on: bool) {
+        self.int8_decode = on;
+        *self.decode.lock().unwrap() = None;
     }
 
     // --- buffer helpers -----------------------------------------------------
@@ -1200,8 +1243,6 @@ impl GpuBackend {
     /// cached by source pointer in [`weights_i8`]. Only valid for
     /// `QMatrix::Quant { ty: Q8_0, .. }` — the eligibility gate guarantees the
     /// caller never asks for anything else.
-    // Wired into the fused decode in the next commit (Stage 1).
-    #[allow(dead_code)]
     fn weight_buffer_i8(&self, w: &QMatrix) -> GpuWeightI8 {
         let (data, rows, cols) = match w {
             QMatrix::Quant {
@@ -1402,6 +1443,65 @@ impl GpuBackend {
         let final_cls = self.bind(self.matmul_pipeline(wcls.ty), &[&wcls.buf, &xb, &logits, &p_vocab]);
         let final_cls_ty = wcls.ty;
 
+        // int8 (DP4A) overlay: built only when enabled and every matmul weight is
+        // Q8_0. Shares the f32 resident buffers and const params; adds resident
+        // int8 activations + relaid int8 weights (the Stage-1 2× weight-VRAM
+        // shortcut keeps the f32 weights too). The int8 activation buffers and
+        // the shared f32 buffers are kept alive by the bind groups built here, so
+        // none need their own field on DecodeInt8.
+        let int8 = (self.int8_decode && model_q8_0_eligible(model)).then(|| {
+            let xb_i8 = self.buffer("xb_i8", dim / 4, U::STORAGE);
+            let xb_scale = self.buffer("xb_scale", dim / 32, U::STORAGE);
+            let hb_i8 = self.buffer("hb_i8", hidden / 4, U::STORAGE);
+            let hb_scale = self.buffer("hb_scale", hidden / 32, U::STORAGE);
+            let p_q_xb = self.storage_ro("p_q", u32_bytes(&[(dim / 32) as u32]));
+            let p_q_hb = self.storage_ro("p_q", u32_bytes(&[(hidden / 32) as u32]));
+            let quant_xb =
+                self.bind(&self.pipelines.quantize_q8, &[&xb, &xb_i8, &xb_scale, &p_q_xb]);
+            let quant_hb =
+                self.bind(&self.pipelines.quantize_q8, &[&hb, &hb_i8, &hb_scale, &p_q_hb]);
+            // int8 matmul bind order: [wq, wscale, aq, ascale, out, params].
+            let mm8 = |w8: &GpuWeightI8,
+                       aq: &wgpu::Buffer,
+                       asc: &wgpu::Buffer,
+                       out: &wgpu::Buffer,
+                       params: &wgpu::Buffer| {
+                self.bind(
+                    &self.pipelines.matmul_q8_0_i8,
+                    &[&w8.q, &w8.scale, aq, asc, out, params],
+                )
+            };
+            let layers = (0..nl)
+                .map(|l| {
+                    let wq = self.weight_buffer_i8(&w.wq[l]);
+                    let wk = self.weight_buffer_i8(&w.wk[l]);
+                    let wv = self.weight_buffer_i8(&w.wv[l]);
+                    let wo = self.weight_buffer_i8(&w.wo[l]);
+                    let w1 = self.weight_buffer_i8(&w.w1[l]);
+                    let w2 = self.weight_buffer_i8(&w.w2[l]);
+                    let w3 = self.weight_buffer_i8(&w.w3[l]);
+                    LayerBindsInt8 {
+                        mq: mm8(&wq, &xb_i8, &xb_scale, &q, &p_dimdim),
+                        mk: mm8(&wk, &xb_i8, &xb_scale, &k_tmp, &p_kvdim),
+                        mv: mm8(&wv, &xb_i8, &xb_scale, &v_tmp, &p_kvdim),
+                        // mo/m2 accumulate (acc=1) into x, folding the residual.
+                        mo: mm8(&wo, &xb_i8, &xb_scale, &x, &p_dimdim_acc),
+                        m1: mm8(&w1, &xb_i8, &xb_scale, &hb, &p_hidden),
+                        m3: mm8(&w3, &xb_i8, &xb_scale, &hb2, &p_hidden),
+                        m2: mm8(&w2, &hb_i8, &hb_scale, &x, &p_dimhidden_acc),
+                    }
+                })
+                .collect();
+            let wcls_i8 = self.weight_buffer_i8(&w.wcls);
+            let final_cls = mm8(&wcls_i8, &xb_i8, &xb_scale, &logits, &p_vocab);
+            DecodeInt8 {
+                quant_xb,
+                quant_hb,
+                layers,
+                final_cls,
+            }
+        });
+
         DecodeState {
             dim,
             kv_dim,
@@ -1423,6 +1523,7 @@ impl GpuBackend {
             final_rms,
             final_cls,
             final_cls_ty,
+            int8,
             kv_filled: 0,
             embed: vec![0.0; dim],
         }
@@ -1490,33 +1591,70 @@ impl GpuBackend {
         let sw_wg = ceil_div(d.hidden, 64);
         let wg_rope = ceil_div(d.dim / 2, 64);
         let wg_heads = d.n_heads as u32;
+        let q_xb_wg = ceil_div(d.dim / 32, 64);
+        let q_hb_wg = ceil_div(d.hidden / 32, 64);
         let pos_off = (pos * d.kv_dim * 4) as u64;
         let kv_bytes = (d.kv_dim * 4) as u64;
 
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        for l in 0..d.n_layers {
-            let lb = &d.layers[l];
-            let mm = lb.mm_ty.map(|t| self.matmul_pipeline(t)); // [wq,wk,wv,wo,w1,w3,w2]
-            pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_att, 1);
-            pass(&mut enc, mm[0], &lb.mq, mm_dim);
-            pass(&mut enc, mm[1], &lb.mk, mm_kv);
-            pass(&mut enc, mm[2], &lb.mv, mm_kv);
-            pass(&mut enc, &self.pipelines.rope, &lb.rope, wg_rope);
-            // Stash the rotated K/V for this position into the resident cache.
-            enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
-            enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
-            pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
-            pass(&mut enc, mm[3], &lb.mo, mm_dim); // folds residual add into x
-            pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
-            pass(&mut enc, mm[4], &lb.m1, mm_hidden);
-            pass(&mut enc, mm[5], &lb.m3, mm_hidden);
-            pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, sw_wg);
-            pass(&mut enc, mm[6], &lb.m2, mm_dim); // folds residual add into x
+        if let Some(i8s) = &d.int8 {
+            // int8 (DP4A) path: rmsnorm/rope/attention/swiglu stay f32 (reusing
+            // the LayerBinds groups); the seven matmuls + classifier run on int8,
+            // each preceded by an on-device quantize of its f32 input activation.
+            // One op per pass() => wgpu inserts the read/write barriers the reused
+            // xb_i8/hb_i8 buffers need; never coalesce two ops into one pass.
+            let mm8 = &self.pipelines.matmul_q8_0_i8;
+            let quant = &self.pipelines.quantize_q8;
+            for l in 0..d.n_layers {
+                let lb = &d.layers[l];
+                let il = &i8s.layers[l];
+                pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_att, 1);
+                pass(&mut enc, quant, &i8s.quant_xb, q_xb_wg);
+                pass(&mut enc, mm8, &il.mq, mm_dim);
+                pass(&mut enc, mm8, &il.mk, mm_kv);
+                pass(&mut enc, mm8, &il.mv, mm_kv);
+                pass(&mut enc, &self.pipelines.rope, &lb.rope, wg_rope);
+                enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
+                enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
+                pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
+                pass(&mut enc, quant, &i8s.quant_xb, q_xb_wg); // quantize attn output
+                pass(&mut enc, mm8, &il.mo, mm_dim); // folds residual add into x
+                pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
+                pass(&mut enc, quant, &i8s.quant_xb, q_xb_wg);
+                pass(&mut enc, mm8, &il.m1, mm_hidden);
+                pass(&mut enc, mm8, &il.m3, mm_hidden);
+                pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, sw_wg);
+                pass(&mut enc, quant, &i8s.quant_hb, q_hb_wg);
+                pass(&mut enc, mm8, &il.m2, mm_dim); // folds residual add into x
+            }
+            pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
+            pass(&mut enc, quant, &i8s.quant_xb, q_xb_wg);
+            pass(&mut enc, mm8, &i8s.final_cls, mm_vocab);
+        } else {
+            for l in 0..d.n_layers {
+                let lb = &d.layers[l];
+                let mm = lb.mm_ty.map(|t| self.matmul_pipeline(t)); // [wq,wk,wv,wo,w1,w3,w2]
+                pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_att, 1);
+                pass(&mut enc, mm[0], &lb.mq, mm_dim);
+                pass(&mut enc, mm[1], &lb.mk, mm_kv);
+                pass(&mut enc, mm[2], &lb.mv, mm_kv);
+                pass(&mut enc, &self.pipelines.rope, &lb.rope, wg_rope);
+                // Stash the rotated K/V for this position into the resident cache.
+                enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
+                enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
+                pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
+                pass(&mut enc, mm[3], &lb.mo, mm_dim); // folds residual add into x
+                pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
+                pass(&mut enc, mm[4], &lb.m1, mm_hidden);
+                pass(&mut enc, mm[5], &lb.m3, mm_hidden);
+                pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, sw_wg);
+                pass(&mut enc, mm[6], &lb.m2, mm_dim); // folds residual add into x
+            }
+            pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
+            pass(&mut enc, self.matmul_pipeline(d.final_cls_ty), &d.final_cls, mm_vocab);
         }
-        pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
-        pass(&mut enc, self.matmul_pipeline(d.final_cls_ty), &d.final_cls, mm_vocab);
         enc.copy_buffer_to_buffer(&d.logits, 0, &d.logits_staging, 0, (d.vocab * 4) as u64);
         self.queue.submit(Some(enc.finish()));
         d.kv_filled = pos + 1;
@@ -1780,8 +1918,6 @@ fn ceil_div(a: usize, b: usize) -> u32 {
 /// Re-lay a Q8_0 weight's raw 34-byte blocks into contiguous int8 values (as
 /// bytes, 4 per `u32` for `dot4I8Packed`) + per-32-block f32 scales — the layout
 /// `matmul_q8_0_i8` expects. `nb` is the number of 32-blocks per row (`cols/32`).
-// Used by weight_buffer_i8 (wired into the fused decode next commit) + tests.
-#[allow(dead_code)]
 fn q8_0_relayout(wbytes: &[u8], rows: usize, nb: usize) -> (Vec<u8>, Vec<f32>) {
     let mut wq = Vec::with_capacity(rows * nb * 32);
     let mut wscale = Vec::with_capacity(rows * nb);
@@ -1794,6 +1930,33 @@ fn q8_0_relayout(wbytes: &[u8], rows: usize, nb: usize) -> (Vec<u8>, Vec<f32>) {
         wq.extend_from_slice(&wbytes[off + 2..off + 34]);
     }
     (wq, wscale)
+}
+
+/// Whether `model` is eligible for the int8 (DP4A) decode path: every matmul
+/// weight — the seven per layer plus the classifier — is Q8_0, and the two
+/// quantized activation widths (`dim` for xb, `hidden` for hb) are multiples of
+/// 32. (Q8_0 already forces `cols % 32 == 0`, so the dim checks only guard a
+/// pathological model. `kv_dim`/`vocab` are matmul *output* row counts, never
+/// quantized activation widths, so they have no divisibility constraint.) The
+/// token-embedding table is excluded: it is dequantized on the host into the
+/// per-step embedding, never run through an int8 matmul.
+fn model_q8_0_eligible(model: &crate::model::Model) -> bool {
+    let p = &model.config;
+    if !p.dim.is_multiple_of(32) || !p.hidden_dim.is_multiple_of(32) {
+        return false;
+    }
+    let w = &model.weights;
+    let q8 = |m: &QMatrix| matches!(m, QMatrix::Quant { ty: GgmlType::Q8_0, .. });
+    q8(&w.wcls)
+        && (0..p.n_layers).all(|l| {
+            q8(&w.wq[l])
+                && q8(&w.wk[l])
+                && q8(&w.wv[l])
+                && q8(&w.wo[l])
+                && q8(&w.w1[l])
+                && q8(&w.w2[l])
+                && q8(&w.w3[l])
+        })
 }
 
 /// View an f32 slice as raw little-endian bytes (no copy).
@@ -2057,6 +2220,43 @@ mod tests {
     }
 
     #[test]
+    fn matmul_q8_0_i8_acc_folds_residual() {
+        // The acc=1 branch (out[row] += dot) is what mo/m2 use to fold the
+        // residual into x; the matches_int_dot test only covers acc=0.
+        let Some(g) = gpu() else { return };
+        let (rows, cols) = (4usize, 256usize);
+        let nb = cols / 32;
+        let wbytes = crate::quant::quantize_q8_0(&noise(rows * cols, 17));
+        let (wq, wscale) = q8_0_relayout(&wbytes, rows, nb);
+        let act = crate::quant::quantize_activation_q8(&noise(cols, 18));
+        let aq: &[u8] =
+            unsafe { std::slice::from_raw_parts(act.qs.as_ptr() as *const u8, act.qs.len()) };
+        let prior: Vec<f32> = (0..rows).map(|r| r as f32 * 0.5 - 1.0).collect();
+
+        // Reference: the pre-seeded value plus the exact integer dot.
+        let mut want = prior.clone();
+        for (r, w) in want.iter_mut().enumerate() {
+            for b in 0..nb {
+                let dot: i32 = (0..32)
+                    .map(|i| wq[(r * nb + b) * 32 + i] as i8 as i32 * act.qs[b * 32 + i] as i32)
+                    .sum();
+                *w += wscale[r * nb + b] * act.scales[b] * dot as f32;
+            }
+        }
+
+        let wqb = g.storage_ro("wq", &wq);
+        let wsb = g.storage_ro("wscale", f32_bytes(&wscale));
+        let aqb = g.storage_ro("aq", aq);
+        let asb = g.storage_ro("ascale", f32_bytes(&act.scales));
+        let ob = g.storage_rw("out", f32_bytes(&prior)); // seeded + readable back
+        let pb = g.params(&[rows as u32, cols as u32, 1]); // acc=1
+        let bind = g.bind(&g.pipelines.matmul_q8_0_i8, &[&wqb, &wsb, &aqb, &asb, &ob, &pb]);
+        let mut got = vec![0.0f32; rows];
+        g.run_grid(&g.pipelines.matmul_q8_0_i8, &bind, [rows as u32, 1, 1], &ob, &mut got);
+        close(&got, &want);
+    }
+
+    #[test]
     fn quantize_q8_kernel_is_valid() {
         let Some(g) = gpu() else { return };
         let n = 256usize;
@@ -2089,6 +2289,38 @@ mod tests {
         for (hs, gs) in host.scales.iter().zip(&scales) {
             assert!((hs - gs).abs() <= 1e-6 * hs.abs().max(1.0) + 1e-9);
         }
+    }
+
+    #[test]
+    fn int8_decode_gate_and_toggle() {
+        let Some(mut g) = gpu() else { return };
+        // A Model borrows its Gguf, which borrows its bytes, so keep all three
+        // alive per model (can't return a Model from a helper).
+        let c = crate::Config {
+            dim: 32,
+            hidden_dim: 64,
+            n_layers: 2,
+            n_heads: 4,
+            n_kv_heads: 2,
+            vocab_size: 64,
+            seq_len: 16,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let q8_bytes = crate::dummy::synthetic_gguf_typed(&c, GgmlType::Q8_0);
+        let q8_gguf = crate::Gguf::parse(&q8_bytes).unwrap();
+        let q8 = crate::Model::from_gguf(&q8_gguf).unwrap();
+        let f_bytes = crate::dummy::synthetic_gguf_typed(&c, GgmlType::F32);
+        let f_gguf = crate::Gguf::parse(&f_bytes).unwrap();
+        let f = crate::Model::from_gguf(&f_gguf).unwrap();
+
+        // Q8_0 + int8 enabled (default) => the overlay is built.
+        assert!(g.build_decode_state(&q8).int8.is_some(), "Q8_0 should enable int8");
+        // F32 weights are ineligible => no overlay.
+        assert!(g.build_decode_state(&f).int8.is_none(), "F32 is ineligible for int8");
+        // Toggle off => no overlay even for an eligible Q8_0 model.
+        g.set_int8_decode(false);
+        assert!(g.build_decode_state(&q8).int8.is_none(), "toggle disables int8");
     }
 
     #[test]
