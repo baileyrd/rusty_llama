@@ -2565,43 +2565,69 @@ mod tests {
         if GpuBackend::new().is_err() {
             return;
         }
-        // A weights-heavy model so the weight-streaming cost is visible.
+        // TinyLlama-1.1B shape (the roadmap's reference model) so the number is
+        // representative of the real decode workload.
         let c = crate::Config {
             dim: 2048,
             hidden_dim: 5632,
-            n_layers: 8,
+            n_layers: 22,
             n_heads: 32,
-            n_kv_heads: 32,
+            n_kv_heads: 4, // grouped-query attention (kv_dim = 256)
             vocab_size: 32000,
-            seq_len: 256,
+            seq_len: 2048,
             shared_weights: true,
             ..Default::default()
         };
         let steps = 32usize;
-        for ty in [crate::GgmlType::F32, crate::GgmlType::Q8_0] {
-            // Fresh backend per model (same dims => the decode state wouldn't rebuild).
-            let g = GpuBackend::new().unwrap();
-            let bytes = crate::dummy::synthetic_gguf_typed(&c, ty);
-            let gguf = crate::Gguf::parse(&bytes).unwrap();
-            let model = crate::Model::from_gguf(&gguf).unwrap();
+
+        // Steady-state decode tok/s: warm one step (builds resident state +
+        // uploads weights), then time `steps` more.
+        let bench = |g: &GpuBackend, model: &crate::Model| -> f64 {
             let mut s = crate::RunState::new(&model.config);
-            g.forward_step(&model, &mut s, 1, 0); // warm: build state + upload weights
+            g.forward_step(model, &mut s, 1, 0);
             let t = Instant::now();
             for i in 0..steps {
-                g.forward_step(&model, &mut s, (i * 7) % c.vocab_size, 1 + i);
+                g.forward_step(model, &mut s, (i * 7) % c.vocab_size, 1 + i);
             }
-            let el = t.elapsed();
-            let bytes_per_elem = if ty == crate::GgmlType::F32 { 4.0 } else { 34.0 / 32.0 };
-            eprintln!(
-                "{ty:?}: decode {steps} steps (dim {} x{}L) -> {:.0} tok/s; \
-                 weights ~{:.1}x f16-element bytes ({:.2} B/elem)",
-                c.dim,
-                c.n_layers,
-                steps as f64 / el.as_secs_f64(),
-                bytes_per_elem / 4.0,
-                bytes_per_elem,
-            );
-        }
+            steps as f64 / t.elapsed().as_secs_f64()
+        };
+
+        // F32 baseline (fresh backend; the weight cache keys on data pointers).
+        let f32_toks = {
+            let g = GpuBackend::new().unwrap();
+            let bytes = crate::dummy::synthetic_gguf_typed(&c, crate::GgmlType::F32);
+            let gguf = crate::Gguf::parse(&bytes).unwrap();
+            let model = crate::Model::from_gguf(&gguf).unwrap();
+            bench(&g, &model)
+        };
+
+        // Q8_0 weights, A/B on the SAME model: the in-shader dequant GEMV vs the
+        // int8 (DP4A) path. Fresh backend per arm and an explicit set_int8_decode
+        // toggle, so the env default is irrelevant and no decode state is reused.
+        let bytes = crate::dummy::synthetic_gguf_typed(&c, crate::GgmlType::Q8_0);
+        let gguf = crate::Gguf::parse(&bytes).unwrap();
+        let model = crate::Model::from_gguf(&gguf).unwrap();
+        let dequant_toks = {
+            let mut g = GpuBackend::new().unwrap();
+            g.set_int8_decode(false);
+            bench(&g, &model)
+        };
+        let int8_toks = {
+            let mut g = GpuBackend::new().unwrap();
+            g.set_int8_decode(true);
+            bench(&g, &model)
+        };
+
+        eprintln!(
+            "decode {steps} steps, dim {} x{}L, vocab {}:\n  \
+             f32          {f32_toks:.0} tok/s\n  \
+             Q8_0 dequant {dequant_toks:.0} tok/s\n  \
+             Q8_0 int8    {int8_toks:.0} tok/s  ({:.2}x the dequant path)",
+            c.dim,
+            c.n_layers,
+            c.vocab_size,
+            int8_toks / dequant_toks,
+        );
     }
 
     // Prototype: does a DP4A int8 GEMV beat the f32 dequant GEMV for Q8_0?
