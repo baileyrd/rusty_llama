@@ -176,7 +176,7 @@ and that greedy generation reproduces.
 - [x] Byte-level BPE (`gpt2`) tokenizer — Llama-3 / Qwen2 vocabularies load
 - [x] Byte-exact pretokenizer regex (`gpt-2`/`llama-bpe`/`qwen2` via `fancy-regex`) + special-token handling
 - [x] RoPE long-context scaling (`linear`/`yarn`/`llama3`)
-- [x] Explicit AVX-512 VNNI (`vpdpbusd`) integer dot products for Q8_0/Q4_0/Q4_K (~2.2–2.5×, bit-identical to scalar)
+- [x] Explicit AVX-512 VNNI (`vpdpbusd`) integer dot products for Q8_0/Q4_0/Q4_K/Q6_K (~2.2–2.5×, bit-identical to scalar)
 - [x] GPU backend (`wgpu`) behind the existing `Backend` trait — per-op parity + byte-identical e2e output; decode currently latency-bound (honest verdict above)
 
 See [`BACKLOG.md`](BACKLOG.md) for the history of these items.
