@@ -1522,6 +1522,54 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_decode_gpu_vs_cpu() {
+        use std::time::Instant;
+        let Some(g) = gpu() else { return };
+
+        let c = crate::Config {
+            dim: 1024,
+            hidden_dim: 2816,
+            n_layers: 4,
+            n_heads: 16,
+            n_kv_heads: 16,
+            vocab_size: 4096,
+            seq_len: 512,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let bytes = crate::dummy::synthetic_gguf_typed(&c, crate::GgmlType::F32);
+        let gguf = crate::Gguf::parse(&bytes).unwrap();
+        let model = crate::Model::from_gguf(&gguf).unwrap();
+        let steps = 64usize;
+
+        let time = |backend: &dyn Backend, warm: usize| -> std::time::Duration {
+            let mut s = crate::RunState::new(&model.config);
+            for pos in 0..warm {
+                backend.forward_step(&model, &mut s, (pos * 13) % c.vocab_size, pos);
+            }
+            let t = Instant::now();
+            for i in 0..steps {
+                let pos = warm + i;
+                backend.forward_step(&model, &mut s, (pos * 13) % c.vocab_size, pos);
+            }
+            t.elapsed()
+        };
+
+        let gpu = time(&g, 1); // warm: build resident state + upload weights
+        let cpu = time(&CpuBackend::new(), 0);
+        eprintln!(
+            "decode {steps} steps, dim {} x{} layers: gpu={gpu:?} cpu={cpu:?} \
+             -> gpu is {:.2}x the cpu time ({:.0} vs {:.0} tok/s)",
+            c.dim,
+            c.n_layers,
+            gpu.as_secs_f64() / cpu.as_secs_f64(),
+            steps as f64 / gpu.as_secs_f64(),
+            steps as f64 / cpu.as_secs_f64(),
+        );
+    }
+
+    #[test]
     fn attention_gqa_parity() {
         let Some(g) = gpu() else { return };
         // 4 query heads, 2 kv heads, head_size 4, a few timesteps populated.
