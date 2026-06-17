@@ -754,6 +754,18 @@ struct GpuWeight {
     ty: GgmlType,
 }
 
+/// A resident Q8_0 weight re-laid for the int8 (DP4A) decode path: contiguous
+/// int8 values (4 packed per `u32`) plus the per-32-block f32 scales — the
+/// layout `matmul_q8_0_i8` expects. The int8 analogue of [`GpuWeight`]; always
+/// Q8_0-derived, so it carries no format tag.
+// Wired into the fused decode in the next commit (Stage 1).
+#[allow(dead_code)]
+#[derive(Clone)]
+struct GpuWeightI8 {
+    q: Arc<wgpu::Buffer>,
+    scale: Arc<wgpu::Buffer>,
+}
+
 /// Pre-built bind groups for one transformer layer's fused decode step. The
 /// bind groups reference fixed resident buffers, so they're built once and
 /// reused every step; only the *contents* of the per-step params buffers (pos)
@@ -841,6 +853,13 @@ pub struct GpuBackend {
     /// principle alias a freed-then-recycled address, so don't: make one
     /// backend per model.
     weights: Mutex<HashMap<usize, GpuWeight>>,
+    /// Resident int8-relaid Q8_0 matmul weights for the DP4A decode path, keyed
+    /// by the *same* source data pointer as [`weights`] (so the raw-Q8_0 and
+    /// int8 copies of one weight coexist — the Stage-1 2× weight-VRAM shortcut).
+    /// Same one-backend-per-model rule as `weights`.
+    // Wired into the fused decode in the next commit (Stage 1).
+    #[allow(dead_code)]
+    weights_i8: Mutex<HashMap<usize, GpuWeightI8>>,
     /// Resident RoPE inverse-frequency tables, keyed by source data pointer.
     tables: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
     /// The granted device limits (used to pre-check oversized weight buffers).
@@ -946,6 +965,7 @@ impl GpuBackend {
             queue,
             pipelines,
             weights: Mutex::new(HashMap::new()),
+            weights_i8: Mutex::new(HashMap::new()),
             tables: Mutex::new(HashMap::new()),
             limits,
             decode: Mutex::new(None),
@@ -1172,6 +1192,52 @@ impl GpuBackend {
             ty,
         };
         self.weights.lock().unwrap().insert(key, gw.clone());
+        gw
+    }
+
+    /// Fetch (relaying + uploading on first use) the int8 (DP4A) buffers for a
+    /// Q8_0 weight `w`: contiguous int8 values + per-32-block f32 scales, both
+    /// cached by source pointer in [`weights_i8`]. Only valid for
+    /// `QMatrix::Quant { ty: Q8_0, .. }` — the eligibility gate guarantees the
+    /// caller never asks for anything else.
+    // Wired into the fused decode in the next commit (Stage 1).
+    #[allow(dead_code)]
+    fn weight_buffer_i8(&self, w: &QMatrix) -> GpuWeightI8 {
+        let (data, rows, cols) = match w {
+            QMatrix::Quant {
+                ty: GgmlType::Q8_0,
+                data,
+                rows,
+                cols,
+                ..
+            } => (data, *rows, *cols),
+            _ => panic!("weight_buffer_i8 requires a Q8_0 weight"),
+        };
+        let key = data.as_ptr() as usize;
+        if let Some(g) = self.weights_i8.lock().unwrap().get(&key) {
+            return g.clone();
+        }
+
+        let (wq, wscale) = q8_0_relayout(data, rows, cols / 32);
+
+        // Mirror weight_buffer's per-buffer limit check; the int8 values are the
+        // larger of the two buffers (rows*cols bytes vs rows*cols/32 f32).
+        let nbytes = wq.len() as u64;
+        let binding_cap = self.limits.max_storage_buffer_binding_size;
+        if nbytes > binding_cap || nbytes > self.limits.max_buffer_size {
+            panic!(
+                "int8 weight matrix ({rows} rows × {cols} cols → {nbytes} bytes on device) \
+                 exceeds this GPU's limits (max_storage_buffer_binding_size {binding_cap}, \
+                 max_buffer_size {}); this model is too large for the int8 GPU path",
+                self.limits.max_buffer_size,
+            );
+        }
+
+        let gw = GpuWeightI8 {
+            q: Arc::new(self.storage_ro("weight_i8", &wq)),
+            scale: Arc::new(self.storage_ro("weight_i8_scale", f32_bytes(&wscale))),
+        };
+        self.weights_i8.lock().unwrap().insert(key, gw.clone());
         gw
     }
 
@@ -1711,6 +1777,25 @@ fn ceil_div(a: usize, b: usize) -> u32 {
     a.div_ceil(b) as u32
 }
 
+/// Re-lay a Q8_0 weight's raw 34-byte blocks into contiguous int8 values (as
+/// bytes, 4 per `u32` for `dot4I8Packed`) + per-32-block f32 scales — the layout
+/// `matmul_q8_0_i8` expects. `nb` is the number of 32-blocks per row (`cols/32`).
+// Used by weight_buffer_i8 (wired into the fused decode next commit) + tests.
+#[allow(dead_code)]
+fn q8_0_relayout(wbytes: &[u8], rows: usize, nb: usize) -> (Vec<u8>, Vec<f32>) {
+    let mut wq = Vec::with_capacity(rows * nb * 32);
+    let mut wscale = Vec::with_capacity(rows * nb);
+    for blk in 0..rows * nb {
+        let off = blk * 34;
+        wscale.push(crate::quant::f16_to_f32(u16::from_le_bytes([
+            wbytes[off],
+            wbytes[off + 1],
+        ])));
+        wq.extend_from_slice(&wbytes[off + 2..off + 34]);
+    }
+    (wq, wscale)
+}
+
 /// View an f32 slice as raw little-endian bytes (no copy).
 ///
 /// SAFETY: every f32 bit pattern is a valid byte sequence; the resulting slice
@@ -1896,19 +1981,40 @@ mod tests {
 
     // --- int8 DP4A decode path (Stage 1) --------------------------------
 
-    /// Re-lay a Q8_0 weight to contiguous int8 (as bytes) + per-32 f32 scales.
-    fn q8_0_relayout(wbytes: &[u8], rows: usize, nb: usize) -> (Vec<u8>, Vec<f32>) {
-        let mut wq = Vec::with_capacity(rows * nb * 32);
-        let mut wscale = Vec::with_capacity(rows * nb);
-        for blk in 0..rows * nb {
-            let off = blk * 34;
-            wscale.push(crate::quant::f16_to_f32(u16::from_le_bytes([
-                wbytes[off],
-                wbytes[off + 1],
-            ])));
-            wq.extend_from_slice(&wbytes[off + 2..off + 34]);
+    #[test]
+    fn q8_0_relayout_roundtrips() {
+        let (rows, cols) = (3usize, 64usize);
+        let nb = cols / 32;
+        let wbytes = crate::quant::quantize_q8_0(&noise(rows * cols, 11));
+        let (wq, wscale) = q8_0_relayout(&wbytes, rows, nb);
+        assert_eq!(wq.len(), rows * cols);
+        assert_eq!(wscale.len(), rows * nb);
+        // int8 × per-block scale must reconstruct the same values as the
+        // standard Q8_0 dequant (same int8s, same f16 scale, same arithmetic).
+        let deq = crate::quant::dequantize(GgmlType::Q8_0, &wbytes, rows * cols).unwrap();
+        for r in 0..rows {
+            for b in 0..nb {
+                for i in 0..32 {
+                    let got = wq[(r * nb + b) * 32 + i] as i8 as f32 * wscale[r * nb + b];
+                    let want = deq[r * cols + b * 32 + i];
+                    assert!((got - want).abs() <= 1e-6 * want.abs().max(1.0) + 1e-9);
+                }
+            }
         }
-        (wq, wscale)
+    }
+
+    #[test]
+    fn weight_buffer_i8_caches_and_sizes() {
+        let Some(g) = gpu() else { return };
+        let (rows, cols) = (4usize, 64usize);
+        let nb = cols / 32;
+        let wbytes = crate::quant::quantize_q8_0(&noise(rows * cols, 12));
+        let w = QMatrix::quant(GgmlType::Q8_0, wbytes.into(), rows, cols).unwrap();
+        let a = g.weight_buffer_i8(&w);
+        let b = g.weight_buffer_i8(&w);
+        assert_eq!(a.q.size(), (rows * cols) as u64);
+        assert_eq!(a.scale.size(), (rows * nb * 4) as u64);
+        assert!(Arc::ptr_eq(&a.q, &b.q), "second call should hit the cache");
     }
 
     #[test]
