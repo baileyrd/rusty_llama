@@ -44,7 +44,7 @@ use crate::tensor::QMatrix;
 // reduce the dot product. Threads read consecutive weight elements (coalesced),
 // unlike one-thread-per-row which strides by `cols`. Dispatch `rows` workgroups.
 const WGSL_MATMUL: &str = r#"
-struct P { rows: u32, cols: u32 };
+struct P { rows: u32, cols: u32, acc: u32 };
 @group(0) @binding(0) var<storage, read> w: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
@@ -66,7 +66,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
         workgroupBarrier();
     }
-    if (tid == 0u) { outp[row] = red[0]; }
+    if (tid == 0u) { outp[row] = select(red[0], outp[row] + red[0], p.acc != 0u); }
 }
 "#;
 
@@ -388,7 +388,7 @@ fn scale_min_k4(j: u32, base: u32) -> vec2<u32> {
 // Q8_0 cooperative GEMV: one workgroup per row, threads split the 34-byte
 // blocks and reduce. out[row] = sum_b sum_i d*q*x. Dispatch `rows` workgroups.
 const WGSL_MATMUL_Q8_0: &str = r#"
-struct P { rows: u32, cols: u32 };
+struct P { rows: u32, cols: u32, acc: u32 };
 @group(0) @binding(0) var<storage, read> wb: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
@@ -417,7 +417,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
         workgroupBarrier();
     }
-    if (tid == 0u) { outp[row] = red[0]; }
+    if (tid == 0u) { outp[row] = select(red[0], outp[row] + red[0], p.acc != 0u); }
 }
 "#;
 
@@ -456,7 +456,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // output chunks (8 per 144-byte superblock). out-chunk oc => qs-chunk oc/2,
 // low/high nibble by oc&1, sub-block scale scale_min_k4(oc). Dispatch `rows` wg.
 const WGSL_MATMUL_Q4_K: &str = r#"
-struct P { rows: u32, cols: u32 };
+struct P { rows: u32, cols: u32, acc: u32 };
 @group(0) @binding(0) var<storage, read> wb: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
@@ -494,7 +494,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
         workgroupBarrier();
     }
-    if (tid == 0u) { outp[row] = red[0]; }
+    if (tid == 0u) { outp[row] = select(red[0], outp[row] + red[0], p.acc != 0u); }
 }
 "#;
 
@@ -550,7 +550,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // output chunks (8 per 210-byte superblock). out-chunk oc => half oc/4, group
 // oc%4 (ql nibble + 2 qh bits + signed scale). Dispatch `rows` workgroups.
 const WGSL_MATMUL_Q6_K: &str = r#"
-struct P { rows: u32, cols: u32 };
+struct P { rows: u32, cols: u32, acc: u32 };
 @group(0) @binding(0) var<storage, read> wb: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
@@ -594,7 +594,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
         workgroupBarrier();
     }
-    if (tid == 0u) { outp[row] = red[0]; }
+    if (tid == 0u) { outp[row] = select(red[0], outp[row] + red[0], p.acc != 0u); }
 }
 "#;
 
@@ -684,13 +684,11 @@ struct LayerBinds {
     rope: wgpu::BindGroup,
     attn: wgpu::BindGroup,
     mo: wgpu::BindGroup,
-    add_attn: wgpu::BindGroup,
     rms_ffn: wgpu::BindGroup,
     m1: wgpu::BindGroup,
     m3: wgpu::BindGroup,
     swiglu: wgpu::BindGroup,
     m2: wgpu::BindGroup,
-    add_ffn: wgpu::BindGroup,
     /// On-device format of each matmul weight, to pick the matmul pipeline
     /// (order: wq, wk, wv, wo, w1, w3, w2).
     mm_ty: [GgmlType; 7],
@@ -1165,7 +1163,6 @@ impl GpuBackend {
         // Activation + KV buffers.
         let x = self.buffer("x", dim, U::STORAGE | U::COPY_DST);
         let xb = self.buffer("xb", dim, U::STORAGE);
-        let xb2 = self.buffer("xb2", dim, U::STORAGE);
         let q = self.buffer("q", dim, U::STORAGE);
         let k_tmp = self.buffer("k_tmp", kv_dim, U::STORAGE | U::COPY_SRC);
         let v_tmp = self.buffer("v_tmp", kv_dim, U::STORAGE | U::COPY_SRC);
@@ -1181,14 +1178,15 @@ impl GpuBackend {
             .map(|_| self.buffer("value", seq * kv_dim, U::STORAGE | U::COPY_DST))
             .collect();
 
-        // Constant params (shape/eps), kept alive by the bind groups.
-        let p_dimdim = self.storage_ro("p", u32_bytes(&[dim as u32, dim as u32]));
-        let p_kvdim = self.storage_ro("p", u32_bytes(&[kv_dim as u32, dim as u32]));
-        let p_hidden = self.storage_ro("p", u32_bytes(&[hidden as u32, dim as u32]));
-        let p_dimhidden = self.storage_ro("p", u32_bytes(&[dim as u32, hidden as u32]));
-        let p_vocab = self.storage_ro("p", u32_bytes(&[vocab as u32, dim as u32]));
+        // Constant matmul params: [rows, cols, acc]. acc=1 folds the residual
+        // add into the matmul output (mo and m2 accumulate into x).
+        let p_dimdim = self.storage_ro("p", u32_bytes(&[dim as u32, dim as u32, 0]));
+        let p_dimdim_acc = self.storage_ro("p", u32_bytes(&[dim as u32, dim as u32, 1]));
+        let p_kvdim = self.storage_ro("p", u32_bytes(&[kv_dim as u32, dim as u32, 0]));
+        let p_hidden = self.storage_ro("p", u32_bytes(&[hidden as u32, dim as u32, 0]));
+        let p_dimhidden_acc = self.storage_ro("p", u32_bytes(&[dim as u32, hidden as u32, 1]));
+        let p_vocab = self.storage_ro("p", u32_bytes(&[vocab as u32, dim as u32, 0]));
         let p_rms = self.storage_ro("p", u32_bytes(&[dim as u32, p.rms_eps.to_bits()]));
-        let p_add = self.storage_ro("p", u32_bytes(&[dim as u32]));
         let p_swiglu = self.storage_ro("p", u32_bytes(&[hidden as u32]));
         let kv_mul = (p.n_heads / p.n_kv_heads) as u32;
         let scale = 1.0f32 / (hs as f32).sqrt();
@@ -1232,15 +1230,17 @@ impl GpuBackend {
                         &self.pipelines.attention,
                         &[&q, &key[l], &value[l], &att, &xb, &attn_params],
                     ),
-                    mo: mm(&wo, &xb2, &p_dimdim),
-                    add_attn: self.bind(&self.pipelines.add, &[&x, &xb2, &p_add]),
+                    // Residual add folded in: mo accumulates wo·attn into x.
+                    mo: mm(&wo, &x, &p_dimdim_acc),
                     rms_ffn: self.bind(&self.pipelines.rmsnorm, &[&x, &rms_f, &xb, &p_rms]),
                     m1: mm(&w1, &hb, &p_hidden),
                     m3: mm(&w3, &hb2, &p_hidden),
                     swiglu: self.bind(&self.pipelines.swiglu, &[&hb, &hb2, &p_swiglu]),
-                    // w2 reads hb (not xb); bind it explicitly.
-                    m2: self.bind(self.matmul_pipeline(w2.ty), &[&w2.buf, &hb, &xb, &p_dimhidden]),
-                    add_ffn: self.bind(&self.pipelines.add, &[&x, &xb, &p_add]),
+                    // w2 reads hb (not xb) and accumulates w2·swiglu into x.
+                    m2: self.bind(
+                        self.matmul_pipeline(w2.ty),
+                        &[&w2.buf, &hb, &x, &p_dimhidden_acc],
+                    ),
                     mm_ty: [wq.ty, wk.ty, wv.ty, wo.ty, w1.ty, w3.ty, w2.ty],
                 }
             })
@@ -1337,7 +1337,6 @@ impl GpuBackend {
         // elementwise add/swiglu keep one thread per element.
         let (mm_dim, mm_kv, mm_hidden, mm_vocab) =
             (d.dim as u32, d.kv_dim as u32, d.hidden as u32, d.vocab as u32);
-        let add_wg = ceil_div(d.dim, 64);
         let sw_wg = ceil_div(d.hidden, 64);
         let wg_rope = ceil_div(d.dim / 2, 64);
         let wg_heads = d.n_heads as u32;
@@ -1359,14 +1358,12 @@ impl GpuBackend {
             enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
             enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
             pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
-            pass(&mut enc, mm[3], &lb.mo, mm_dim);
-            pass(&mut enc, &self.pipelines.add, &lb.add_attn, add_wg);
+            pass(&mut enc, mm[3], &lb.mo, mm_dim); // folds residual add into x
             pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
             pass(&mut enc, mm[4], &lb.m1, mm_hidden);
             pass(&mut enc, mm[5], &lb.m3, mm_hidden);
             pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, sw_wg);
-            pass(&mut enc, mm[6], &lb.m2, mm_dim);
-            pass(&mut enc, &self.pipelines.add, &lb.add_ffn, add_wg);
+            pass(&mut enc, mm[6], &lb.m2, mm_dim); // folds residual add into x
         }
         pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
         pass(&mut enc, self.matmul_pipeline(d.final_cls_ty), &d.final_cls, mm_vocab);
@@ -1393,7 +1390,7 @@ impl Backend for GpuBackend {
         let pipe = self.matmul_pipeline(gw.ty);
         let xb = self.storage_ro("x", f32_bytes(x));
         let ob = self.alloc_out(out.len());
-        let pb = self.params(&[w.rows() as u32, w.cols() as u32]);
+        let pb = self.params(&[w.rows() as u32, w.cols() as u32, 0]); // acc=0: overwrite
         let bind = self.bind(pipe, &[&gw.buf, &xb, &ob, &pb]);
         // Cooperative GEMV: one workgroup per output row.
         self.run(pipe, &bind, w.rows() as u32, &ob, out);
