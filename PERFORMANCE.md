@@ -90,6 +90,25 @@ separable from the CLI but is far below llama.cpp regardless).
    Metal simdgroup-matrix, but experimental in wgpu 29 with an immature WGSL
    surface) or a NVIDIA-only **CUDA backend** (cuBLASLt / `mma`, most certain to
    deliver). This is where ~80% of the GPU gap lives.
+
+   **Portable wgpu coopmat path — spiked and ruled out (on this hardware, wgpu
+   29).** A cheap go/no-go probe (`probe_cooperative_matrix`, an ignored test in
+   `gpu.rs`) found the portable path silently broken here:
+   - The RTX 5070 Ti (Blackwell, Vulkan `VK_KHR_cooperative_matrix`) advertises
+     **only f16-input configs** — 16×16×16, 16×8×16, 16×8×8 with f16 A/B and
+     f16-or-f32 accumulate. It exposes **no 8×8 f32 config**.
+   - wgpu 29's coopmat backend **only wires 8×8 f32** (per its own feature doc).
+     So the one shape wgpu supports, this driver doesn't expose; the shapes this
+     driver exposes (f16 16×16), wgpu doesn't wire.
+   - Worst of all, requesting an 8×8 f32 `coopMultiplyAdd` **compiles and runs
+     with no validation error** (after the `ExperimentalFeatures` token) yet
+     returns **all-zero garbage** — a silent correctness failure, exactly the
+     "experimental, may be UB" warning made real.
+
+   Conclusion: the portable coopmat path is a dead end until wgpu wires f16
+   16×16 (and naga's WGSL surface matures). The real tensor-core win on this
+   machine needs the **NVIDIA-only CUDA backend** (`mma` / cuBLASLt) — pursued
+   next. `dot4I8Packed` (item 2) is also exhausted.
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),
