@@ -5,58 +5,36 @@ Each item notes *why* it's deferred. Pick one, branch, implement, test, PR.
 
 ---
 
-## 1. GPU backend behind the `Backend` trait  — **requires a GPU**
+## 1. GPU backend behind the `Backend` trait  — **done**
 
-**Why deferred:** the cloud execution environment these milestones were built in
-has no GPU, so this can't be implemented or verified there. Pick this up on a
-**local Claude Code instance with GPU access** (CUDA, Metal, or Vulkan/wgpu).
+Implemented as [`GpuBackend`](src/backend/gpu.rs), a `wgpu` (Vulkan/DX12/Metal)
+backend behind an optional `gpu` cargo feature, selected at run time with
+`--backend gpu`. The default build is unchanged (still three small deps). The
+transformer in [`src/model.rs`](src/model.rs) was **not** touched — the new
+backend is a pure `impl Backend`.
 
-### What exists today
-All heavy math goes through the object-safe `Backend` trait in
-[`src/backend/mod.rs`](src/backend/mod.rs); the only implementation is
-[`CpuBackend`](src/backend/cpu.rs) (rayon + autovectorized/integer kernels).
-The transformer in [`src/model.rs`](src/model.rs) (`forward`) is written purely
-in terms of the trait, so a new backend slots in without touching model code.
-
-Trait surface to implement:
-
-| method      | shape contract |
-|-------------|----------------|
-| `rmsnorm(out, x, weight, eps)`                                   | all length `dim` |
-| `matmul(out, x, w: &QMatrix)`                                    | `out=[w.rows()]`, `x=[w.cols()]` |
-| `rope(q, k, pos, head_size, kv_dim, inv_freq, mscale)`           | in place; `inv_freq` is the precomputed per-pair table |
-| `attention(out, q, key_cache, value_cache, att, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim)` | GQA, one position |
-| `swiglu(hb, hb2)`                                                | `hb = silu(hb) * hb2` |
-| `add(out, x)`                                                    | residual |
-
-`QMatrix` ([`src/tensor.rs`](src/tensor.rs)) is either `F32 { data, rows, cols }`
-or `Quant { ty, data: &[u8], rows, cols }`. The CPU backend dequantizes a block
-at a time (`src/quant.rs`: `dequant_block`, `vec_dot_*`). Quant types: F32, F16,
-Q4_0, Q8_0, Q4_K, Q6_K.
-
-### Suggested approach
-- **Library:** `wgpu` is the portable choice (Metal/Vulkan/DX12 + WebGPU) and
-  keeps the "from scratch, minimal deps" spirit; CUDA via `cudarc` is an option
-  if targeting NVIDIA only. Put it behind a cargo feature (e.g. `gpu`) so the
-  default build stays dependency-light.
-- **Start simple:** implement f32 `matmul` first (upload `QMatrix::F32` weights
-  once, keep them resident), then `rmsnorm`/`rope`/`swiglu`/`add`, then
-  `attention`, then dequantize quantized `QMatrix` on the device (or convert to
-  f16 on upload).
-- **Performance note:** single-token decode issues many *tiny* (dim-sized)
-  ops. Naive per-op host↔device dispatch will be latency-bound and likely
-  *slower* than `CpuBackend`. To actually win, keep weights + KV cache resident
-  on the device and minimize round-trips (ideally fuse a layer, or batch the
-  prompt prefill). Measure against `CpuBackend` honestly.
-
-### Acceptance criteria
-- New `impl Backend` selectable at runtime (CLI flag, e.g. `--backend gpu`).
-- Per-op parity tests vs `CpuBackend` within f32 tolerance (mirror the existing
-  backend unit tests; reuse the synthetic model in `src/dummy.rs`).
-- An end-to-end run of a real GGUF model produces coherent text matching the
-  CPU backend's greedy output.
-- A benchmark vs `CpuBackend` (extend the `bench_*` pattern in
-  `src/backend/cpu.rs`), reported in the PR.
+- **All six primitives** (`rmsnorm`, `matmul`, `rope`, `attention`, `swiglu`,
+  `add`) run as WGSL compute shaders. Parameters ride in small storage buffers
+  (f32 via `to_bits`) to sidestep uniform-buffer alignment; bind groups use each
+  pipeline's auto-derived layout.
+- **Resident weights.** Matmul weights are uploaded once and cached, keyed on
+  the weight's data pointer (stable across tokens). Quantized `QMatrix` weights
+  are dequantized to f32 on the host at upload, so one f32 matmul shader covers
+  every `GgmlType`. The RoPE `inv_freq` table is cached the same way. Activations
+  and KV-cache slices are small and re-passed by the trait, so they upload per
+  call and the result reads straight back.
+- **Parity:** per-op tests vs `CpuBackend` within f32 tolerance, mirroring the
+  `cpu.rs` unit tests and skipping cleanly when no adapter is present
+  (`src/backend/gpu.rs`). End-to-end, greedy output is **byte-identical** to the
+  CPU backend on a synthetic GGUF (F32 + Q8_0; `tests/gpu_parity.rs`) and on real
+  models — `stories15M` (f32) and `TinyLlama-1.1B-Chat Q4_K_M` (quantized).
+- **Benchmark + honest verdict:** `bench_matmul_gpu_vs_cpu`. A large resident
+  matmul (4096×4096) is ~1.2× faster on the GPU, but single-token decode issues
+  ~50 tiny ops per token and this per-op backend pays a host↔device round-trip on
+  each — so end-to-end decode is currently *slower* than `CpuBackend` (≈70 vs 420
+  tok/s on `stories15M`; ≈6 vs 34 tok/s on TinyLlama Q4_K_M). Beating CPU on
+  decode needs the KV cache kept resident and a fused layer to cut the
+  round-trips — future work.
 
 ---
 

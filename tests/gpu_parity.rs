@@ -1,0 +1,109 @@
+//! End-to-end GPU↔CPU parity on a synthetic GGUF model.
+//!
+//! Builds a small synthetic `llama` GGUF (F32 and Q8_0), then checks that the
+//! `GpuBackend` produces the same forward-pass logits and the same greedy token
+//! stream as `CpuBackend`. The whole file is compiled only with `--features
+//! gpu`; if no GPU adapter is present at run time the tests skip cleanly.
+#![cfg(feature = "gpu")]
+
+use rusty_llama::dummy::synthetic_gguf_typed;
+use rusty_llama::{
+    forward, generate, Backend, Config, CpuBackend, GgmlType, Gguf, GpuBackend, Model, RunState,
+    Sampler, Tokenizer,
+};
+
+/// dim/hidden are multiples of 32 so the same config serializes as Q8_0 too.
+fn cfg() -> Config {
+    Config {
+        dim: 32,
+        hidden_dim: 64,
+        n_layers: 2,
+        n_heads: 4,
+        n_kv_heads: 2, // grouped-query attention
+        vocab_size: 64,
+        seq_len: 16,
+        shared_weights: true,
+        ..Default::default()
+    }
+}
+
+/// A GPU backend, or `None` (with a note) when no adapter is available.
+fn gpu() -> Option<GpuBackend> {
+    match GpuBackend::new() {
+        Ok(g) => {
+            eprintln!("[gpu] adapter: {}", g.adapter_name());
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("skipping GPU e2e test: {e}");
+            None
+        }
+    }
+}
+
+/// argmax of a logit vector (greedy's next token).
+fn argmax(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0
+}
+
+/// Single-step forward: GPU logits must track CPU logits, and pick the same
+/// next token, for both F32 and Q8_0 weights.
+#[test]
+fn forward_logits_match_cpu() {
+    let c = cfg();
+    for ty in [GgmlType::F32, GgmlType::Q8_0] {
+        // Fresh backend per model: the weight cache keys on data pointers.
+        let Some(g) = gpu() else { return };
+        let bytes = synthetic_gguf_typed(&c, ty);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let model = Model::from_gguf(&gguf).unwrap();
+
+        let logits = |backend: &dyn Backend| -> Vec<f32> {
+            let mut s = RunState::new(&model.config);
+            forward(&model, &mut s, backend, 7, 0);
+            s.logits().to_vec()
+        };
+        let cpu = logits(&CpuBackend::new());
+        let gpu_l = logits(&g);
+
+        assert!(gpu_l.iter().all(|v| v.is_finite()));
+        let max_diff = cpu
+            .iter()
+            .zip(&gpu_l)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-2, "{ty:?}: logits diverge by {max_diff}");
+        assert_eq!(argmax(&cpu), argmax(&gpu_l), "{ty:?}: greedy token differs");
+    }
+}
+
+/// Multi-step greedy decoding must produce a byte-identical stream on GPU and
+/// CPU (greedy is argmax, so matching logits => matching tokens).
+#[test]
+fn greedy_stream_matches_cpu() {
+    let c = cfg();
+    for ty in [GgmlType::F32, GgmlType::Q8_0] {
+        // Fresh backend per model: the weight cache keys on data pointers.
+        let Some(g) = gpu() else { return };
+        let bytes = synthetic_gguf_typed(&c, ty);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let model = Model::from_gguf(&gguf).unwrap();
+        let tk = Tokenizer::from_gguf(&gguf).unwrap();
+
+        let run = |backend: &dyn Backend| -> Vec<u8> {
+            let mut st = RunState::new(&model.config);
+            let mut sm = Sampler::new(c.vocab_size, 0.0, 0.9, 1); // greedy
+            let mut out = Vec::new();
+            generate(&model, &mut st, backend, &tk, &mut sm, "", 12, |b| {
+                out.extend_from_slice(b)
+            });
+            out
+        };
+
+        assert_eq!(run(&CpuBackend::new()), run(&g), "{ty:?}: greedy stream differs");
+    }
+}

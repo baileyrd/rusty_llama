@@ -121,7 +121,7 @@ struct SpecialTokens {
 impl SpecialTokens {
     /// Build from `(text, id)` pairs (used by tests and the GGUF path).
     fn new(mut entries: Vec<(String, usize)>) -> Self {
-        entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
         let ids = entries.iter().map(|(_, id)| *id).collect();
         SpecialTokens { entries, ids }
     }

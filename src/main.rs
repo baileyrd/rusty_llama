@@ -15,19 +15,22 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rusty_llama::{generate, Checkpoint, CpuBackend, Gguf, Model, RunState, Sampler, Tokenizer};
+use rusty_llama::{
+    generate, Backend, Checkpoint, CpuBackend, Gguf, Model, RunState, Sampler, Tokenizer,
+};
 
 const USAGE: &str = "\
 Usage: rusty_llama <checkpoint.bin> [options]
 
 Options:
-  -z <path>   tokenizer file              (default: tokenizer.bin)
-  -t <float>  temperature, 0 = greedy     (default: 1.0)
-  -p <float>  top-p / nucleus sampling    (default: 0.9)
-  -s <int>    RNG seed                    (default: wall-clock time)
-  -n <int>    number of steps to run      (default: 256)
-  -i <text>   prompt                      (default: \"\")
-  -h          show this help";
+  -z <path>     tokenizer file            (default: tokenizer.bin)
+  -t <float>    temperature, 0 = greedy   (default: 1.0)
+  -p <float>    top-p / nucleus sampling  (default: 0.9)
+  -s <int>      RNG seed                  (default: wall-clock time)
+  -n <int>      number of steps to run    (default: 256)
+  -i <text>     prompt                    (default: \"\")
+  --backend <b> compute backend: cpu|gpu  (default: cpu; gpu needs --features gpu)
+  -h            show this help";
 
 struct Args {
     checkpoint: String,
@@ -37,6 +40,7 @@ struct Args {
     seed: u64,
     steps: usize,
     prompt: String,
+    backend: String,
 }
 
 fn main() -> ExitCode {
@@ -71,7 +75,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
-    let backend = CpuBackend::new();
+    let backend = make_backend(&args.backend)?;
     let mut state = RunState::new(&model.config);
     let mut sampler = Sampler::new(
         model.config.vocab_size,
@@ -86,7 +90,7 @@ fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(
     let generated = generate(
         model,
         &mut state,
-        &backend,
+        backend.as_ref(),
         tokenizer,
         &mut sampler,
         &args.prompt,
@@ -103,6 +107,32 @@ fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(
         eprintln!("\n[{generated} tokens, {:.1} tok/s]", generated as f64 / secs);
     }
     Ok(())
+}
+
+/// Construct the compute backend named on the command line.
+///
+/// `gpu` requires the `gpu` cargo feature; without it (or without a usable
+/// adapter) this returns a clear error rather than silently falling back.
+fn make_backend(name: &str) -> Result<Box<dyn Backend>, Box<dyn Error>> {
+    match name {
+        "cpu" => Ok(Box::new(CpuBackend::new())),
+        "gpu" => {
+            #[cfg(feature = "gpu")]
+            {
+                let gpu = rusty_llama::GpuBackend::new()
+                    .map_err(|e| format!("GPU backend unavailable: {e}"))?;
+                eprintln!("[gpu] adapter: {}", gpu.adapter_name());
+                Ok(Box::new(gpu))
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Err("this binary was built without GPU support; rebuild with \
+                     `cargo build --release --features gpu`"
+                    .into())
+            }
+        }
+        other => Err(format!("unknown backend '{other}' (have cpu/gpu)").into()),
+    }
 }
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
@@ -126,6 +156,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         seed: default_seed(),
         steps: 256,
         prompt: String::new(),
+        backend: "cpu".to_string(),
     };
 
     let rest: Vec<String> = raw.collect();
@@ -143,6 +174,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "-s" => args.seed = value()?.parse()?,
             "-n" => args.steps = value()?.parse()?,
             "-i" => args.prompt = value()?.clone(),
+            "--backend" => args.backend = value()?.clone(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
