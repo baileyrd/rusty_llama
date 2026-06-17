@@ -1,0 +1,80 @@
+# Performance: rusty_llama vs llama.cpp, and the improvement roadmap
+
+A head-to-head benchmark against [llama.cpp](https://github.com/ggml-org/llama.cpp)
+and the prioritized list of work it points to. Measured 2026-06-16.
+
+## Setup
+
+- **Machine:** Intel Core Ultra 9 285H (AVX2, **no** AVX-512), NVIDIA GeForce
+  RTX 5070 Ti Laptop GPU (Blackwell, sm_120, 12 GB), CUDA 13.3 toolkit.
+- **Model:** TinyLlama-1.1B-Chat v1.0 **Q4_K_M** (the same GGUF for both).
+- **llama.cpp:** prebuilt release `b9672` (`llama-bench`), CUDA 13.3 / Vulkan /
+  CPU builds. `pp512` = prefill throughput, `tg128` = single-token decode.
+- **rusty_llama:** release build; decode measured as a 128-token greedy run with
+  a 1-token prompt (decode-dominated), so it lines up with `tg128`.
+
+## Results
+
+### Decode (tok/s) — the clean apples-to-apples
+
+| Path | Decode | vs rusty_llama |
+| --- | ---: | --- |
+| rusty_llama — CPU | 35.0 | — |
+| llama.cpp — CPU | 73.6 | **2.1× faster** |
+| rusty_llama — GPU (wgpu) | 45.9 | — |
+| llama.cpp — Vulkan (same GPU, same API class) | 375.9 | **8.2× faster** |
+| llama.cpp — CUDA (NVIDIA-native) | 397.5 | **8.7× faster** |
+
+### Prefill (tok/s)
+
+llama.cpp: **CPU 5,890 · Vulkan 16,988 · CUDA 18,457**. rusty_llama's batched
+prefill helps but uses no tensor cores, so it is one to two orders of magnitude
+behind (synthetic prefill bench ~735 tok/s; the real-model figure isn't
+separable from the CLI but is far below llama.cpp regardless).
+
+## Why the gaps
+
+- **CPU (~2×):** our integer fast path is **AVX-512 VNNI only** (`vpdpbusd`),
+  which is dormant on this Core Ultra and on most consumer CPUs that lack
+  AVX-512. We have **no AVX2 integer path** — just the VNNI kernels plus an
+  autovectorized scalar loop. llama.cpp's AVX2 quant kernels (`vpmaddubsw` +
+  `vpmaddwd`) and threading are simply better-tuned on this class of hardware.
+- **GPU (~8× decode, ~24× prefill):** the decisive factor is **tensor cores**.
+  llama.cpp's Vulkan backend reports `matrix cores: NV_coopmat2` and its CUDA
+  backend uses native `mma`; both exploit the RTX 5070 Ti's tensor cores (plus
+  flash attention and years of kernel tuning). Our wgpu (v29) cooperative GEMV
+  is portable **f32 with no tensor-core path**, which dominates the prefill gap.
+
+## Improvement roadmap (ranked by ROI vs the gaps above)
+
+1. **CPU: hand-written AVX2 integer quant kernels — highest ROI, verifiable on
+   this machine.** Add `vpmaddubsw`+`vpmaddwd` int8 dot products (the AVX2
+   analog of `vpdpbusd`) for Q4_K/Q6_K/Q8_0/Q4_0, dispatched as
+   VNNI → AVX2 → scalar. 4-/6-bit weights (Q4_K/Q6_K — TinyLlama's formats) don't
+   saturate the i16 step, so the result is **bit-identical** to scalar; the
+   signed 8-bit formats (Q8_0/Q4_0) need a widen-to-i16 (`vpmovsxbw` + `vpmaddwd`)
+   path to stay exact. Closes much of the CPU gap on the *most common* hardware
+   (consumer x86 without AVX-512), and unlike VNNI it can be run-verified here.
+2. **GPU: int8 (DP4A `dot4I8Packed`) + f16 GEMV — medium ROI, no tensor cores.**
+   Quantize the activation to int8 (the GPU analog of the CPU integer path; the
+   Vulkan device reports `int dot: 1`) and/or compute in f16 to ~halve memory
+   traffic. Narrows the decode gap without tensor cores.
+3. **GPU: tensor cores — the big swing (most of the prefill/decode gap).**
+   Either wgpu's `EXPERIMENTAL_COOPERATIVE_MATRIX` (portable: Vulkan coopmat /
+   Metal simdgroup-matrix, but experimental in wgpu 29 with an immature WGSL
+   surface) or a NVIDIA-only **CUDA backend** (cuBLASLt / `mma`, most certain to
+   deliver). This is where ~80% of the GPU gap lives.
+4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
+   GEMM**.
+5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),
+   IQ-quants, KV-cache quantization, richer samplers (min-p, repetition penalty,
+   GBNF grammars), batching / server.
+
+### The honest framing
+
+Matching llama.cpp's raw throughput is a treadmill — it is a mature,
+tensor-core-tuned, perpetually-moving target, and an ~8k-LOC from-scratch
+reference won't win that race. The worthwhile goal is to **close the most
+glaring, bounded-effort gaps while staying legible**. By that measure item 1
+(AVX2 integer kernels) is the first move: real payoff, broad hardware impact,
+and fully verifiable on this machine.
