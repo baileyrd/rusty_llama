@@ -19,8 +19,9 @@ and the prioritized list of work it points to. Measured 2026-06-16.
 
 | Path | Decode | vs rusty_llama |
 | --- | ---: | --- |
-| rusty_llama — CPU | 35.0 | — |
-| llama.cpp — CPU | 73.6 | **2.1× faster** |
+| rusty_llama — CPU (autovectorized scalar) | 36.7 | — |
+| rusty_llama — CPU (**AVX2 integer kernels**, roadmap #1) | **49.8** | — |
+| llama.cpp — CPU | 73.6 | **1.48× faster** (was 2.1× before #1) |
 | rusty_llama — GPU (wgpu) | 45.9 | — |
 | llama.cpp — Vulkan (same GPU, same API class) | 375.9 | **8.2× faster** |
 | llama.cpp — CUDA (NVIDIA-native) | 397.5 | **8.7× faster** |
@@ -47,14 +48,15 @@ separable from the CLI but is far below llama.cpp regardless).
 
 ## Improvement roadmap (ranked by ROI vs the gaps above)
 
-1. **CPU: hand-written AVX2 integer quant kernels — highest ROI, verifiable on
-   this machine.** Add `vpmaddubsw`+`vpmaddwd` int8 dot products (the AVX2
-   analog of `vpdpbusd`) for Q4_K/Q6_K/Q8_0/Q4_0, dispatched as
-   VNNI → AVX2 → scalar. 4-/6-bit weights (Q4_K/Q6_K — TinyLlama's formats) don't
-   saturate the i16 step, so the result is **bit-identical** to scalar; the
-   signed 8-bit formats (Q8_0/Q4_0) need a widen-to-i16 (`vpmovsxbw` + `vpmaddwd`)
-   path to stay exact. Closes much of the CPU gap on the *most common* hardware
-   (consumer x86 without AVX-512), and unlike VNNI it can be run-verified here.
+1. **CPU: hand-written AVX2 integer quant kernels — DONE.** `vpmaddubsw`+
+   `vpmaddwd` int8 dot products (the AVX2 analog of `vpdpbusd`) for
+   Q4_K/Q6_K/Q8_0/Q4_0, dispatched as VNNI → AVX2 → scalar (`x86::vec_dot_*_avx2`).
+   4-/6-bit weights (Q4_K/Q6_K) don't saturate the i16 step so they're
+   **bit-identical** to scalar; the signed 8-bit formats widen to i16
+   (`vpmovsxbw` + `vpmaddwd`) to stay exact. **Run-verified on this machine**
+   (`*_avx2_matches_scalar` tests) and measured **+36% CPU decode** on TinyLlama
+   Q4_K_M (36.7 → 49.8 tok/s), narrowing the gap to llama.cpp's CPU from ~2.1× to
+   ~1.48×. Toggle off with `RUSTY_LLAMA_NO_AVX2=1`.
 2. **GPU: int8 (DP4A `dot4I8Packed`) + f16 GEMV — medium ROI, no tensor cores.**
    Quantize the activation to int8 (the GPU analog of the CPU integer path; the
    Vulkan device reports `int dot: 1`) and/or compute in f16 to ~halve memory
