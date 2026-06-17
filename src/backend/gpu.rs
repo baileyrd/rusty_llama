@@ -209,6 +209,140 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }
 "#;
 
+// --- Batched (prefill) shaders ----------------------------------------------
+//
+// These process `n` token positions at once so the whole prompt runs as a few
+// large dispatches instead of n× the single-token ops. add/swiglu are
+// elementwise, so the single-token kernels above already handle a flattened
+// batch; only matmul/rmsnorm/rope/attention need batched variants.
+
+// 2-D dispatch: x = output feature, y = batch row. out is (n, rows) row-major.
+const WGSL_MATMUL_BATCH: &str = r#"
+struct P { rows: u32, cols: u32, n: u32 };
+@group(0) @binding(0) var<storage, read> w: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = gid.y;
+    if (row >= p.rows || r >= p.n) { return; }
+    var acc = 0.0;
+    let wbase = row * p.cols;
+    let xbase = r * p.cols;
+    for (var j = 0u; j < p.cols; j = j + 1u) {
+        acc = acc + w[wbase + j] * x[xbase + j];
+    }
+    outp[r * p.rows + row] = acc;
+}
+"#;
+
+// One workgroup per batch row; reduce the row's sum-of-squares over 256 lanes.
+const WGSL_RMSNORM_BATCH: &str = r#"
+struct P { dim: u32, eps: f32, n: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r = wid.x;
+    let tid = lid.x;
+    let base = r * p.dim;
+    var ss = 0.0;
+    for (var i = tid; i < p.dim; i = i + 256u) { let v = x[base + i]; ss = ss + v * v; }
+    red[tid] = ss;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (tid < s) { red[tid] = red[tid] + red[tid + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(red[0] / f32(p.dim) + p.eps);
+    for (var i = tid; i < p.dim; i = i + 256u) { outp[base + i] = x[base + i] * inv * weight[i]; }
+}
+"#;
+
+// 2-D dispatch: x = pair within the head, y = batch row. Row r is at absolute
+// position pos_base + r.
+const WGSL_ROPE_BATCH: &str = r#"
+struct P { head_size: u32, kv_dim: u32, pos_base: u32, n_freqs: u32, mscale: f32, q_dim: u32, n: u32 };
+@group(0) @binding(0) var<storage, read_write> q: array<f32>;
+@group(0) @binding(1) var<storage, read_write> k: array<f32>;
+@group(0) @binding(2) var<storage, read> inv_freq: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let r = gid.y;
+    if (r >= p.n) { return; }
+    let i = gid.x * 2u;
+    if (i >= p.q_dim) { return; }
+    let ph = (i % p.head_size) / 2u;
+    if (ph >= p.n_freqs) { return; }
+    let angle = f32(p.pos_base + r) * inv_freq[ph];
+    let fcr = cos(angle) * p.mscale;
+    let fci = sin(angle) * p.mscale;
+    let qb = r * p.q_dim;
+    let q0 = q[qb + i]; let q1 = q[qb + i + 1u];
+    q[qb + i] = q0 * fcr - q1 * fci;
+    q[qb + i + 1u] = q0 * fci + q1 * fcr;
+    if (i < p.kv_dim) {
+        let kb = r * p.kv_dim;
+        let k0 = k[kb + i]; let k1 = k[kb + i + 1u];
+        k[kb + i] = k0 * fcr - k1 * fci;
+        k[kb + i + 1u] = k0 * fci + k1 * fcr;
+    }
+}
+"#;
+
+// One thread per (batch row, head). Causal: row r attends to keys 0..=pos_base+r.
+// Uses an online (running-max) softmax so no score buffer is needed — the only
+// limit is head_size <= 128 (the per-thread accumulator). Larger heads fall back
+// to the looped default on the host side.
+const WGSL_ATTENTION_BATCH: &str = r#"
+struct P { head_size: u32, kv_dim: u32, kv_mul: u32, pos_base: u32, n: u32, n_heads: u32, scale: f32 };
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keyc: array<f32>;
+@group(0) @binding(2) var<storage, read> valc: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<storage, read> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.n * p.n_heads) { return; }
+    let r = idx / p.n_heads;
+    let h = idx % p.n_heads;
+    let hs = p.head_size;
+    let dim = p.n_heads * hs;
+    let pos = p.pos_base + r;
+    let kv_off = (h / p.kv_mul) * hs;
+    let qh = r * dim + h * hs;
+    var m = -3.4028235e38;
+    var sumexp = 0.0;
+    var acc: array<f32, 128>;
+    for (var d = 0u; d < hs; d = d + 1u) { acc[d] = 0.0; }
+    for (var t = 0u; t <= pos; t = t + 1u) {
+        let kb = t * p.kv_dim + kv_off;
+        var s = 0.0;
+        for (var i = 0u; i < hs; i = i + 1u) { s = s + q[qh + i] * keyc[kb + i]; }
+        s = s * p.scale;
+        let new_m = max(m, s);
+        let corr = exp(m - new_m);
+        let f = exp(s - new_m);
+        sumexp = sumexp * corr + f;
+        for (var d = 0u; d < hs; d = d + 1u) { acc[d] = acc[d] * corr + f * valc[kb + d]; }
+        m = new_m;
+    }
+    let inv = 1.0 / sumexp;
+    for (var d = 0u; d < hs; d = d + 1u) { outp[qh + d] = acc[d] * inv; }
+}
+"#;
+
+/// Largest head_size the batched attention kernel's per-thread accumulator
+/// (`array<f32, 128>`) supports; larger heads use the looped fallback.
+const MAX_BATCH_HEAD: usize = 128;
+
 /// The compiled compute pipelines, one per primitive.
 struct Pipelines {
     matmul: wgpu::ComputePipeline,
@@ -217,6 +351,10 @@ struct Pipelines {
     swiglu: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
+    matmul_batch: wgpu::ComputePipeline,
+    rmsnorm_batch: wgpu::ComputePipeline,
+    rope_batch: wgpu::ComputePipeline,
+    attention_batch: wgpu::ComputePipeline,
 }
 
 /// A wgpu-backed [`Backend`].
@@ -291,6 +429,10 @@ impl GpuBackend {
             swiglu: make_pipeline(&device, WGSL_SWIGLU, "swiglu"),
             rope: make_pipeline(&device, WGSL_ROPE, "rope"),
             attention: make_pipeline(&device, WGSL_ATTENTION, "attention"),
+            matmul_batch: make_pipeline(&device, WGSL_MATMUL_BATCH, "matmul_batch"),
+            rmsnorm_batch: make_pipeline(&device, WGSL_RMSNORM_BATCH, "rmsnorm_batch"),
+            rope_batch: make_pipeline(&device, WGSL_ROPE_BATCH, "rope_batch"),
+            attention_batch: make_pipeline(&device, WGSL_ATTENTION_BATCH, "attention_batch"),
         };
 
         Ok(GpuBackend {
@@ -363,13 +505,25 @@ impl GpuBackend {
         })
     }
 
-    /// Dispatch `pipeline` over `workgroups` workgroups (1-D), then copy
-    /// `out_buf` back into `out`. Compute + copy share a single submission.
+    /// Dispatch `pipeline` over a 1-D grid, then copy `out_buf` back into `out`.
     fn run(
         &self,
         pipeline: &wgpu::ComputePipeline,
         bind: &wgpu::BindGroup,
         workgroups: u32,
+        out_buf: &wgpu::Buffer,
+        out: &mut [f32],
+    ) {
+        self.run_grid(pipeline, bind, [workgroups, 1, 1], out_buf, out);
+    }
+
+    /// Dispatch `pipeline` over `grid` workgroups, then copy `out_buf` back into
+    /// `out`. Compute + copy share a single submission.
+    fn run_grid(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bind: &wgpu::BindGroup,
+        grid: [u32; 3],
         out_buf: &wgpu::Buffer,
         out: &mut [f32],
     ) {
@@ -390,16 +544,21 @@ impl GpuBackend {
             });
             cpass.set_pipeline(pipeline);
             cpass.set_bind_group(0, bind, &[]);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
+            cpass.dispatch_workgroups(grid[0], grid[1], grid[2]);
         }
         enc.copy_buffer_to_buffer(out_buf, 0, &staging, 0, byte_len);
         self.queue.submit(Some(enc.finish()));
         self.map_read(&staging, out);
     }
 
-    /// Dispatch `pipeline` without reading anything back (the op wrote into
-    /// resident buffers that are read back separately).
+    /// Dispatch `pipeline` over a 1-D grid without reading anything back (the op
+    /// wrote into resident buffers that are read back separately).
     fn dispatch(&self, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, workgroups: u32) {
+        self.dispatch_grid(pipeline, bind, [workgroups, 1, 1]);
+    }
+
+    /// Dispatch `pipeline` over `grid` workgroups without reading anything back.
+    fn dispatch_grid(&self, pipeline: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, grid: [u32; 3]) {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -410,7 +569,7 @@ impl GpuBackend {
             });
             cpass.set_pipeline(pipeline);
             cpass.set_bind_group(0, bind, &[]);
-            cpass.dispatch_workgroups(workgroups, 1, 1);
+            cpass.dispatch_workgroups(grid[0], grid[1], grid[2]);
         }
         self.queue.submit(Some(enc.finish()));
     }
@@ -604,6 +763,124 @@ impl Backend for GpuBackend {
         let pb = self.params(&[out.len() as u32]);
         let bind = self.bind(&self.pipelines.add, &[&ob, &xb, &pb]);
         self.run(&self.pipelines.add, &bind, ceil_div(out.len(), 64), &ob, out);
+    }
+
+    // --- Batched (prefill) overrides ------------------------------------
+
+    fn matmul_batch(&self, out: &mut [f32], x: &[f32], w: &QMatrix, rows: usize) {
+        let (oc, ic) = (w.rows(), w.cols());
+        let wb = self.weight_buffer(w);
+        let xb = self.storage_ro("x", f32_bytes(x));
+        let ob = self.alloc_out(out.len());
+        let pb = self.params(&[oc as u32, ic as u32, rows as u32]);
+        let bind = self.bind(&self.pipelines.matmul_batch, &[&wb, &xb, &ob, &pb]);
+        // 2-D grid: x over output features, y over batch rows.
+        let grid = [ceil_div(oc, 64), rows as u32, 1];
+        self.run_grid(&self.pipelines.matmul_batch, &bind, grid, &ob, out);
+    }
+
+    fn rmsnorm_batch(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32, rows: usize) {
+        let dim = weight.len();
+        let xb = self.storage_ro("x", f32_bytes(x));
+        let wb = self.storage_ro("weight", f32_bytes(weight));
+        let ob = self.alloc_out(out.len());
+        let pb = self.params(&[dim as u32, eps.to_bits(), rows as u32]);
+        let bind = self.bind(&self.pipelines.rmsnorm_batch, &[&xb, &wb, &ob, &pb]);
+        // One workgroup per row (each reduces its own row over 256 lanes).
+        self.run_grid(&self.pipelines.rmsnorm_batch, &bind, [rows as u32, 1, 1], &ob, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rope_batch(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        pos_base: usize,
+        rows: usize,
+        head_size: usize,
+        kv_dim: usize,
+        q_dim: usize,
+        inv_freq: &[f32],
+        mscale: f32,
+    ) {
+        let qb = self.storage_rw("q", f32_bytes(q));
+        let kb = self.storage_rw("k", f32_bytes(k));
+        let fb = self.table_buffer(inv_freq);
+        let pb = self.params(&[
+            head_size as u32,
+            kv_dim as u32,
+            pos_base as u32,
+            inv_freq.len() as u32,
+            mscale.to_bits(),
+            q_dim as u32,
+            rows as u32,
+        ]);
+        let bind = self.bind(&self.pipelines.rope_batch, &[&qb, &kb, &fb, &pb]);
+        // 2-D grid: x over (even,odd) pairs of a row, y over batch rows.
+        let grid = [ceil_div(q_dim / 2, 64), rows as u32, 1];
+        self.dispatch_grid(&self.pipelines.rope_batch, &bind, grid);
+        self.read_back(&qb, q);
+        self.read_back(&kb, k);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_batch(
+        &self,
+        out: &mut [f32],
+        q: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        att: &mut [f32],
+        pos_base: usize,
+        rows: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_size: usize,
+        seq_len: usize,
+        kv_dim: usize,
+    ) {
+        // The kernel's per-thread accumulator is fixed at MAX_BATCH_HEAD; wider
+        // heads fall back to the looped single-token attention (still correct).
+        if head_size > MAX_BATCH_HEAD {
+            let dim = n_heads * head_size;
+            for r in 0..rows {
+                self.attention(
+                    &mut out[r * dim..r * dim + dim],
+                    &q[r * dim..r * dim + dim],
+                    key_cache,
+                    value_cache,
+                    att,
+                    pos_base + r,
+                    n_heads,
+                    n_kv_heads,
+                    head_size,
+                    seq_len,
+                    kv_dim,
+                );
+            }
+            return;
+        }
+        // Causal: row r reads keys 0..=pos_base+r, so only the first
+        // (pos_base + rows) cache positions are needed.
+        let used = (pos_base + rows) * kv_dim;
+        let qb = self.storage_ro("q", f32_bytes(q));
+        let kb = self.storage_ro("keyc", f32_bytes(&key_cache[..used]));
+        let vb = self.storage_ro("valc", f32_bytes(&value_cache[..used]));
+        let ob = self.alloc_out(out.len());
+        let pb = self.params(&[
+            head_size as u32,
+            kv_dim as u32,
+            (n_heads / n_kv_heads) as u32,
+            pos_base as u32,
+            rows as u32,
+            n_heads as u32,
+            (1.0 / (head_size as f32).sqrt()).to_bits(),
+        ]);
+        let bind = self.bind(&self.pipelines.attention_batch, &[&qb, &kb, &vb, &ob, &pb]);
+        // One thread per (batch row, head).
+        let grid = [ceil_div(rows * n_heads, 64), 1, 1];
+        self.run_grid(&self.pipelines.attention_batch, &bind, grid, &ob, out);
+        let _ = att; // GPU path keeps softmax state in registers; att unused.
     }
 }
 
@@ -867,6 +1144,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_prefill_gpu_vs_cpu() {
+        use std::time::Instant;
+        let Some(g) = gpu() else { return };
+
+        // A small-but-real-shaped model; prefill a 256-token prompt.
+        let c = crate::Config {
+            dim: 1024,
+            hidden_dim: 2816,
+            n_layers: 4,
+            n_heads: 16,
+            n_kv_heads: 16,
+            vocab_size: 4096,
+            seq_len: 512,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let bytes = crate::dummy::synthetic_gguf_typed(&c, crate::GgmlType::F32);
+        let gguf = crate::Gguf::parse(&bytes).unwrap();
+        let model = crate::Model::from_gguf(&gguf).unwrap();
+        let tokens: Vec<usize> = (0..256).map(|i| (i * 7) % c.vocab_size).collect();
+
+        let prefill = |backend: &dyn Backend| {
+            let mut s = crate::RunState::new(&model.config);
+            crate::forward_prefill(&model, &mut s, backend, &tokens, 0);
+        };
+
+        prefill(&g); // warm up: make weights resident
+        let t = Instant::now();
+        prefill(&g);
+        let gpu = t.elapsed();
+
+        let cpu_backend = CpuBackend::new();
+        let t = Instant::now();
+        prefill(&cpu_backend);
+        let cpu = t.elapsed();
+
+        eprintln!(
+            "prefill {} tokens, dim {} x{} layers: gpu={gpu:?} cpu={cpu:?} \
+             -> gpu is {:.2}x the cpu time ({:.0} vs {:.0} tok/s)",
+            tokens.len(),
+            c.dim,
+            c.n_layers,
+            gpu.as_secs_f64() / cpu.as_secs_f64(),
+            tokens.len() as f64 / gpu.as_secs_f64(),
+            tokens.len() as f64 / cpu.as_secs_f64(),
+        );
+    }
+
+    #[test]
     fn attention_gqa_parity() {
         let Some(g) = gpu() else { return };
         // 4 query heads, 2 kv heads, head_size 4, a few timesteps populated.
@@ -887,5 +1214,71 @@ mod tests {
             &mut a_c, &q, &kc, &vc, &mut att_c, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim,
         );
         close(&a_g, &a_c);
+    }
+
+    // --- Batched-op parity (GPU override vs CPU default loop) ------------
+
+    #[test]
+    fn matmul_batch_parity() {
+        let Some(g) = gpu() else { return };
+        // Output features not a multiple of the workgroup size; several rows.
+        let (oc, ic, n) = (130usize, 96usize, 5usize);
+        let w = QMatrix::f32(noise(oc * ic, 1).into(), oc, ic).unwrap();
+        let x = noise(n * ic, 2);
+        let (mut a, mut b) = (vec![0.0; n * oc], vec![0.0; n * oc]);
+        g.matmul_batch(&mut a, &x, &w, n);
+        CpuBackend.matmul_batch(&mut b, &x, &w, n);
+        close(&a, &b);
+    }
+
+    #[test]
+    fn rmsnorm_batch_parity() {
+        let Some(g) = gpu() else { return };
+        let (dim, n) = (288usize, 7usize);
+        let x = noise(n * dim, 3);
+        let w = noise(dim, 4);
+        let (mut a, mut b) = (vec![0.0; n * dim], vec![0.0; n * dim]);
+        g.rmsnorm_batch(&mut a, &x, &w, 1e-5, n);
+        CpuBackend.rmsnorm_batch(&mut b, &x, &w, 1e-5, n);
+        close(&a, &b);
+    }
+
+    #[test]
+    fn rope_batch_parity() {
+        let Some(g) = gpu() else { return };
+        // 2 q heads, 1 kv head of size 8; each row at a different position.
+        let (head_size, n) = (8usize, 6usize);
+        let (q_dim, kv_dim) = (2 * head_size, head_size);
+        let inv = base_inv_freq(head_size, 10000.0);
+        let mut q_g = noise(n * q_dim, 5);
+        let mut q_c = q_g.clone();
+        let mut k_g = noise(n * kv_dim, 6);
+        let mut k_c = k_g.clone();
+        g.rope_batch(&mut q_g, &mut k_g, 3, n, head_size, kv_dim, q_dim, &inv, 1.0);
+        CpuBackend.rope_batch(&mut q_c, &mut k_c, 3, n, head_size, kv_dim, q_dim, &inv, 1.0);
+        close(&q_g, &q_c);
+        close(&k_g, &k_c);
+    }
+
+    #[test]
+    fn attention_batch_parity() {
+        let Some(g) = gpu() else { return };
+        // GQA, batch of query rows at positions 0..n, causal over a filled cache.
+        let (n_heads, n_kv_heads, head_size, seq_len) = (4usize, 2usize, 8usize, 16usize);
+        let kv_dim = n_kv_heads * head_size;
+        let dim = n_heads * head_size;
+        let n = 10usize; // rows / positions 0..10
+        let q = noise(n * dim, 1);
+        let kc = noise(seq_len * kv_dim, 2);
+        let vc = noise(seq_len * kv_dim, 3);
+        let (mut a, mut b) = (vec![0.0; n * dim], vec![0.0; n * dim]);
+        let mut att = vec![0.0; n_heads * seq_len];
+        g.attention_batch(
+            &mut a, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim,
+        );
+        CpuBackend.attention_batch(
+            &mut b, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim,
+        );
+        close(&a, &b);
     }
 }

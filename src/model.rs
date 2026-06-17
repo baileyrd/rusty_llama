@@ -453,6 +453,117 @@ pub fn forward(
     backend.matmul(&mut state.logits, &state.xb, &w.wcls);
 }
 
+/// Run the transformer over a whole batch of `tokens` at once (prompt prefill).
+///
+/// Positions `pos_base .. pos_base + tokens.len()` are written into the KV
+/// cache, and the **last** position's next-token logits are left in
+/// `state.logits()` (the only ones a greedy/sampling decoder needs from the
+/// prompt). This is exactly equivalent to calling [`forward`] once per token in
+/// order — the batched [`Backend`] ops have default impls that loop the
+/// single-token ones — but lets a batching backend (the GPU) fuse each op into
+/// one large kernel and collapse the host↔device round-trips.
+///
+/// `pos_base` is general, but the prompt is normally prefilled in one call with
+/// `pos_base == 0`; the cache rows for the batch are then contiguous.
+pub fn forward_prefill(
+    model: &Model,
+    state: &mut RunState,
+    backend: &dyn Backend,
+    tokens: &[usize],
+    pos_base: usize,
+) {
+    let p = &model.config;
+    let w = &model.weights;
+    let dim = p.dim;
+    let kv_dim = p.kv_dim();
+    let head_size = p.head_size();
+    let hidden = p.hidden_dim;
+    let n = tokens.len();
+
+    // Row-major (n, *) scratch for the batch. Allocated here (prefill runs once
+    // per prompt) rather than living in the single-token RunState.
+    let mut x = vec![0.0f32; n * dim];
+    let mut xb = vec![0.0f32; n * dim];
+    let mut xb2 = vec![0.0f32; n * dim];
+    let mut q = vec![0.0f32; n * dim];
+    let mut hb = vec![0.0f32; n * hidden];
+    let mut hb2 = vec![0.0f32; n * hidden];
+
+    // Seed each row with its token's (dequantized) embedding.
+    for (r, &tok) in tokens.iter().enumerate() {
+        w.token_embedding_table
+            .dequant_row(tok, &mut x[r * dim..r * dim + dim]);
+    }
+
+    for layer in 0..p.n_layers {
+        // --- Attention --------------------------------------------------
+        backend.rmsnorm_batch(&mut xb, &x, slice(&w.rms_att_weight, layer, dim), p.rms_eps, n);
+
+        let loff = layer * p.seq_len * kv_dim;
+        let kv_start = loff + pos_base * kv_dim;
+        let kv_span = n * kv_dim;
+
+        backend.matmul_batch(&mut q, &xb, &w.wq[layer], n);
+        backend.matmul_batch(
+            &mut state.key_cache[kv_start..kv_start + kv_span],
+            &xb,
+            &w.wk[layer],
+            n,
+        );
+        backend.matmul_batch(
+            &mut state.value_cache[kv_start..kv_start + kv_span],
+            &xb,
+            &w.wv[layer],
+            n,
+        );
+
+        backend.rope_batch(
+            &mut q,
+            &mut state.key_cache[kv_start..kv_start + kv_span],
+            pos_base,
+            n,
+            head_size,
+            kv_dim,
+            dim,
+            &model.rope.inv_freq,
+            model.rope.mscale,
+        );
+
+        backend.attention_batch(
+            &mut xb,
+            &q,
+            &state.key_cache[loff..loff + p.seq_len * kv_dim],
+            &state.value_cache[loff..loff + p.seq_len * kv_dim],
+            &mut state.att,
+            pos_base,
+            n,
+            p.n_heads,
+            p.n_kv_heads,
+            head_size,
+            p.seq_len,
+            kv_dim,
+        );
+
+        backend.matmul_batch(&mut xb2, &xb, &w.wo[layer], n);
+        backend.add(&mut x, &xb2);
+
+        // --- Feed-forward (SwiGLU) -------------------------------------
+        backend.rmsnorm_batch(&mut xb, &x, slice(&w.rms_ffn_weight, layer, dim), p.rms_eps, n);
+        backend.matmul_batch(&mut hb, &xb, &w.w1[layer], n);
+        backend.matmul_batch(&mut hb2, &xb, &w.w3[layer], n);
+        backend.swiglu(&mut hb, &hb2);
+        backend.matmul_batch(&mut xb, &hb, &w.w2[layer], n);
+        backend.add(&mut x, &xb);
+    }
+
+    // Only the final position predicts the next token, so norm + classify just
+    // that row (the classifier matmul is the widest one — no need to run it n×).
+    let last = (n - 1) * dim;
+    let mut xb_last = vec![0.0f32; dim];
+    backend.rmsnorm(&mut xb_last, &x[last..last + dim], &w.rms_final_weight, p.rms_eps);
+    backend.matmul(&mut state.logits, &xb_last, &w.wcls);
+}
+
 /// Autoregressively generate from `prompt`, streaming decoded bytes to
 /// `on_piece`. Returns the number of tokens generated (excluding the prompt).
 ///
@@ -471,6 +582,23 @@ pub fn generate(
 ) -> usize {
     let prompt_tokens = tokenizer.encode(prompt, true, false);
     let steps = steps.min(model.config.seq_len);
+    let n = prompt_tokens.len();
+
+    // Fast path: batch-prefill the whole prompt in one pass, then decode. Used
+    // only when every prompt token would be processed anyway (`steps >= n`) so
+    // the emitted token stream is identical to the sequential loop below.
+    if n >= 2 && steps >= n {
+        return generate_prefilled(
+            model,
+            state,
+            backend,
+            tokenizer,
+            sampler,
+            &prompt_tokens,
+            steps,
+            on_piece,
+        );
+    }
 
     let mut token = prompt_tokens[0];
     let mut pos = 0;
@@ -495,6 +623,61 @@ pub fn generate(
         on_piece(&tokenizer.decode(token, next));
         token = next;
         generated += 1;
+    }
+
+    generated
+}
+
+/// Prompt-prefilled generation: fill the KV cache for the whole prompt in one
+/// batched [`forward_prefill`], echo the prompt tokens (matching the sequential
+/// loop's streamed output), then decode one token at a time. Produces the exact
+/// same token stream as the sequential path; only the prompt's KV fill is
+/// batched. Caller guarantees `prompt_tokens.len() >= 2` and `steps >= len`.
+#[allow(clippy::too_many_arguments)]
+fn generate_prefilled(
+    model: &Model,
+    state: &mut RunState,
+    backend: &dyn Backend,
+    tokenizer: &Tokenizer,
+    sampler: &mut Sampler,
+    prompt_tokens: &[usize],
+    steps: usize,
+    mut on_piece: impl FnMut(&[u8]),
+) -> usize {
+    let n = prompt_tokens.len();
+    let mut generated = 0;
+
+    forward_prefill(model, state, backend, prompt_tokens, 0);
+
+    // Echo the prompt's internal transitions, exactly as the sequential loop
+    // streams them (decode(prev, cur) renders `cur`'s piece).
+    for r in 0..n - 1 {
+        let next = prompt_tokens[r + 1];
+        if next == 1 {
+            return generated; // BOS-as-EOS mid-prompt (matches the loop's break)
+        }
+        on_piece(&tokenizer.decode(prompt_tokens[r], next));
+        generated += 1;
+    }
+
+    // Sample the first generated token from the last prompt position's logits,
+    // then continue single-token decoding from position `n`.
+    let mut token = prompt_tokens[n - 1];
+    let mut pos = n - 1;
+    let mut next = sampler.sample(state.logits_mut());
+    loop {
+        pos += 1;
+        if next == 1 {
+            break; // BOS doubles as an end-of-sequence delimiter here.
+        }
+        on_piece(&tokenizer.decode(token, next));
+        token = next;
+        generated += 1;
+        if pos >= steps {
+            break;
+        }
+        forward(model, state, backend, token, pos);
+        next = sampler.sample(state.logits_mut());
     }
 
     generated

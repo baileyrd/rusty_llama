@@ -82,8 +82,107 @@ pub trait Backend: Send + Sync {
     );
 
     /// SwiGLU gate: `hb[i] = silu(hb[i]) * hb2[i]`.
+    ///
+    /// Operates on the whole slice, so it doubles as the batched form: pass a
+    /// `(rows, hidden_dim)` buffer flattened row-major.
     fn swiglu(&self, hb: &mut [f32], hb2: &[f32]);
 
     /// Residual add: `out[i] += x[i]`.
+    ///
+    /// Like [`Backend::swiglu`], elementwise over the whole slice, so it also
+    /// serves as the batched residual add.
     fn add(&self, out: &mut [f32], x: &[f32]);
+
+    // --- Batched (prefill) variants -------------------------------------
+    //
+    // These process `rows` token positions at once so a backend can fuse them
+    // into a single large kernel (the GPU's sweet spot, and far fewer
+    // host<->device round-trips than `rows` single-token calls). The default
+    // implementations just loop the single-token op, so any backend is correct
+    // for free and `forward_prefill` is exactly equivalent to `rows` sequential
+    // `forward` calls; a backend overrides them only to go faster.
+
+    /// Batched matmul: `x` is `(rows, w.cols())` row-major, `out` is
+    /// `(rows, w.rows())`. Equivalent to calling [`Backend::matmul`] on each row.
+    fn matmul_batch(&self, out: &mut [f32], x: &[f32], w: &QMatrix, rows: usize) {
+        let (oc, ic) = (w.rows(), w.cols());
+        for r in 0..rows {
+            self.matmul(&mut out[r * oc..r * oc + oc], &x[r * ic..r * ic + ic], w);
+        }
+    }
+
+    /// Batched RMSNorm: `out`/`x` are `(rows, dim)` row-major, normalized per
+    /// row against the shared `weight` (length `dim`).
+    fn rmsnorm_batch(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32, rows: usize) {
+        let dim = weight.len();
+        for r in 0..rows {
+            self.rmsnorm(&mut out[r * dim..r * dim + dim], &x[r * dim..r * dim + dim], weight, eps);
+        }
+    }
+
+    /// Batched RoPE: `q` is `(rows, q_dim)`, `k` is `(rows, kv_dim)`; row `r`
+    /// rotates at absolute position `pos_base + r`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_batch(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        pos_base: usize,
+        rows: usize,
+        head_size: usize,
+        kv_dim: usize,
+        q_dim: usize,
+        inv_freq: &[f32],
+        mscale: f32,
+    ) {
+        for r in 0..rows {
+            self.rope(
+                &mut q[r * q_dim..r * q_dim + q_dim],
+                &mut k[r * kv_dim..r * kv_dim + kv_dim],
+                pos_base + r,
+                head_size,
+                kv_dim,
+                inv_freq,
+                mscale,
+            );
+        }
+    }
+
+    /// Batched causal attention over `rows` query positions. Query row `r` (at
+    /// absolute position `pos_base + r`) attends to cached keys `0..=pos_base+r`.
+    /// `q`/`out` are `(rows, n_heads*head_size)`; `att` is single-row scratch of
+    /// length `n_heads * seq_len`, reused across rows by the default impl.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_batch(
+        &self,
+        out: &mut [f32],
+        q: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        att: &mut [f32],
+        pos_base: usize,
+        rows: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_size: usize,
+        seq_len: usize,
+        kv_dim: usize,
+    ) {
+        let dim = n_heads * head_size;
+        for r in 0..rows {
+            self.attention(
+                &mut out[r * dim..r * dim + dim],
+                &q[r * dim..r * dim + dim],
+                key_cache,
+                value_cache,
+                att,
+                pos_base + r,
+                n_heads,
+                n_kv_heads,
+                head_size,
+                seq_len,
+                kv_dim,
+            );
+        }
+    }
 }
