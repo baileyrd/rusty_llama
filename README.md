@@ -81,15 +81,25 @@ with default impls that loop the single-token ops so the CPU is correct for
 free). That's where the GPU shines: prefilling a 256-token prompt is **~2×
 faster on GPU than CPU** (735 vs 377 tok/s, `bench_prefill_gpu_vs_cpu`).
 
-**Honest performance note.** A single large matmul with the weight resident is
-already faster on the GPU (~1.2× a multi-core CPU matmul at 4096×4096), and
-batched prefill wins outright. But single-token *decode* issues ~50 tiny,
-dim-sized ops per token, and this per-op backend uploads each activation and
-reads the result straight back — so the host↔device round-trips dominate and
-end-to-end *decode* is still **slower** than `CpuBackend` (TinyLlama Q4_K_M
-≈6 vs 34 tok/s). Winning on decode too needs the KV cache kept resident and a
-fused layer to cut the round-trips — future work. See `bench_matmul_gpu_vs_cpu`
-and `bench_prefill_gpu_vs_cpu` in `src/backend/gpu.rs`.
+**Decode is fused on-device.** A single decode step (`Backend::forward_step`)
+keeps the KV cache and activations resident and records the whole step into one
+command encoder — one submission, one logits read-back — instead of a
+host↔device round-trip per op. That cut decode round-trips from ~300/token to
+one and sped decode up **1.5–2.9× over the naive per-op path** (stories15M
+82→239 tok/s; TinyLlama Q4_K_M 6→9 tok/s), reaching ~parity with the CPU at
+moderate widths (`bench_decode_gpu_vs_cpu`: 191 vs 196 tok/s at dim 1024).
+
+**Honest performance note.** A large matmul with the weight resident is faster
+on the GPU (~1.2× a multi-core CPU matmul at 4096²) and batched prefill wins
+outright (~2×). Single-token *decode* is now competitive but still doesn't beat
+the CPU at the extremes: tiny models (stories15M) are dominated by per-token
+dispatch overhead (hundreds of small dispatches), and large quantized models
+(TinyLlama) by memory bandwidth — the GPU path dequantizes weights to f32 on
+upload, so it streams ~4–7× more weight data per token than the CPU's quantized
+kernels. Closing that needs **on-device quantized weights** (cut bandwidth)
+and/or a **fused-layer megakernel** (cut dispatch count) — the next levers.
+Greedy output stays **byte-identical** to the CPU throughout. See the
+`bench_*_gpu_vs_cpu` benchmarks in `src/backend/gpu.rs`.
 
 ## How it fits together
 

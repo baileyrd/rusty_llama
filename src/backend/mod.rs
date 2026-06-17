@@ -16,6 +16,7 @@ pub use cpu::CpuBackend;
 #[cfg(feature = "gpu")]
 pub use gpu::GpuBackend;
 
+use crate::model::{Model, RunState};
 use crate::tensor::QMatrix;
 
 /// The set of primitive operations the transformer is built from.
@@ -185,4 +186,16 @@ pub trait Backend: Send + Sync {
             );
         }
     }
+
+    /// Run one decode step for `token` at position `pos`, leaving next-token
+    /// logits in `state` (the autoregressive counterpart to
+    /// [`Backend::attention_batch`]'s prefill).
+    ///
+    /// The straightforward implementation is the per-op [`crate::model::forward`]
+    /// — one `Backend` call per primitive — and that's what the CPU backend
+    /// does. A backend whose per-op dispatch is latency-bound (the GPU) may
+    /// override this to run the whole step with its state kept resident,
+    /// collapsing the host↔device round-trips. The result must match the per-op
+    /// path. `state` carries the (per-backend) KV cache across steps.
+    fn forward_step(&self, model: &Model, state: &mut RunState, token: usize, pos: usize);
 }

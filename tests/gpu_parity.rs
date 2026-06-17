@@ -112,6 +112,41 @@ fn prefill_matches_cpu() {
     }
 }
 
+/// The fused on-device decode step (with the prefill→decode KV sync) must track
+/// the CPU forward and pick the same next token, for F32 and Q8_0.
+#[test]
+fn decode_step_matches_cpu() {
+    let c = cfg();
+    for ty in [GgmlType::F32, GgmlType::Q8_0] {
+        let Some(g) = gpu() else { return };
+        let bytes = synthetic_gguf_typed(&c, ty);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let model = Model::from_gguf(&gguf).unwrap();
+        let prompt: Vec<usize> = vec![3, 8, 1, 5, 9];
+        let next = 7usize;
+
+        // Batched prefill, then one fused decode step at the next position —
+        // this exercises the one-time host→device KV-cache sync.
+        let logits = |backend: &dyn Backend| -> Vec<f32> {
+            let mut s = RunState::new(&model.config);
+            forward_prefill(&model, &mut s, backend, &prompt, 0);
+            backend.forward_step(&model, &mut s, next, prompt.len());
+            s.logits().to_vec()
+        };
+        let cpu = logits(&CpuBackend::new());
+        let gpu_l = logits(&g);
+
+        assert!(gpu_l.iter().all(|v| v.is_finite()));
+        let max_diff = cpu
+            .iter()
+            .zip(&gpu_l)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-2, "{ty:?}: decode logits diverge by {max_diff}");
+        assert_eq!(argmax(&cpu), argmax(&gpu_l), "{ty:?}: decode greedy token differs");
+    }
+}
+
 /// Multi-step greedy decoding must produce a byte-identical stream on GPU and
 /// CPU (greedy is argmax, so matching logits => matching tokens).
 #[test]

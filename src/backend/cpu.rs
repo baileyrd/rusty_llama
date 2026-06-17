@@ -206,6 +206,17 @@ impl Backend for CpuBackend {
             *o += xi;
         }
     }
+
+    fn forward_step(
+        &self,
+        model: &crate::model::Model,
+        state: &mut crate::model::RunState,
+        token: usize,
+        pos: usize,
+    ) {
+        // The CPU per-op path is already efficient; just run the generic forward.
+        crate::model::forward(model, state, self, token, pos);
+    }
 }
 
 #[cfg(test)]

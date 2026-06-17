@@ -357,6 +357,78 @@ struct Pipelines {
     attention_batch: wgpu::ComputePipeline,
 }
 
+/// Pre-built bind groups for one transformer layer's fused decode step. The
+/// bind groups reference fixed resident buffers, so they're built once and
+/// reused every step; only the *contents* of the per-step params buffers (pos)
+/// and the embedding change between steps.
+struct LayerBinds {
+    rms_att: wgpu::BindGroup,
+    mq: wgpu::BindGroup,
+    mk: wgpu::BindGroup,
+    mv: wgpu::BindGroup,
+    rope: wgpu::BindGroup,
+    attn: wgpu::BindGroup,
+    mo: wgpu::BindGroup,
+    add_attn: wgpu::BindGroup,
+    rms_ffn: wgpu::BindGroup,
+    m1: wgpu::BindGroup,
+    m3: wgpu::BindGroup,
+    swiglu: wgpu::BindGroup,
+    m2: wgpu::BindGroup,
+    add_ffn: wgpu::BindGroup,
+}
+
+/// Device-resident state for fused single-token decode: the KV cache, the
+/// activation scratch, and every bind group, all kept on the GPU across steps
+/// so a step is one submission with a single logits read-back.
+struct DecodeState {
+    dim: usize,
+    kv_dim: usize,
+    hidden: usize,
+    vocab: usize,
+    n_heads: usize,
+    n_layers: usize,
+    seq_len: usize,
+    // Resident buffers the step touches directly. The purely-intermediate
+    // activations (xb, q, hb, …) and the constant params buffers are held alive
+    // by the bind groups that reference them, so they aren't stored here.
+    x: wgpu::Buffer,                 // embedding written here each step
+    k_tmp: wgpu::Buffer,             // fresh K, copied into the resident cache
+    v_tmp: wgpu::Buffer,             // fresh V, copied into the resident cache
+    logits: wgpu::Buffer,            // classifier output, copied to staging
+    logits_staging: wgpu::Buffer,    // mapped to read logits back
+    // Resident KV cache, one buffer per layer (seq_len * kv_dim each).
+    key: Vec<wgpu::Buffer>,
+    value: Vec<wgpu::Buffer>,
+    // Per-step params, rewritten each step via write_buffer.
+    rope_params: wgpu::Buffer,
+    attn_params: wgpu::Buffer,
+    layers: Vec<LayerBinds>,
+    final_rms: wgpu::BindGroup,
+    final_cls: wgpu::BindGroup,
+    /// Number of KV positions already resident on the device.
+    kv_filled: usize,
+    /// Scratch for the per-step token embedding upload.
+    embed: Vec<f32>,
+}
+
+/// Record one compute dispatch as its own pass (so wgpu inserts the
+/// read-after-write barrier against the previous pass on shared buffers).
+fn pass(
+    enc: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bind: &wgpu::BindGroup,
+    workgroups: u32,
+) {
+    let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: None,
+    });
+    cp.set_pipeline(pipeline);
+    cp.set_bind_group(0, bind, &[]);
+    cp.dispatch_workgroups(workgroups, 1, 1);
+}
+
 /// A wgpu-backed [`Backend`].
 pub struct GpuBackend {
     device: wgpu::Device,
@@ -374,6 +446,9 @@ pub struct GpuBackend {
     tables: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
     /// The granted device limits (used to pre-check oversized weight buffers).
     limits: wgpu::Limits,
+    /// Resident decode state (KV cache + activations + bind groups), built lazily
+    /// on the first [`Backend::forward_step`] and reused across decode steps.
+    decode: Mutex<Option<DecodeState>>,
     /// Human-readable adapter name, for logging.
     adapter_name: String,
 }
@@ -442,6 +517,7 @@ impl GpuBackend {
             weights: Mutex::new(HashMap::new()),
             tables: Mutex::new(HashMap::new()),
             limits,
+            decode: Mutex::new(None),
             adapter_name,
         })
     }
@@ -664,6 +740,248 @@ impl GpuBackend {
         cache.insert(key, buf.clone());
         buf
     }
+
+    // --- Fused on-device decode -----------------------------------------
+
+    /// An uninitialized device buffer of `len` f32s with the given usage.
+    fn buffer(&self, label: &str, len: usize, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (len * 4) as u64,
+            usage,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// A storage param buffer initialized from `words`, also writable later.
+    fn params_dyn(&self, words: &[u32]) -> wgpu::Buffer {
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params"),
+            contents: u32_bytes(words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        })
+    }
+
+    /// Build the resident decode state for `model` (weights/KV/activations +
+    /// every bind group). Called once, lazily, on the first decode step.
+    fn build_decode_state(&self, model: &crate::model::Model) -> DecodeState {
+        use wgpu::BufferUsages as U;
+        let p = &model.config;
+        let w = &model.weights;
+        let (dim, kv_dim, hs, hidden, vocab, nl, seq) = (
+            p.dim,
+            p.kv_dim(),
+            p.head_size(),
+            p.hidden_dim,
+            p.vocab_size,
+            p.n_layers,
+            p.seq_len,
+        );
+
+        // Activation + KV buffers.
+        let x = self.buffer("x", dim, U::STORAGE | U::COPY_DST);
+        let xb = self.buffer("xb", dim, U::STORAGE);
+        let xb2 = self.buffer("xb2", dim, U::STORAGE);
+        let q = self.buffer("q", dim, U::STORAGE);
+        let k_tmp = self.buffer("k_tmp", kv_dim, U::STORAGE | U::COPY_SRC);
+        let v_tmp = self.buffer("v_tmp", kv_dim, U::STORAGE | U::COPY_SRC);
+        let att = self.buffer("att", p.n_heads * seq, U::STORAGE);
+        let hb = self.buffer("hb", hidden, U::STORAGE);
+        let hb2 = self.buffer("hb2", hidden, U::STORAGE);
+        let logits = self.buffer("logits", vocab, U::STORAGE | U::COPY_SRC);
+        let logits_staging = self.buffer("logits_staging", vocab, U::MAP_READ | U::COPY_DST);
+        let key: Vec<wgpu::Buffer> = (0..nl)
+            .map(|_| self.buffer("key", seq * kv_dim, U::STORAGE | U::COPY_DST))
+            .collect();
+        let value: Vec<wgpu::Buffer> = (0..nl)
+            .map(|_| self.buffer("value", seq * kv_dim, U::STORAGE | U::COPY_DST))
+            .collect();
+
+        // Constant params (shape/eps), kept alive by the bind groups.
+        let p_dimdim = self.storage_ro("p", u32_bytes(&[dim as u32, dim as u32]));
+        let p_kvdim = self.storage_ro("p", u32_bytes(&[kv_dim as u32, dim as u32]));
+        let p_hidden = self.storage_ro("p", u32_bytes(&[hidden as u32, dim as u32]));
+        let p_dimhidden = self.storage_ro("p", u32_bytes(&[dim as u32, hidden as u32]));
+        let p_vocab = self.storage_ro("p", u32_bytes(&[vocab as u32, dim as u32]));
+        let p_rms = self.storage_ro("p", u32_bytes(&[dim as u32, p.rms_eps.to_bits()]));
+        let p_add = self.storage_ro("p", u32_bytes(&[dim as u32]));
+        let p_swiglu = self.storage_ro("p", u32_bytes(&[hidden as u32]));
+        let kv_mul = (p.n_heads / p.n_kv_heads) as u32;
+        let scale = 1.0f32 / (hs as f32).sqrt();
+        // pos / np filled in per step.
+        let rope_params = self.params_dyn(&[
+            hs as u32,
+            kv_dim as u32,
+            0,
+            model.rope.inv_freq.len() as u32,
+            model.rope.mscale.to_bits(),
+            dim as u32,
+        ]);
+        let attn_params =
+            self.params_dyn(&[hs as u32, kv_dim as u32, seq as u32, kv_mul, 0, scale.to_bits()]);
+
+        // Resident weights (cached by pointer) and per-layer norm weights.
+        let inv_freq = self.table_buffer(&model.rope.inv_freq);
+        let mm = &self.pipelines.matmul;
+        let layers: Vec<LayerBinds> = (0..nl)
+            .map(|l| {
+                let wq = self.weight_buffer(&w.wq[l]);
+                let wk = self.weight_buffer(&w.wk[l]);
+                let wv = self.weight_buffer(&w.wv[l]);
+                let wo = self.weight_buffer(&w.wo[l]);
+                let w1 = self.weight_buffer(&w.w1[l]);
+                let w2 = self.weight_buffer(&w.w2[l]);
+                let w3 = self.weight_buffer(&w.w3[l]);
+                let rms_a = self.table_buffer(&w.rms_att_weight[l * dim..l * dim + dim]);
+                let rms_f = self.table_buffer(&w.rms_ffn_weight[l * dim..l * dim + dim]);
+                LayerBinds {
+                    rms_att: self.bind(&self.pipelines.rmsnorm, &[&x, &rms_a, &xb, &p_rms]),
+                    mq: self.bind(mm, &[&wq, &xb, &q, &p_dimdim]),
+                    mk: self.bind(mm, &[&wk, &xb, &k_tmp, &p_kvdim]),
+                    mv: self.bind(mm, &[&wv, &xb, &v_tmp, &p_kvdim]),
+                    rope: self.bind(&self.pipelines.rope, &[&q, &k_tmp, &inv_freq, &rope_params]),
+                    attn: self.bind(
+                        &self.pipelines.attention,
+                        &[&q, &key[l], &value[l], &att, &xb, &attn_params],
+                    ),
+                    mo: self.bind(mm, &[&wo, &xb, &xb2, &p_dimdim]),
+                    add_attn: self.bind(&self.pipelines.add, &[&x, &xb2, &p_add]),
+                    rms_ffn: self.bind(&self.pipelines.rmsnorm, &[&x, &rms_f, &xb, &p_rms]),
+                    m1: self.bind(mm, &[&w1, &xb, &hb, &p_hidden]),
+                    m3: self.bind(mm, &[&w3, &xb, &hb2, &p_hidden]),
+                    swiglu: self.bind(&self.pipelines.swiglu, &[&hb, &hb2, &p_swiglu]),
+                    m2: self.bind(mm, &[&w2, &hb, &xb, &p_dimhidden]),
+                    add_ffn: self.bind(&self.pipelines.add, &[&x, &xb, &p_add]),
+                }
+            })
+            .collect();
+
+        let rms_final = self.table_buffer(&w.rms_final_weight);
+        let wcls = self.weight_buffer(&w.wcls);
+        let final_rms = self.bind(&self.pipelines.rmsnorm, &[&x, &rms_final, &xb, &p_rms]);
+        let final_cls = self.bind(mm, &[&wcls, &xb, &logits, &p_vocab]);
+
+        DecodeState {
+            dim,
+            kv_dim,
+            hidden,
+            vocab,
+            n_heads: p.n_heads,
+            n_layers: nl,
+            seq_len: seq,
+            x,
+            k_tmp,
+            v_tmp,
+            logits,
+            logits_staging,
+            key,
+            value,
+            rope_params,
+            attn_params,
+            layers,
+            final_rms,
+            final_cls,
+            kv_filled: 0,
+            embed: vec![0.0; dim],
+        }
+    }
+
+    /// Run one decode step entirely on the device: one command encoder, one
+    /// submission, one logits read-back. See [`Backend::forward_step`].
+    fn fused_step(
+        &self,
+        model: &crate::model::Model,
+        state: &mut crate::model::RunState,
+        token: usize,
+        pos: usize,
+    ) {
+        let mut guard = self.decode.lock().unwrap();
+        let stale = match &*guard {
+            Some(d) => {
+                d.dim != model.config.dim
+                    || d.n_layers != model.config.n_layers
+                    || d.vocab != model.config.vocab_size
+                    || d.seq_len != model.config.seq_len
+            }
+            None => true,
+        };
+        if stale {
+            *guard = Some(self.build_decode_state(model));
+        }
+        let d = guard.as_mut().unwrap();
+
+        // One-time host->device sync of any KV positions a prior prefill filled.
+        if d.kv_filled < pos {
+            let (kv_dim, seq) = (d.kv_dim, d.seq_len);
+            for l in 0..d.n_layers {
+                let loff = l * seq * kv_dim;
+                let lo = loff + d.kv_filled * kv_dim;
+                let hi = loff + pos * kv_dim;
+                let off = (d.kv_filled * kv_dim * 4) as u64;
+                self.queue
+                    .write_buffer(&d.key[l], off, f32_bytes(&state.key_cache()[lo..hi]));
+                self.queue
+                    .write_buffer(&d.value[l], off, f32_bytes(&state.value_cache()[lo..hi]));
+            }
+            d.kv_filled = pos;
+        }
+
+        // Per-step inputs: this token's embedding, and the pos-dependent params.
+        model
+            .weights
+            .token_embedding_table
+            .dequant_row(token, &mut d.embed);
+        self.queue.write_buffer(&d.x, 0, f32_bytes(&d.embed));
+        // Patch just the pos-dependent words: rope's `pos` (3rd u32, byte 8) and
+        // attention's `np = pos+1` (5th u32, byte 16).
+        self.queue
+            .write_buffer(&d.rope_params, 8, u32_bytes(&[pos as u32]));
+        self.queue
+            .write_buffer(&d.attn_params, 16, u32_bytes(&[(pos + 1) as u32]));
+
+        // Record the whole step into one encoder (one pass per op => wgpu
+        // inserts the read-after-write barriers between dependent dispatches).
+        let wg_dim = ceil_div(d.dim, 64);
+        let wg_kv = ceil_div(d.kv_dim, 64);
+        let wg_hidden = ceil_div(d.hidden, 64);
+        let wg_vocab = ceil_div(d.vocab, 64);
+        let wg_rope = ceil_div(d.dim / 2, 64);
+        let wg_heads = d.n_heads as u32;
+        let pos_off = (pos * d.kv_dim * 4) as u64;
+        let kv_bytes = (d.kv_dim * 4) as u64;
+
+        let mm = &self.pipelines.matmul;
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for l in 0..d.n_layers {
+            let lb = &d.layers[l];
+            pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_att, 1);
+            pass(&mut enc, mm, &lb.mq, wg_dim);
+            pass(&mut enc, mm, &lb.mk, wg_kv);
+            pass(&mut enc, mm, &lb.mv, wg_kv);
+            pass(&mut enc, &self.pipelines.rope, &lb.rope, wg_rope);
+            // Stash the rotated K/V for this position into the resident cache.
+            enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
+            enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
+            pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
+            pass(&mut enc, mm, &lb.mo, wg_dim);
+            pass(&mut enc, &self.pipelines.add, &lb.add_attn, wg_dim);
+            pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
+            pass(&mut enc, mm, &lb.m1, wg_hidden);
+            pass(&mut enc, mm, &lb.m3, wg_hidden);
+            pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, wg_hidden);
+            pass(&mut enc, mm, &lb.m2, wg_dim);
+            pass(&mut enc, &self.pipelines.add, &lb.add_ffn, wg_dim);
+        }
+        pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
+        pass(&mut enc, mm, &d.final_cls, wg_vocab);
+        enc.copy_buffer_to_buffer(&d.logits, 0, &d.logits_staging, 0, (d.vocab * 4) as u64);
+        self.queue.submit(Some(enc.finish()));
+        d.kv_filled = pos + 1;
+
+        self.map_read(&d.logits_staging, state.logits_mut());
+    }
 }
 
 impl Backend for GpuBackend {
@@ -881,6 +1199,16 @@ impl Backend for GpuBackend {
         let grid = [ceil_div(rows * n_heads, 64), 1, 1];
         self.run_grid(&self.pipelines.attention_batch, &bind, grid, &ob, out);
         let _ = att; // GPU path keeps softmax state in registers; att unused.
+    }
+
+    fn forward_step(
+        &self,
+        model: &crate::model::Model,
+        state: &mut crate::model::RunState,
+        token: usize,
+        pos: usize,
+    ) {
+        self.fused_step(model, state, token, pos);
     }
 }
 
@@ -1190,6 +1518,54 @@ mod tests {
             gpu.as_secs_f64() / cpu.as_secs_f64(),
             tokens.len() as f64 / gpu.as_secs_f64(),
             tokens.len() as f64 / cpu.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_decode_gpu_vs_cpu() {
+        use std::time::Instant;
+        let Some(g) = gpu() else { return };
+
+        let c = crate::Config {
+            dim: 1024,
+            hidden_dim: 2816,
+            n_layers: 4,
+            n_heads: 16,
+            n_kv_heads: 16,
+            vocab_size: 4096,
+            seq_len: 512,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let bytes = crate::dummy::synthetic_gguf_typed(&c, crate::GgmlType::F32);
+        let gguf = crate::Gguf::parse(&bytes).unwrap();
+        let model = crate::Model::from_gguf(&gguf).unwrap();
+        let steps = 64usize;
+
+        let time = |backend: &dyn Backend, warm: usize| -> std::time::Duration {
+            let mut s = crate::RunState::new(&model.config);
+            for pos in 0..warm {
+                backend.forward_step(&model, &mut s, (pos * 13) % c.vocab_size, pos);
+            }
+            let t = Instant::now();
+            for i in 0..steps {
+                let pos = warm + i;
+                backend.forward_step(&model, &mut s, (pos * 13) % c.vocab_size, pos);
+            }
+            t.elapsed()
+        };
+
+        let gpu = time(&g, 1); // warm: build resident state + upload weights
+        let cpu = time(&CpuBackend::new(), 0);
+        eprintln!(
+            "decode {steps} steps, dim {} x{} layers: gpu={gpu:?} cpu={cpu:?} \
+             -> gpu is {:.2}x the cpu time ({:.0} vs {:.0} tok/s)",
+            c.dim,
+            c.n_layers,
+            gpu.as_secs_f64() / cpu.as_secs_f64(),
+            steps as f64 / gpu.as_secs_f64(),
+            steps as f64 / cpu.as_secs_f64(),
         );
     }
 

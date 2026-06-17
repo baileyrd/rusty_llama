@@ -361,6 +361,19 @@ impl RunState {
     pub fn logits_mut(&mut self) -> &mut [f32] {
         &mut self.logits
     }
+
+    /// The key cache `(n_layers, seq_len, kv_dim)`. Used by a backend that
+    /// mirrors the KV cache on a device (the GPU fused decode path).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn key_cache(&self) -> &[f32] {
+        &self.key_cache
+    }
+
+    /// The value cache `(n_layers, seq_len, kv_dim)`; see [`RunState::key_cache`].
+    #[cfg(feature = "gpu")]
+    pub(crate) fn value_cache(&self) -> &[f32] {
+        &self.value_cache
+    }
 }
 
 /// Run one transformer step for `token` at position `pos`.
@@ -605,7 +618,7 @@ pub fn generate(
     let mut generated = 0;
 
     while pos < steps {
-        forward(model, state, backend, token, pos);
+        backend.forward_step(model, state, token, pos);
 
         // While we still have prompt tokens to ingest, force the next token;
         // otherwise sample it.
@@ -676,7 +689,7 @@ fn generate_prefilled(
         if pos >= steps {
             break;
         }
-        forward(model, state, backend, token, pos);
+        backend.forward_step(model, state, token, pos);
         next = sampler.sample(state.logits_mut());
     }
 
