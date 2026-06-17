@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
 use crate::backend::Backend;
-use crate::quant::dequantize;
+use crate::quant::{dequantize, GgmlType};
 use crate::tensor::QMatrix;
 
 // --- Shaders ----------------------------------------------------------------
@@ -343,6 +343,277 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// (`array<f32, 128>`) supports; larger heads use the looped fallback.
 const MAX_BATCH_HEAD: usize = 128;
 
+// --- In-shader dequantizing matmul ------------------------------------------
+//
+// Quantized weights are uploaded as their raw GGUF block bytes (kept resident)
+// and dequantized inside the matmul, exactly like the CPU's per-block path.
+// This streams ~4x less weight data per token than expanding to f32 on upload.
+// Common WGSL prelude: read a byte out of an `array<u32>` and an f16 scale.
+
+const WGSL_QUANT_PRELUDE: &str = r#"
+fn gb(i: u32) -> u32 { return (wb[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu; }
+fn sext8(b: u32) -> i32 { return (i32(b) << 24u) >> 24u; }   // signed 8-bit
+fn f16f32(h: u32) -> f32 {
+    let s = (h >> 15u) & 1u;
+    let e = (h >> 10u) & 0x1fu;
+    let m = h & 0x3ffu;
+    var v: f32;
+    if (e == 0u) { v = f32(m) * exp2(-24.0); }
+    else if (e == 0x1fu) { v = 0.0; }   // weight scales are never inf/nan
+    else { v = (1.0 + f32(m) / 1024.0) * exp2(f32(i32(e) - 15)); }
+    return select(v, -v, s == 1u);
+}
+// Q4_K 6-bit packed scale+min for sub-block j (scales at byte `base`).
+fn scale_min_k4(j: u32, base: u32) -> vec2<u32> {
+    if (j < 4u) {
+        return vec2<u32>(gb(base + j) & 63u, gb(base + j + 4u) & 63u);
+    }
+    let d = (gb(base + j + 4u) & 0x0fu) | ((gb(base + j - 4u) >> 6u) << 4u);
+    let m = (gb(base + j + 4u) >> 4u) | ((gb(base + j) >> 6u) << 4u);
+    return vec2<u32>(d, m);
+}
+"#;
+
+// Q8_0: 34-byte blocks of (f16 scale, 32 x i8). out[row] = sum_b sum_i d*q*x.
+const WGSL_MATMUL_Q8_0: &str = r#"
+struct P { rows: u32, cols: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= p.rows) { return; }
+    let nb = p.cols / 32u;
+    let row_base = row * nb * 34u;
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 34u;
+        let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
+        let xb = b * 32u;
+        for (var i = 0u; i < 32u; i = i + 1u) {
+            let q = (i32(gb(bb + 2u + i)) << 24u) >> 24u;
+            acc = acc + d * f32(q) * x[xb + i];
+        }
+    }
+    outp[row] = acc;
+}
+"#;
+
+// Batched Q8_0: 2-D grid, x = output feature, y = batch row. out is (n, rows).
+const WGSL_MATMUL_Q8_0_BATCH: &str = r#"
+struct P { rows: u32, cols: u32, n: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = gid.y;
+    if (row >= p.rows || r >= p.n) { return; }
+    let nb = p.cols / 32u;
+    let row_base = row * nb * 34u;
+    let xrow = r * p.cols;
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 34u;
+        let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
+        let xb = xrow + b * 32u;
+        for (var i = 0u; i < 32u; i = i + 1u) {
+            let q = (i32(gb(bb + 2u + i)) << 24u) >> 24u;
+            acc = acc + d * f32(q) * x[xb + i];
+        }
+    }
+    outp[r * p.rows + row] = acc;
+}
+"#;
+
+// Q4_K: 144-byte superblocks of 256 (f16 d, f16 dmin, 12B packed 6-bit
+// scale/min, 128B of 4-bit quants). Mirrors quant::block_q4_k.
+const WGSL_MATMUL_Q4_K: &str = r#"
+struct P { rows: u32, cols: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 144u;
+        let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
+        let dmin = f16f32(gb(bb + 2u) | (gb(bb + 3u) << 8u));
+        let sbase = bb + 4u;
+        let qbase = bb + 16u;
+        let xb = xoff + b * 256u;
+        var y = 0u;
+        var is = 0u;
+        for (var chunk = 0u; chunk < 4u; chunk = chunk + 1u) {
+            let sm1 = scale_min_k4(is, sbase);
+            let sm2 = scale_min_k4(is + 1u, sbase);
+            let d1 = d * f32(sm1.x); let min1 = dmin * f32(sm1.y);
+            let d2 = d * f32(sm2.x); let min2 = dmin * f32(sm2.y);
+            let cbase = qbase + chunk * 32u;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d1 * f32(gb(cbase + j) & 0x0fu) - min1) * x[xb + y];
+                y = y + 1u;
+            }
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d2 * f32(gb(cbase + j) >> 4u) - min2) * x[xb + y];
+                y = y + 1u;
+            }
+            is = is + 2u;
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= p.rows) { return; }
+    let nb = p.cols / 256u;
+    outp[row] = dot_q4k_row(row * nb * 144u, nb, 0u);
+}
+"#;
+
+const WGSL_MATMUL_Q4_K_BATCH: &str = r#"
+struct P { rows: u32, cols: u32, n: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 144u;
+        let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
+        let dmin = f16f32(gb(bb + 2u) | (gb(bb + 3u) << 8u));
+        let sbase = bb + 4u;
+        let qbase = bb + 16u;
+        let xb = xoff + b * 256u;
+        var y = 0u;
+        var is = 0u;
+        for (var chunk = 0u; chunk < 4u; chunk = chunk + 1u) {
+            let sm1 = scale_min_k4(is, sbase);
+            let sm2 = scale_min_k4(is + 1u, sbase);
+            let d1 = d * f32(sm1.x); let min1 = dmin * f32(sm1.y);
+            let d2 = d * f32(sm2.x); let min2 = dmin * f32(sm2.y);
+            let cbase = qbase + chunk * 32u;
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d1 * f32(gb(cbase + j) & 0x0fu) - min1) * x[xb + y];
+                y = y + 1u;
+            }
+            for (var j = 0u; j < 32u; j = j + 1u) {
+                acc = acc + (d2 * f32(gb(cbase + j) >> 4u) - min2) * x[xb + y];
+                y = y + 1u;
+            }
+            is = is + 2u;
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = gid.y;
+    if (row >= p.rows || r >= p.n) { return; }
+    let nb = p.cols / 256u;
+    outp[r * p.rows + row] = dot_q4k_row(row * nb * 144u, nb, r * p.cols);
+}
+"#;
+
+// Q6_K: 210-byte superblocks of 256 (128B ql, 64B qh, 16 signed-i8 scales,
+// f16 d). Mirrors quant::block_q6_k.
+const WGSL_MATMUL_Q6_K: &str = r#"
+struct P { rows: u32, cols: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 210u;
+        let d = f16f32(gb(bb + 208u) | (gb(bb + 209u) << 8u));
+        let xb = xoff + b * 256u;
+        for (var half = 0u; half < 2u; half = half + 1u) {
+            let qlb = bb + half * 64u;
+            let qhb = bb + 128u + half * 32u;
+            let scb = bb + 192u + half * 8u;
+            let y = half * 128u;
+            for (var l = 0u; l < 32u; l = l + 1u) {
+                let is = l / 16u;
+                let qll = gb(qlb + l);
+                let qll32 = gb(qlb + l + 32u);
+                let qhl = gb(qhb + l);
+                let q1 = i32((qll & 0x0fu) | (((qhl >> 0u) & 3u) << 4u)) - 32;
+                let q2 = i32((qll32 & 0x0fu) | (((qhl >> 2u) & 3u) << 4u)) - 32;
+                let q3 = i32((qll >> 4u) | (((qhl >> 4u) & 3u) << 4u)) - 32;
+                let q4 = i32((qll32 >> 4u) | (((qhl >> 6u) & 3u) << 4u)) - 32;
+                acc = acc + d * f32(sext8(gb(scb + is))) * f32(q1) * x[xb + y + l];
+                acc = acc + d * f32(sext8(gb(scb + is + 2u))) * f32(q2) * x[xb + y + l + 32u];
+                acc = acc + d * f32(sext8(gb(scb + is + 4u))) * f32(q3) * x[xb + y + l + 64u];
+                acc = acc + d * f32(sext8(gb(scb + is + 6u))) * f32(q4) * x[xb + y + l + 96u];
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    if (row >= p.rows) { return; }
+    let nb = p.cols / 256u;
+    outp[row] = dot_q6k_row(row * nb * 210u, nb, 0u);
+}
+"#;
+
+const WGSL_MATMUL_Q6_K_BATCH: &str = r#"
+struct P { rows: u32, cols: u32, n: u32 };
+@group(0) @binding(0) var<storage, read> wb: array<u32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(3) var<storage, read> p: P;
+fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
+    var acc = 0.0;
+    for (var b = 0u; b < nb; b = b + 1u) {
+        let bb = row_base + b * 210u;
+        let d = f16f32(gb(bb + 208u) | (gb(bb + 209u) << 8u));
+        let xb = xoff + b * 256u;
+        for (var half = 0u; half < 2u; half = half + 1u) {
+            let qlb = bb + half * 64u;
+            let qhb = bb + 128u + half * 32u;
+            let scb = bb + 192u + half * 8u;
+            let y = half * 128u;
+            for (var l = 0u; l < 32u; l = l + 1u) {
+                let is = l / 16u;
+                let qll = gb(qlb + l);
+                let qll32 = gb(qlb + l + 32u);
+                let qhl = gb(qhb + l);
+                let q1 = i32((qll & 0x0fu) | (((qhl >> 0u) & 3u) << 4u)) - 32;
+                let q2 = i32((qll32 & 0x0fu) | (((qhl >> 2u) & 3u) << 4u)) - 32;
+                let q3 = i32((qll >> 4u) | (((qhl >> 4u) & 3u) << 4u)) - 32;
+                let q4 = i32((qll32 >> 4u) | (((qhl >> 6u) & 3u) << 4u)) - 32;
+                acc = acc + d * f32(sext8(gb(scb + is))) * f32(q1) * x[xb + y + l];
+                acc = acc + d * f32(sext8(gb(scb + is + 2u))) * f32(q2) * x[xb + y + l + 32u];
+                acc = acc + d * f32(sext8(gb(scb + is + 4u))) * f32(q3) * x[xb + y + l + 64u];
+                acc = acc + d * f32(sext8(gb(scb + is + 6u))) * f32(q4) * x[xb + y + l + 96u];
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let r = gid.y;
+    if (row >= p.rows || r >= p.n) { return; }
+    let nb = p.cols / 256u;
+    outp[r * p.rows + row] = dot_q6k_row(row * nb * 210u, nb, r * p.cols);
+}
+"#;
+
 /// The compiled compute pipelines, one per primitive.
 struct Pipelines {
     matmul: wgpu::ComputePipeline,
@@ -355,6 +626,21 @@ struct Pipelines {
     rmsnorm_batch: wgpu::ComputePipeline,
     rope_batch: wgpu::ComputePipeline,
     attention_batch: wgpu::ComputePipeline,
+    matmul_q8_0: wgpu::ComputePipeline,
+    matmul_q8_0_batch: wgpu::ComputePipeline,
+    matmul_q4_k: wgpu::ComputePipeline,
+    matmul_q4_k_batch: wgpu::ComputePipeline,
+    matmul_q6_k: wgpu::ComputePipeline,
+    matmul_q6_k_batch: wgpu::ComputePipeline,
+}
+
+/// A resident weight: its device buffer and the format it's stored in (`F32`
+/// for full-precision or host-dequantized weights, or a quant type that the
+/// matmul kernel dequantizes in-shader).
+#[derive(Clone)]
+struct GpuWeight {
+    buf: Arc<wgpu::Buffer>,
+    ty: GgmlType,
 }
 
 /// Pre-built bind groups for one transformer layer's fused decode step. The
@@ -376,6 +662,9 @@ struct LayerBinds {
     swiglu: wgpu::BindGroup,
     m2: wgpu::BindGroup,
     add_ffn: wgpu::BindGroup,
+    /// On-device format of each matmul weight, to pick the matmul pipeline
+    /// (order: wq, wk, wv, wo, w1, w3, w2).
+    mm_ty: [GgmlType; 7],
 }
 
 /// Device-resident state for fused single-token decode: the KV cache, the
@@ -406,6 +695,7 @@ struct DecodeState {
     layers: Vec<LayerBinds>,
     final_rms: wgpu::BindGroup,
     final_cls: wgpu::BindGroup,
+    final_cls_ty: GgmlType,
     /// Number of KV positions already resident on the device.
     kv_filled: usize,
     /// Scratch for the per-step token embedding upload.
@@ -441,7 +731,7 @@ pub struct GpuBackend {
     /// CLI's pattern). Reusing one backend across *different* models could in
     /// principle alias a freed-then-recycled address, so don't: make one
     /// backend per model.
-    weights: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
+    weights: Mutex<HashMap<usize, GpuWeight>>,
     /// Resident RoPE inverse-frequency tables, keyed by source data pointer.
     tables: Mutex<HashMap<usize, Arc<wgpu::Buffer>>>,
     /// The granted device limits (used to pre-check oversized weight buffers).
@@ -508,6 +798,36 @@ impl GpuBackend {
             rmsnorm_batch: make_pipeline(&device, WGSL_RMSNORM_BATCH, "rmsnorm_batch"),
             rope_batch: make_pipeline(&device, WGSL_ROPE_BATCH, "rope_batch"),
             attention_batch: make_pipeline(&device, WGSL_ATTENTION_BATCH, "attention_batch"),
+            matmul_q8_0: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q8_0}"),
+                "matmul_q8_0",
+            ),
+            matmul_q8_0_batch: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q8_0_BATCH}"),
+                "matmul_q8_0_batch",
+            ),
+            matmul_q4_k: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q4_K}"),
+                "matmul_q4_k",
+            ),
+            matmul_q4_k_batch: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q4_K_BATCH}"),
+                "matmul_q4_k_batch",
+            ),
+            matmul_q6_k: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q6_K}"),
+                "matmul_q6_k",
+            ),
+            matmul_q6_k_batch: make_pipeline(
+                &device,
+                &format!("{WGSL_QUANT_PRELUDE}{WGSL_MATMUL_Q6_K_BATCH}"),
+                "matmul_q6_k_batch",
+            ),
         };
 
         Ok(GpuBackend {
@@ -684,49 +1004,84 @@ impl GpuBackend {
         staging.unmap();
     }
 
-    /// Fetch (uploading on first use) the resident f32 buffer for weight `w`.
-    /// Quantized weights are dequantized to f32 on the host once, here.
-    fn weight_buffer(&self, w: &QMatrix) -> Arc<wgpu::Buffer> {
-        let (key, f32data): (usize, Cow<[f32]>) = match w {
-            QMatrix::F32 { data, .. } => (data.as_ptr() as usize, Cow::Borrowed(&data[..])),
+    /// Fetch (uploading on first use) the resident buffer for weight `w`.
+    ///
+    /// Formats with an in-shader dequant kernel (currently Q8_0) are uploaded as
+    /// their raw quantized block bytes and kept that way — the matmul
+    /// dequantizes them on the fly, streaming ~4× less data per token. Every
+    /// other format is dequantized to f32 on the host once, here. The returned
+    /// [`GpuWeight`] carries the on-device format so the caller picks the
+    /// matching matmul kernel.
+    fn weight_buffer(&self, w: &QMatrix) -> GpuWeight {
+        let key = match w {
+            QMatrix::F32 { data, .. } => data.as_ptr() as usize,
+            QMatrix::Quant { data, .. } => data.as_ptr() as usize,
+        };
+        if let Some(g) = self.weights.lock().unwrap().get(&key) {
+            return g.clone();
+        }
+
+        // (bytes-to-upload, on-device format).
+        let (bytes, ty): (Cow<[u8]>, GgmlType) = match w {
+            QMatrix::F32 { data, .. } => (Cow::Borrowed(f32_bytes(data)), GgmlType::F32),
+            // In-shader formats: keep the raw blocks (padded to a u32 boundary
+            // so the shader can read them as array<u32>).
             QMatrix::Quant {
-                ty,
+                ty: ty @ (GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K),
                 data,
-                rows,
-                cols,
+                ..
             } => {
-                let key = data.as_ptr() as usize;
-                // Avoid the dequant if it's already resident.
-                if let Some(b) = self.weights.lock().unwrap().get(&key) {
-                    return b.clone();
-                }
+                let mut b = data.to_vec();
+                b.resize(b.len().next_multiple_of(4), 0);
+                (Cow::Owned(b), *ty)
+            }
+            // Everything else: host dequant to f32 (the original behaviour).
+            QMatrix::Quant {
+                ty, data, rows, cols, ..
+            } => {
                 let f = dequantize(*ty, data, rows * cols).expect("weight dequantization");
-                (key, Cow::Owned(f))
+                (Cow::Owned(f32_bytes(&f).to_vec()), GgmlType::F32)
             }
         };
-        let mut cache = self.weights.lock().unwrap();
-        if let Some(b) = cache.get(&key) {
-            return b.clone();
-        }
-        // A weight is uploaded as one buffer and bound whole, so it must fit
-        // both caps. Fail with an actionable message rather than wgpu's opaque
-        // uncaptured-error panic. (Tiling the matmul would lift this; future
-        // work — see the perf notes in cpu.rs / the PR.)
-        let bytes = (f32data.len() * 4) as u64;
+
+        let nbytes = bytes.len() as u64;
         let binding_cap = self.limits.max_storage_buffer_binding_size;
-        if bytes > binding_cap || bytes > self.limits.max_buffer_size {
+        if nbytes > binding_cap || nbytes > self.limits.max_buffer_size {
             panic!(
-                "weight matrix ({} rows × {} cols → {bytes} bytes f32) exceeds this GPU's limits \
-                 (max_storage_buffer_binding_size {binding_cap}, max_buffer_size {}); \
+                "weight matrix ({} rows × {} cols → {nbytes} bytes on device) exceeds this GPU's \
+                 limits (max_storage_buffer_binding_size {binding_cap}, max_buffer_size {}); \
                  this model is too large for the GPU backend — use --backend cpu",
                 w.rows(),
                 w.cols(),
                 self.limits.max_buffer_size,
             );
         }
-        let buf = Arc::new(self.storage_ro("weight", f32_bytes(&f32data)));
-        cache.insert(key, buf.clone());
-        buf
+        let gw = GpuWeight {
+            buf: Arc::new(self.storage_ro("weight", &bytes)),
+            ty,
+        };
+        self.weights.lock().unwrap().insert(key, gw.clone());
+        gw
+    }
+
+    /// The matmul pipeline for an on-device weight format.
+    fn matmul_pipeline(&self, ty: GgmlType) -> &wgpu::ComputePipeline {
+        match ty {
+            GgmlType::Q8_0 => &self.pipelines.matmul_q8_0,
+            GgmlType::Q4_K => &self.pipelines.matmul_q4_k,
+            GgmlType::Q6_K => &self.pipelines.matmul_q6_k,
+            _ => &self.pipelines.matmul, // F32 (incl. host-dequantized weights)
+        }
+    }
+
+    /// The batched matmul pipeline for an on-device weight format.
+    fn matmul_batch_pipeline(&self, ty: GgmlType) -> &wgpu::ComputePipeline {
+        match ty {
+            GgmlType::Q8_0 => &self.pipelines.matmul_q8_0_batch,
+            GgmlType::Q4_K => &self.pipelines.matmul_q4_k_batch,
+            GgmlType::Q6_K => &self.pipelines.matmul_q6_k_batch,
+            _ => &self.pipelines.matmul_batch,
+        }
     }
 
     /// Fetch (uploading on first use) the resident RoPE inverse-frequency table.
@@ -820,9 +1175,10 @@ impl GpuBackend {
         let attn_params =
             self.params_dyn(&[hs as u32, kv_dim as u32, seq as u32, kv_mul, 0, scale.to_bits()]);
 
-        // Resident weights (cached by pointer) and per-layer norm weights.
+        // Resident weights (cached by pointer) and per-layer norm weights. Each
+        // matmul binds the weight against the pipeline matching its on-device
+        // format (f32 or in-shader-dequant), recorded in `mm_ty` for dispatch.
         let inv_freq = self.table_buffer(&model.rope.inv_freq);
-        let mm = &self.pipelines.matmul;
         let layers: Vec<LayerBinds> = (0..nl)
             .map(|l| {
                 let wq = self.weight_buffer(&w.wq[l]);
@@ -834,24 +1190,29 @@ impl GpuBackend {
                 let w3 = self.weight_buffer(&w.w3[l]);
                 let rms_a = self.table_buffer(&w.rms_att_weight[l * dim..l * dim + dim]);
                 let rms_f = self.table_buffer(&w.rms_ffn_weight[l * dim..l * dim + dim]);
+                let mm = |gw: &GpuWeight, out: &wgpu::Buffer, params: &wgpu::Buffer| {
+                    self.bind(self.matmul_pipeline(gw.ty), &[&gw.buf, &xb, out, params])
+                };
                 LayerBinds {
                     rms_att: self.bind(&self.pipelines.rmsnorm, &[&x, &rms_a, &xb, &p_rms]),
-                    mq: self.bind(mm, &[&wq, &xb, &q, &p_dimdim]),
-                    mk: self.bind(mm, &[&wk, &xb, &k_tmp, &p_kvdim]),
-                    mv: self.bind(mm, &[&wv, &xb, &v_tmp, &p_kvdim]),
+                    mq: mm(&wq, &q, &p_dimdim),
+                    mk: mm(&wk, &k_tmp, &p_kvdim),
+                    mv: mm(&wv, &v_tmp, &p_kvdim),
                     rope: self.bind(&self.pipelines.rope, &[&q, &k_tmp, &inv_freq, &rope_params]),
                     attn: self.bind(
                         &self.pipelines.attention,
                         &[&q, &key[l], &value[l], &att, &xb, &attn_params],
                     ),
-                    mo: self.bind(mm, &[&wo, &xb, &xb2, &p_dimdim]),
+                    mo: mm(&wo, &xb2, &p_dimdim),
                     add_attn: self.bind(&self.pipelines.add, &[&x, &xb2, &p_add]),
                     rms_ffn: self.bind(&self.pipelines.rmsnorm, &[&x, &rms_f, &xb, &p_rms]),
-                    m1: self.bind(mm, &[&w1, &xb, &hb, &p_hidden]),
-                    m3: self.bind(mm, &[&w3, &xb, &hb2, &p_hidden]),
+                    m1: mm(&w1, &hb, &p_hidden),
+                    m3: mm(&w3, &hb2, &p_hidden),
                     swiglu: self.bind(&self.pipelines.swiglu, &[&hb, &hb2, &p_swiglu]),
-                    m2: self.bind(mm, &[&w2, &hb, &xb, &p_dimhidden]),
+                    // w2 reads hb (not xb); bind it explicitly.
+                    m2: self.bind(self.matmul_pipeline(w2.ty), &[&w2.buf, &hb, &xb, &p_dimhidden]),
                     add_ffn: self.bind(&self.pipelines.add, &[&x, &xb, &p_add]),
+                    mm_ty: [wq.ty, wk.ty, wv.ty, wo.ty, w1.ty, w3.ty, w2.ty],
                 }
             })
             .collect();
@@ -859,7 +1220,8 @@ impl GpuBackend {
         let rms_final = self.table_buffer(&w.rms_final_weight);
         let wcls = self.weight_buffer(&w.wcls);
         let final_rms = self.bind(&self.pipelines.rmsnorm, &[&x, &rms_final, &xb, &p_rms]);
-        let final_cls = self.bind(mm, &[&wcls, &xb, &logits, &p_vocab]);
+        let final_cls = self.bind(self.matmul_pipeline(wcls.ty), &[&wcls.buf, &xb, &logits, &p_vocab]);
+        let final_cls_ty = wcls.ty;
 
         DecodeState {
             dim,
@@ -881,6 +1243,7 @@ impl GpuBackend {
             layers,
             final_rms,
             final_cls,
+            final_cls_ty,
             kv_filled: 0,
             embed: vec![0.0; dim],
         }
@@ -950,32 +1313,32 @@ impl GpuBackend {
         let pos_off = (pos * d.kv_dim * 4) as u64;
         let kv_bytes = (d.kv_dim * 4) as u64;
 
-        let mm = &self.pipelines.matmul;
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         for l in 0..d.n_layers {
             let lb = &d.layers[l];
+            let mm = lb.mm_ty.map(|t| self.matmul_pipeline(t)); // [wq,wk,wv,wo,w1,w3,w2]
             pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_att, 1);
-            pass(&mut enc, mm, &lb.mq, wg_dim);
-            pass(&mut enc, mm, &lb.mk, wg_kv);
-            pass(&mut enc, mm, &lb.mv, wg_kv);
+            pass(&mut enc, mm[0], &lb.mq, wg_dim);
+            pass(&mut enc, mm[1], &lb.mk, wg_kv);
+            pass(&mut enc, mm[2], &lb.mv, wg_kv);
             pass(&mut enc, &self.pipelines.rope, &lb.rope, wg_rope);
             // Stash the rotated K/V for this position into the resident cache.
             enc.copy_buffer_to_buffer(&d.k_tmp, 0, &d.key[l], pos_off, kv_bytes);
             enc.copy_buffer_to_buffer(&d.v_tmp, 0, &d.value[l], pos_off, kv_bytes);
             pass(&mut enc, &self.pipelines.attention, &lb.attn, wg_heads);
-            pass(&mut enc, mm, &lb.mo, wg_dim);
+            pass(&mut enc, mm[3], &lb.mo, wg_dim);
             pass(&mut enc, &self.pipelines.add, &lb.add_attn, wg_dim);
             pass(&mut enc, &self.pipelines.rmsnorm, &lb.rms_ffn, 1);
-            pass(&mut enc, mm, &lb.m1, wg_hidden);
-            pass(&mut enc, mm, &lb.m3, wg_hidden);
+            pass(&mut enc, mm[4], &lb.m1, wg_hidden);
+            pass(&mut enc, mm[5], &lb.m3, wg_hidden);
             pass(&mut enc, &self.pipelines.swiglu, &lb.swiglu, wg_hidden);
-            pass(&mut enc, mm, &lb.m2, wg_dim);
+            pass(&mut enc, mm[6], &lb.m2, wg_dim);
             pass(&mut enc, &self.pipelines.add, &lb.add_ffn, wg_dim);
         }
         pass(&mut enc, &self.pipelines.rmsnorm, &d.final_rms, 1);
-        pass(&mut enc, mm, &d.final_cls, wg_vocab);
+        pass(&mut enc, self.matmul_pipeline(d.final_cls_ty), &d.final_cls, wg_vocab);
         enc.copy_buffer_to_buffer(&d.logits, 0, &d.logits_staging, 0, (d.vocab * 4) as u64);
         self.queue.submit(Some(enc.finish()));
         d.kv_filled = pos + 1;
@@ -995,12 +1358,13 @@ impl Backend for GpuBackend {
     }
 
     fn matmul(&self, out: &mut [f32], x: &[f32], w: &QMatrix) {
-        let wb = self.weight_buffer(w);
+        let gw = self.weight_buffer(w);
+        let pipe = self.matmul_pipeline(gw.ty);
         let xb = self.storage_ro("x", f32_bytes(x));
         let ob = self.alloc_out(out.len());
         let pb = self.params(&[w.rows() as u32, w.cols() as u32]);
-        let bind = self.bind(&self.pipelines.matmul, &[&wb, &xb, &ob, &pb]);
-        self.run(&self.pipelines.matmul, &bind, ceil_div(w.rows(), 64), &ob, out);
+        let bind = self.bind(pipe, &[&gw.buf, &xb, &ob, &pb]);
+        self.run(pipe, &bind, ceil_div(w.rows(), 64), &ob, out);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1087,14 +1451,15 @@ impl Backend for GpuBackend {
 
     fn matmul_batch(&self, out: &mut [f32], x: &[f32], w: &QMatrix, rows: usize) {
         let (oc, ic) = (w.rows(), w.cols());
-        let wb = self.weight_buffer(w);
+        let gw = self.weight_buffer(w);
+        let pipe = self.matmul_batch_pipeline(gw.ty);
         let xb = self.storage_ro("x", f32_bytes(x));
         let ob = self.alloc_out(out.len());
         let pb = self.params(&[oc as u32, ic as u32, rows as u32]);
-        let bind = self.bind(&self.pipelines.matmul_batch, &[&wb, &xb, &ob, &pb]);
+        let bind = self.bind(pipe, &[&gw.buf, &xb, &ob, &pb]);
         // 2-D grid: x over output features, y over batch rows.
         let grid = [ceil_div(oc, 64), rows as u32, 1];
-        self.run_grid(&self.pipelines.matmul_batch, &bind, grid, &ob, out);
+        self.run_grid(pipe, &bind, grid, &ob, out);
     }
 
     fn rmsnorm_batch(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32, rows: usize) {
@@ -1334,6 +1699,88 @@ mod tests {
         close(&out, &exact);
     }
 
+    /// Build `rows` valid Q4_K superblocks (256 cols each), varied per row.
+    fn q4_k_weight(rows: usize) -> Vec<u8> {
+        use crate::quant::{f32_to_f16, pack_scales_q4_k};
+        let mut bytes = Vec::new();
+        for r in 0..rows as u32 {
+            bytes.extend_from_slice(&f32_to_f16(0.05).to_le_bytes());
+            bytes.extend_from_slice(&f32_to_f16(0.02).to_le_bytes());
+            bytes.extend_from_slice(&pack_scales_q4_k(
+                [10, 20, 5, 33, 41, 7, 18, 25],
+                [3, 9, 14, 1, 22, 6, 30, 11],
+            ));
+            (0..128u32).for_each(|i| bytes.push(((i * 7 + 3 + r) % 256) as u8));
+        }
+        bytes
+    }
+
+    /// Build `rows` valid Q6_K superblocks (256 cols each).
+    fn q6_k_weight(rows: usize) -> Vec<u8> {
+        use crate::quant::f32_to_f16;
+        let mut bytes = Vec::new();
+        for r in 0..rows as u32 {
+            (0..128u32).for_each(|i| bytes.push(((i * 5 + 1 + r) % 256) as u8));
+            (0..64u32).for_each(|i| bytes.push(((i * 9 + 2) % 256) as u8));
+            (0..16i32).for_each(|i| bytes.push((i - 8) as i8 as u8));
+            bytes.extend_from_slice(&f32_to_f16(0.03).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn matmul_q4_k_matches_exact() {
+        let Some(g) = gpu() else { return };
+        let (rows, cols) = (3usize, 256usize);
+        let bytes = q4_k_weight(rows);
+        let deq = crate::quant::dequantize(GgmlType::Q4_K, &bytes, rows * cols).unwrap();
+        let x = noise(cols, 13);
+        let w = QMatrix::quant(GgmlType::Q4_K, bytes.into(), rows, cols).unwrap();
+        let mut out = vec![0.0; rows];
+        g.matmul(&mut out, &x, &w);
+        let exact: Vec<f32> = (0..rows)
+            .map(|r| (0..cols).map(|j| deq[r * cols + j] * x[j]).sum())
+            .collect();
+        close(&out, &exact);
+    }
+
+    #[test]
+    fn matmul_q6_k_matches_exact() {
+        let Some(g) = gpu() else { return };
+        let (rows, cols) = (2usize, 256usize);
+        let bytes = q6_k_weight(rows);
+        let deq = crate::quant::dequantize(GgmlType::Q6_K, &bytes, rows * cols).unwrap();
+        let x = noise(cols, 14);
+        let w = QMatrix::quant(GgmlType::Q6_K, bytes.into(), rows, cols).unwrap();
+        let mut out = vec![0.0; rows];
+        g.matmul(&mut out, &x, &w);
+        let exact: Vec<f32> = (0..rows)
+            .map(|r| (0..cols).map(|j| deq[r * cols + j] * x[j]).sum())
+            .collect();
+        close(&out, &exact);
+    }
+
+    #[test]
+    fn matmul_q4_k_batch_matches_exact() {
+        let Some(g) = gpu() else { return };
+        // Two batch rows of x against a 3-row Q4_K weight; checks the batch
+        // kernel's x/out indexing (the dequant is shared with the single kernel).
+        let (rows, cols, n) = (3usize, 256usize, 2usize);
+        let bytes = q4_k_weight(rows);
+        let deq = crate::quant::dequantize(GgmlType::Q4_K, &bytes, rows * cols).unwrap();
+        let x = noise(n * cols, 15);
+        let w = QMatrix::quant(GgmlType::Q4_K, bytes.into(), rows, cols).unwrap();
+        let mut out = vec![0.0; n * rows];
+        g.matmul_batch(&mut out, &x, &w, n);
+        let mut exact = vec![0.0f32; n * rows];
+        for r in 0..n {
+            for o in 0..rows {
+                exact[r * rows + o] = (0..cols).map(|j| deq[o * cols + j] * x[r * cols + j]).sum();
+            }
+        }
+        close(&out, &exact);
+    }
+
     #[test]
     fn rmsnorm_parity() {
         let Some(g) = gpu() else { return };
@@ -1567,6 +2014,52 @@ mod tests {
             steps as f64 / gpu.as_secs_f64(),
             steps as f64 / cpu.as_secs_f64(),
         );
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release --features gpu -- --ignored --nocapture"]
+    fn bench_decode_quant_vs_f32() {
+        use std::time::Instant;
+        if GpuBackend::new().is_err() {
+            return;
+        }
+        // A weights-heavy model so the weight-streaming cost is visible.
+        let c = crate::Config {
+            dim: 2048,
+            hidden_dim: 5632,
+            n_layers: 8,
+            n_heads: 32,
+            n_kv_heads: 32,
+            vocab_size: 32000,
+            seq_len: 256,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let steps = 32usize;
+        for ty in [crate::GgmlType::F32, crate::GgmlType::Q8_0] {
+            // Fresh backend per model (same dims => the decode state wouldn't rebuild).
+            let g = GpuBackend::new().unwrap();
+            let bytes = crate::dummy::synthetic_gguf_typed(&c, ty);
+            let gguf = crate::Gguf::parse(&bytes).unwrap();
+            let model = crate::Model::from_gguf(&gguf).unwrap();
+            let mut s = crate::RunState::new(&model.config);
+            g.forward_step(&model, &mut s, 1, 0); // warm: build state + upload weights
+            let t = Instant::now();
+            for i in 0..steps {
+                g.forward_step(&model, &mut s, (i * 7) % c.vocab_size, 1 + i);
+            }
+            let el = t.elapsed();
+            let bytes_per_elem = if ty == crate::GgmlType::F32 { 4.0 } else { 34.0 / 32.0 };
+            eprintln!(
+                "{ty:?}: decode {steps} steps (dim {} x{}L) -> {:.0} tok/s; \
+                 weights ~{:.1}x f16-element bytes ({:.2} B/elem)",
+                c.dim,
+                c.n_layers,
+                steps as f64 / el.as_secs_f64(),
+                bytes_per_elem / 4.0,
+                bytes_per_elem,
+            );
+        }
     }
 
     #[test]

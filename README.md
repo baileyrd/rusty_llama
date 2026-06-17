@@ -69,10 +69,12 @@ cargo run --release --features gpu -- stories15M.bin -z tokenizer.bin \
 ```
 
 The matmul weights are uploaded to the device once and kept resident (cached by
-data pointer); quantized weights are dequantized to f32 on the host at upload,
-so a single f32 matmul shader covers every GGUF quant type. Greedy output is
-**byte-identical** to the CPU backend (verified on `stories15M` and a quantized
-TinyLlama-1.1B Q4_K_M; see `tests/gpu_parity.rs`).
+data pointer). Q8_0/Q4_K/Q6_K weights stay in their **quantized** GGUF blocks
+on the device and are dequantized *in the matmul shader* (like the CPU's
+per-block path), so the device streams ~4–7× less weight data per token than
+expanding to f32 would; other formats are dequantized to f32 on the host at
+upload. Greedy output is **byte-identical** to the CPU backend (verified on
+`stories15M` and a quantized TinyLlama-1.1B Q4_K_M; see `tests/gpu_parity.rs`).
 
 **Prompt prefill is batched.** The whole prompt runs in one set of *large*
 matmuls (`forward_prefill`) rather than one tiny pass per token, via batched
@@ -85,21 +87,19 @@ faster on GPU than CPU** (735 vs 377 tok/s, `bench_prefill_gpu_vs_cpu`).
 keeps the KV cache and activations resident and records the whole step into one
 command encoder — one submission, one logits read-back — instead of a
 host↔device round-trip per op. That cut decode round-trips from ~300/token to
-one and sped decode up **1.5–2.9× over the naive per-op path** (stories15M
-82→239 tok/s; TinyLlama Q4_K_M 6→9 tok/s), reaching ~parity with the CPU at
-moderate widths (`bench_decode_gpu_vs_cpu`: 191 vs 196 tok/s at dim 1024).
+one and, combined with the on-device quantized weights above, took TinyLlama
+Q4_K_M decode from **6 → ~25 tok/s** (the naive per-op f32-resident path → fused
+quantized) and **VRAM from ~4.5 GB → ~1.0 GB**.
 
 **Honest performance note.** A large matmul with the weight resident is faster
-on the GPU (~1.2× a multi-core CPU matmul at 4096²) and batched prefill wins
-outright (~2×). Single-token *decode* is now competitive but still doesn't beat
-the CPU at the extremes: tiny models (stories15M) are dominated by per-token
-dispatch overhead (hundreds of small dispatches), and large quantized models
-(TinyLlama) by memory bandwidth — the GPU path dequantizes weights to f32 on
-upload, so it streams ~4–7× more weight data per token than the CPU's quantized
-kernels. Closing that needs **on-device quantized weights** (cut bandwidth)
-and/or a **fused-layer megakernel** (cut dispatch count) — the next levers.
-Greedy output stays **byte-identical** to the CPU throughout. See the
-`bench_*_gpu_vs_cpu` benchmarks in `src/backend/gpu.rs`.
+on the GPU (~1.2× a multi-core CPU matmul at 4096²); batched prefill wins
+outright (~2×); and decode is now competitive — TinyLlama Q4_K_M ≈25 tok/s on
+GPU vs ≈33 on CPU. It still doesn't quite beat a strong multi-core CPU on
+single-stream decode, which is dominated by per-token dispatch overhead
+(hundreds of small dispatches); the next lever there is a **fused-layer
+megakernel** to cut the dispatch count. Greedy output stays **byte-identical**
+to the CPU throughout. See the `bench_*_gpu_vs_cpu` benchmarks in
+`src/backend/gpu.rs`.
 
 ## How it fits together
 
