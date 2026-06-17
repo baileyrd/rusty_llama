@@ -5,6 +5,31 @@ A cold-start prompt for continuing the in-progress int8 GPU decode work. See
 
 ---
 
+## ✅ Status update (2026-06-17): roadmap #2 (int8/DP4A) is DONE — next is #3
+
+This handoff's task is complete; the rest of the doc is kept for context. All on
+branch `feat/gpu-int8-probe`, **PR #19** (open, not merged):
+
+- **Stage 1 — Q8_0 int8 decode: ADOPTED.** Wired into the fused decode behind an
+  all-Q8_0 eligibility gate + toggle (`RUSTY_LLAMA_NO_INT8` / `set_int8_decode`).
+  Measured **~1.5–1.6×** decode over the dequant path (TinyLlama-shaped synthetic
+  Q8_0). Per-op parity (vs exact int dot) + acc=1 fold + gate/toggle + e2e
+  coherence vs CPU.
+- **Stage 2 — Q4_K/Q6_K int8: MEASURED, NOT WIRED.** The three k-quant int8
+  kernels are built and **bit-exact** (per-op parity), but the gating microbench
+  `bench_kquant_int8_vs_dequant_gemv` shows int8 at **~0.94–0.98× (Q4_K) / ~0.70×
+  (Q6_K)** of the dequant GEMV — k-quants stay packed, so int8 saves no weight
+  bandwidth and the in-shader unpack is pure added compute on a bandwidth-bound
+  decode. Kept behind their tests (kill-criterion); Q4_K_M decode stays on
+  dequant. **Don't re-litigate scalar DP4A for k-quants** — it loses here.
+
+**Next session → roadmap #3: tensor cores** (the ~8× GPU decode / ~24× prefill
+gap). Either wgpu `EXPERIMENTAL_COOPERATIVE_MATRIX` (portable, but immature WGSL
+in wgpu 29) or a NVIDIA-only CUDA backend (`mma`/cuBLASLt, most certain). That's
+where ~80% of the GPU gap lives; `dot4I8Packed` has been exhausted.
+
+---
+
 You're picking up **`rusty_llama`** — a from-scratch Llama inference engine in
 Rust ("llama.cpp, the Rust way"). The CPU path is mature; over recent sessions a
 full **GPU backend** (wgpu, behind the `gpu` cargo feature) was built and merged,
