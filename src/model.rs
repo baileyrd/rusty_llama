@@ -363,14 +363,14 @@ impl RunState {
     }
 
     /// The key cache `(n_layers, seq_len, kv_dim)`. Used by a backend that
-    /// mirrors the KV cache on a device (the GPU fused decode path).
-    #[cfg(feature = "gpu")]
+    /// mirrors the KV cache on a device (the GPU/CUDA fused decode path).
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn key_cache(&self) -> &[f32] {
         &self.key_cache
     }
 
     /// The value cache `(n_layers, seq_len, kv_dim)`; see [`RunState::key_cache`].
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn value_cache(&self) -> &[f32] {
         &self.value_cache
     }

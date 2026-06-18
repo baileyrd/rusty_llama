@@ -235,6 +235,49 @@ impl Kernels {
 
 /// CUDA backend: a resident device context, stream, and cuBLASLt handle.
 ///
+/// Device-resident state for single-token decode, kept across steps (the CUDA
+/// analog of the wgpu `DecodeState`): the per-layer KV cache plus the activation
+/// scratch all live on device, so a decode step runs without per-op host
+/// round-trips. Built lazily on the first [`CudaBackend::forward_step`] and
+/// reused while the model shape is unchanged. `kv_filled` tracks how many cache
+/// rows are already on device, so a prior prefill's host KV is uploaded once.
+struct DecodeCuda {
+    // shape (for staleness checks)
+    dim: usize,
+    n_layers: usize,
+    vocab: usize,
+    seq_len: usize,
+    kv_dim: usize,
+    head_size: usize,
+    hidden: usize,
+    n_heads: usize,
+    kv_mul: usize,
+    n_freqs: usize,
+    mscale: f32,
+    // resident activations
+    x: CudaSlice<f32>,
+    xb: CudaSlice<f32>,
+    xb2: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    k_row: CudaSlice<f32>,
+    v_row: CudaSlice<f32>,
+    hb: CudaSlice<f32>,
+    hb2: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+    inv: CudaSlice<f32>,
+    // resident RMSNorm weights (uploaded once, not per step)
+    rms_att: Vec<CudaSlice<f32>>,
+    rms_ffn: Vec<CudaSlice<f32>>,
+    rms_final: CudaSlice<f32>,
+    // resident KV cache, one buffer per layer (seq_len * kv_dim each)
+    key: Vec<CudaSlice<f32>>,
+    value: Vec<CudaSlice<f32>>,
+    // host scratch for the per-step embedding lookup
+    embed: Vec<f32>,
+    // how many KV rows are already resident on device (uploaded or computed)
+    kv_filled: usize,
+}
+
 /// The matmuls (the `forward_prefill` GEMMs and the classifier) run on cuBLASLt
 /// **f16 tensor cores** (`Matmul<f16>`, f32 accumulate); the remaining
 /// elementwise/attention ops delegate to an internal [`CpuBackend`] (M1) or run
@@ -253,6 +296,8 @@ pub struct CudaBackend {
     kernels: Kernels,
     /// f16 device weights, keyed by source data pointer (see [`Self::weight_f16`]).
     weights: Mutex<HashMap<usize, Arc<CudaSlice<f16>>>>,
+    /// Resident single-token decode state (KV cache + activations), built lazily.
+    decode: Mutex<Option<DecodeCuda>>,
     cpu: CpuBackend,
     device_name: String,
 }
@@ -291,6 +336,7 @@ impl CudaBackend {
             blas,
             kernels,
             weights: Mutex::new(HashMap::new()),
+            decode: Mutex::new(None),
             cpu: CpuBackend::new(),
             device_name,
         })
@@ -553,6 +599,51 @@ impl CudaBackend {
             .arg(&kv_i);
         unsafe { b.launch(cfg) }.expect("launch attention");
     }
+
+    /// Allocate the resident decode state for `model` (KV cache + activation
+    /// scratch + RMSNorm weights, all on device). `kv_filled = 0`, so the first
+    /// step uploads any host KV a prior prefill produced.
+    fn build_decode(&self, model: &Model) -> DecodeCuda {
+        let p = &model.config;
+        let (dim, kv_dim, hidden, seq_len) = (p.dim, p.kv_dim(), p.hidden_dim, p.seq_len);
+        let st = &self.stream;
+        let alloc = |n: usize| st.alloc_zeros::<f32>(n).expect("alloc decode buffer");
+        let up = |s: &[f32]| st.clone_htod(s).expect("upload decode weight");
+        DecodeCuda {
+            dim,
+            n_layers: p.n_layers,
+            vocab: p.vocab_size,
+            seq_len,
+            kv_dim,
+            head_size: p.head_size(),
+            hidden,
+            n_heads: p.n_heads,
+            kv_mul: p.n_heads / p.n_kv_heads,
+            n_freqs: model.rope.inv_freq.len(),
+            mscale: model.rope.mscale,
+            x: alloc(dim),
+            xb: alloc(dim),
+            xb2: alloc(dim),
+            q: alloc(dim),
+            k_row: alloc(kv_dim),
+            v_row: alloc(kv_dim),
+            hb: alloc(hidden),
+            hb2: alloc(hidden),
+            logits: alloc(p.vocab_size),
+            inv: up(&model.rope.inv_freq),
+            rms_att: (0..p.n_layers)
+                .map(|l| up(&model.weights.rms_att_weight[l * dim..l * dim + dim]))
+                .collect(),
+            rms_ffn: (0..p.n_layers)
+                .map(|l| up(&model.weights.rms_ffn_weight[l * dim..l * dim + dim]))
+                .collect(),
+            rms_final: up(&model.weights.rms_final_weight[0..dim]),
+            key: (0..p.n_layers).map(|_| alloc(seq_len * kv_dim)).collect(),
+            value: (0..p.n_layers).map(|_| alloc(seq_len * kv_dim)).collect(),
+            embed: vec![0.0; dim],
+            kv_filled: 0,
+        }
+    }
 }
 
 // The matmuls run on cuBLASLt (f16 tensor cores); every other op delegates to
@@ -615,8 +706,98 @@ impl Backend for CudaBackend {
         self.cpu.add(out, x);
     }
 
+    /// Resident fused single-token decode: the KV cache + activations stay on
+    /// device across steps, so a step runs without per-op host round-trips (only
+    /// the embedding goes up and the logits come down). The matmuls are batch-1
+    /// GEMVs (bandwidth-bound — where f16/quantized weights pay off). Mirrors
+    /// [`crate::model::forward`] op-for-op; result must match the CPU path.
     fn forward_step(&self, model: &Model, state: &mut RunState, token: usize, pos: usize) {
-        self.cpu.forward_step(model, state, token, pos);
+        let p = &model.config;
+        let w = &model.weights;
+
+        let mut guard = self.decode.lock().unwrap();
+        let stale = match &*guard {
+            Some(d) => {
+                d.dim != p.dim
+                    || d.n_layers != p.n_layers
+                    || d.vocab != p.vocab_size
+                    || d.seq_len != p.seq_len
+            }
+            None => true,
+        };
+        if stale {
+            *guard = Some(self.build_decode(model));
+        }
+        let d = guard.as_mut().unwrap();
+        let st = &self.stream;
+        let (dim, kv_dim, head_size, hidden) = (d.dim, d.kv_dim, d.head_size, d.hidden);
+        let (n_heads, kv_mul, n_freqs, mscale) = (d.n_heads, d.kv_mul, d.n_freqs, d.mscale);
+        let eps = p.rms_eps;
+
+        // One-time host→device sync of any KV rows a prior prefill filled.
+        if d.kv_filled < pos {
+            for l in 0..d.n_layers {
+                let loff = l * d.seq_len * kv_dim;
+                let (lo, hi) = (loff + d.kv_filled * kv_dim, loff + pos * kv_dim);
+                let off = d.kv_filled * kv_dim;
+                let span = hi - lo;
+                st.memcpy_htod(
+                    &state.key_cache()[lo..hi],
+                    &mut d.key[l].slice_mut(off..off + span),
+                )
+                .expect("upload prefill K");
+                st.memcpy_htod(
+                    &state.value_cache()[lo..hi],
+                    &mut d.value[l].slice_mut(off..off + span),
+                )
+                .expect("upload prefill V");
+            }
+            d.kv_filled = pos;
+        }
+
+        // This token's embedding → resident x.
+        w.token_embedding_table.dequant_row(token, &mut d.embed);
+        st.memcpy_htod(&d.embed, &mut d.x).expect("upload embedding");
+
+        for layer in 0..d.n_layers {
+            // --- Attention (batch-1 GEMVs) ---
+            self.dev_rmsnorm(&mut d.xb, &d.x, &d.rms_att[layer], 1, dim, eps);
+            self.gemm_dev(&mut d.q, &d.xb, &w.wq[layer], 1);
+            self.gemm_dev(&mut d.k_row, &d.xb, &w.wk[layer], 1);
+            self.gemm_dev(&mut d.v_row, &d.xb, &w.wv[layer], 1);
+            self.dev_rope(
+                &mut d.q, &mut d.k_row, &d.inv, 1, pos, head_size, kv_dim, dim, n_freqs, mscale,
+            );
+            // Append this step's K/V to the resident cache at row `pos`.
+            let off = pos * kv_dim;
+            st.memcpy_dtod(&d.k_row, &mut d.key[layer].slice_mut(off..off + kv_dim))
+                .expect("write K");
+            st.memcpy_dtod(&d.v_row, &mut d.value[layer].slice_mut(off..off + kv_dim))
+                .expect("write V");
+            // Attention over cached rows 0..=pos.
+            self.dev_attention(
+                &mut d.xb, &d.q, &d.key[layer], &d.value[layer], 1, pos, n_heads, kv_mul,
+                head_size, pos + 1, kv_dim,
+            );
+            self.gemm_dev(&mut d.xb2, &d.xb, &w.wo[layer], 1);
+            self.dev_add(&mut d.x, &d.xb2, dim);
+
+            // --- Feed-forward (SwiGLU) ---
+            self.dev_rmsnorm(&mut d.xb, &d.x, &d.rms_ffn[layer], 1, dim, eps);
+            self.gemm_dev(&mut d.hb, &d.xb, &w.w1[layer], 1);
+            self.gemm_dev(&mut d.hb2, &d.xb, &w.w3[layer], 1);
+            self.dev_swiglu(&mut d.hb, &d.hb2, hidden);
+            self.gemm_dev(&mut d.xb, &d.hb, &w.w2[layer], 1);
+            self.dev_add(&mut d.x, &d.xb, dim);
+        }
+        d.kv_filled = pos + 1;
+
+        // Final RMSNorm + classifier → logits, downloaded to host `state`.
+        self.dev_rmsnorm(&mut d.xb, &d.x, &d.rms_final, 1, dim, eps);
+        self.gemm_dev(&mut d.logits, &d.xb, &w.wcls, 1);
+        st.synchronize().expect("stream synchronize");
+        let logits_host: Vec<f32> = st.clone_dtoh(&d.logits).expect("download logits");
+        state.logits_mut().copy_from_slice(&logits_host);
     }
 
     /// Resident fused prefill: the whole prompt runs on-device — TF32 GEMMs plus
@@ -952,6 +1133,123 @@ mod tests {
         );
         assert_eq!(argmax(&cuda), argmax(&cpu), "decode top token diverged");
         assert!(rel < 0.1, "decode logits diverged: relative L2 error {rel}");
+    }
+
+    /// Multi-step decode coherence: decode a short sequence one token at a time
+    /// from position 0 (no prefill) on CUDA vs CPU, comparing the logits at every
+    /// step. Exercises the resident `forward_step` KV append across steps (the
+    /// device cache grows by one row per step).
+    #[test]
+    #[ignore = "requires a CUDA device; run with --features cuda -- --ignored --nocapture"]
+    fn decode_multistep_coherent() {
+        let Some(b) = cuda() else { return };
+        let c = crate::Config {
+            dim: 256,
+            hidden_dim: 512,
+            n_layers: 4,
+            n_heads: 8,
+            n_kv_heads: 8,
+            vocab_size: 512,
+            seq_len: 64,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let bytes = crate::dummy::synthetic_gguf_typed(&c, GgmlType::F32);
+        let gguf = crate::Gguf::parse(&bytes).unwrap();
+        let model = crate::Model::from_gguf(&gguf).unwrap();
+        let tokens: Vec<usize> = (0..8).map(|i| (i * 37 + 5) % c.vocab_size).collect();
+
+        let run = |backend: &dyn Backend| {
+            let mut s = crate::RunState::new(&model.config);
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(pos, &tok)| {
+                    backend.forward_step(&model, &mut s, tok, pos);
+                    s.logits().to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        let cuda = run(&b);
+        let cpu = run(&CpuBackend::new());
+
+        for (pos, (cu, cp)) in cuda.iter().zip(&cpu).enumerate() {
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, x| a.1.partial_cmp(x.1).unwrap())
+                    .unwrap()
+                    .0
+            };
+            let num: f32 = cu.iter().zip(cp).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = cp.iter().map(|v| v * v).sum();
+            let rel = (num / den).sqrt();
+            eprintln!("decode step {pos}: argmax cuda={} cpu={}, rel L2 {rel:.4}", argmax(cu), argmax(cp));
+            assert_eq!(argmax(cu), argmax(cp), "step {pos}: top token diverged");
+            assert!(rel < 0.1, "step {pos}: logits diverged: rel L2 {rel}");
+        }
+    }
+
+    /// Decode throughput (`tg128`): CUDA resident `forward_step` vs CPU on the real
+    /// TinyLlama-1.1B Q4_K_M, 128 steps. Compare to
+    /// `llama-bench -m <gguf> -ngl 99` (tg128). Decode is batch-1 GEMV
+    /// (bandwidth-bound). Set `RUSTY_LLAMA_GGUF` to override the path.
+    #[test]
+    #[ignore = "needs the real GGUF + a CUDA device; run with --release --features cuda -- --ignored --nocapture"]
+    fn bench_decode_real_tinyllama() {
+        use std::time::Instant;
+        let Some(b) = cuda() else { return };
+        let path = std::env::var("RUSTY_LLAMA_GGUF")
+            .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string());
+        let cp = match crate::Checkpoint::open(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping real-model decode bench: can't open {path}: {e}");
+                return;
+            }
+        };
+        if !crate::Gguf::is_gguf(cp.bytes()) {
+            eprintln!("skipping real-model decode bench: {path} is not a GGUF");
+            return;
+        }
+        let gguf = crate::Gguf::parse(cp.bytes()).expect("parse gguf");
+        let model = crate::Model::from_gguf(&gguf).expect("build model");
+        let c = &model.config;
+        let steps = 128usize;
+
+        let decode = |backend: &dyn Backend| {
+            let mut s = crate::RunState::new(&model.config);
+            for pos in 0..steps {
+                backend.forward_step(&model, &mut s, (pos * 13 + 1) % c.vocab_size, pos);
+            }
+        };
+
+        // Warm up: build the resident decode state + cache weights on device.
+        {
+            let mut s = crate::RunState::new(&model.config);
+            backend_warmup(&b, &model, &mut s);
+        }
+        let t = Instant::now();
+        decode(&b);
+        let cuda = t.elapsed();
+
+        let cpu_backend = CpuBackend::new();
+        let t = Instant::now();
+        decode(&cpu_backend);
+        let cpu = t.elapsed();
+
+        eprintln!(
+            "real decode {steps} steps: cuda={cuda:?} ({:.0} tok/s) cpu={cpu:?} ({:.0} tok/s) \
+             -> cuda {:.1}x cpu",
+            steps as f64 / cuda.as_secs_f64(),
+            steps as f64 / cpu.as_secs_f64(),
+            cpu.as_secs_f64() / cuda.as_secs_f64(),
+        );
+    }
+
+    /// One decode step to warm the resident state + weight cache before timing.
+    fn backend_warmup(b: &CudaBackend, model: &crate::Model, s: &mut crate::RunState) {
+        b.forward_step(model, s, 1, 0);
     }
 
     /// Prefill throughput: CUDA (cuBLASLt f16) vs CPU on the same shape the wgpu
