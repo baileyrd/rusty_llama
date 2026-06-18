@@ -107,8 +107,25 @@ separable from the CLI but is far below llama.cpp regardless).
 
    Conclusion: the portable coopmat path is a dead end until wgpu wires f16
    16×16 (and naga's WGSL surface matures). The real tensor-core win on this
-   machine needs the **NVIDIA-only CUDA backend** (`mma` / cuBLASLt) — pursued
-   next. `dot4I8Packed` (item 2) is also exhausted.
+   machine needs the **NVIDIA-only CUDA backend** (`mma` / cuBLASLt).
+   `dot4I8Packed` (item 2) is also exhausted.
+
+   **CUDA backend (cudarc + cuBLASLt) — M0 + M1 done, prefill tensor cores
+   live.** A third `Backend` impl (`src/backend/cuda.rs`, behind the `cuda` cargo
+   feature; cudarc `dynamic-loading` so it needs no CUDA libs/nvcc at build time
+   and fails gracefully on a CUDA-less host). The `forward_prefill` matmuls +
+   classifier run on **cuBLASLt f16 tensor cores** (f16 weights cached on-device,
+   f32 accumulate); the other ops still delegate to the CPU. Per-op parity vs the
+   CPU oracle (maxdiff ~5e-3) and an end-to-end prefill coherence check (relative
+   L2 error ~6e-4, top token matches) confirm the column-major `x·Wᵀ` layout.
+   **Measured prefill (synthetic, 256 tok, dim 1024 × 4L, same shape for all
+   three):** CPU ~70 · **wgpu f32 GEMV 533 · CUDA f16 1304 tok/s** — CUDA is
+   **~2.45× wgpu** and **~18× CPU**. Still far under llama.cpp's CUDA prefill
+   (~18.5k on the real Q4_K_M model), because (a) this is synthetic f32, and (b)
+   M1 still round-trips activations to the host per matmul. **Next: M2** — move
+   the elementwise/attention ops onto CUDA and keep activations resident to kill
+   the per-op copies; then re-bench the real TinyLlama Q4_K_M vs `llama-bench`.
+   Decode stays on the CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),

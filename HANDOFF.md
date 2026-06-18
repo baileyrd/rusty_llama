@@ -33,23 +33,25 @@ roadmap this serves.
   Ti (device detected + htod/dtoh round-trip). `cargo test`/`clippy --all-targets`
   clean with and without `--features cuda`.
 
-**Next session → M1: cuBLASLt f16 prefill GEMM** (the ~24× gap, the clearest
-tensor-core win; decode at batch=1 is GEMV/bandwidth-bound and helps less).
-Override `matmul`/`matmul_batch` on `CudaBackend`: dequant each weight to f16
-once + upload/cache (pointer-keyed, like wgpu's `GpuWeight`), convert the f32
-activation tile to f16, run `out(n,oc) = x(n,ic)·Wᵀ` via cuBLASLt (f16 in, f32
-accumulate). Verified API in `src/backend/cuda.rs` and the cudarc source:
-`CudaBlasLT::matmul(cfg: MatmulConfig, a, b, c, bias, act)` is **unsafe**,
-**column-major** (CUDA default — the test swaps A/B args for row-major
-semantics), `Matmul<half::f16>` uses `CUBLAS_COMPUTE_32F`. Gate with per-op
-parity vs `CpuBackend` + e2e coherence; report prefill tok/s (CUDA vs wgpu vs
-CPU) and re-bench vs `llama-bench`. The resident `ctx`/`stream`/`blas` fields are
-`#[allow(dead_code)]` until M1 uses them. `dot4I8Packed` (item 2) is exhausted.
+- **Roadmap #3 — CUDA backend M1 DONE: prefill tensor cores live.**
+  `CudaBackend::matmul`/`matmul_batch` now run on **cuBLASLt f16** (f16 weights
+  cached on-device keyed by data pointer, f32 accumulate); other ops still
+  delegate to CPU. The column-major `out(n,oc)=x(n,ic)·Wᵀ` layout is `transa=true,
+  m=oc, n=rows, k=ic, lda=ldb=ic, ldc=oc, matmul(cfg, a=W, b=X, c=out)` — verified
+  by per-op parity (maxdiff ~5e-3) + e2e prefill coherence (rel L2 ~6e-4, top
+  token matches). **Measured prefill (256 tok, dim 1024 × 4L): CPU ~70 · wgpu 533
+  · CUDA 1304 tok/s** (~2.45× wgpu, ~18× CPU). Benches/tests are ignored
+  (`bench_prefill_cuda_vs_cpu`, `*_parity`, `prefill_coherent_with_cpu`).
 
-CAUTION for M1: the cuBLASLt column-major/leading-dimension layout for `x·Wᵀ` is
-the one fiddly part — nail it down against `src/cublaslt/safe.rs` (the
-`test_matmul_half` test there is a worked f16 example) and let the parity test be
-the guard.
+**Next session → M2: kill the per-op host↔device copies.** M1 is honest but
+leaves throughput on the table — every prefill matmul re-uploads its activation
+tile and reads the result back. Move the elementwise/attention ops
+(rmsnorm/rope/attention/swiglu/add) onto CUDA (cudarc kernels via nvrtc/PTX, or
+hand `.cu`) and keep the activation/KV buffers **resident** across a prefill, so
+a layer runs without host round-trips — mirror the wgpu fused-prefill approach.
+Then **re-bench the real TinyLlama Q4_K_M vs `llama-bench`** (the north-star
+number). Decode stays on CPU/existing paths (batch=1 GEMV is bandwidth-bound).
+`dot4I8Packed` (item 2) and the portable wgpu coopmat path are both exhausted.
 
 ---
 
