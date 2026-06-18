@@ -23,7 +23,7 @@ The roadmap is defined in `PERFORMANCE.md` §"Improvement roadmap". Status:
 | # | Item | Status |
 |---|---|---|
 | 1 | **CPU AVX2 integer quant kernels** | ✅ DONE — `vpmaddubsw`+`vpmaddwd` int8 dot for Q4_K/Q6_K/Q8_0/Q4_0, dispatched VNNI→AVX2→scalar (`src/quant.rs`); +36% CPU decode (36.7→49.8 tok/s), bit-identical to scalar. VNNI path present but **dormant** on the dev box (no AVX-512). NEON still TODO. (`BACKLOG.md` #3) |
-| 2 | **GPU int8 / DP4A decode** | 🟡 PARTIAL — Stage 1 (Q8_0) adopted behind an all-Q8_0 gate (~1.5–1.6×). Stage 2 (Q4_K/Q6_K) built + **bit-exact** but **intentionally not wired**: on bandwidth-bound decode the packed-kquant unpack saves no bytes (~0.94–0.98× Q4_K, ~0.70× Q6_K). Kept behind tests per a pre-agreed kill-criterion. (`02`/`03`/`05`) |
+| 2 | **GPU int8 / DP4A decode** | ✅ (CUDA) / 🟡 (wgpu) — **CUDA packed-weight DP4A GEMV ADOPTED** (Phase 2): warp-cooperative, coalesced Q4_K/Q6_K `__dp4a` decode GEMV (`quantize_q8k` + `gemv_q4_k`/`gemv_q6_k`), default-on, **2.4× decode** (86→207 tok/s on real TinyLlama; plan [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md)). The wgpu Stage-2 stays parked (int8 vs an already-packed dequant GEMV saves no bytes); the CUDA win is real because its baseline was f16. (`02`/`03`/`04`) |
 | 3 | **GPU tensor cores** | ✅ (CUDA) / ❌ (portable) — portable wgpu coopmat **ruled out** on this hardware (advertises only f16 16×16; wgpu 29 wires only 8×8 f32 → silent all-zero garbage). CUDA backend M0→M2b + resident decode **DONE and merged** (PRs #20–#22). Closed PR #23: a naive packed dequant-GEMV was ~1.6× *slower* than f16. (`03`/`04`) |
 | 4 | Flash attention; cache-blocked CPU prefill | ❌ not started |
 | 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 arch breadth SHIPPED**: Qwen2 / Phi-3 / Gemma 2 grown off the `Arch` registry seam (`src/arch.rs`), each greedy-validated vs `llama-cli` (plan [`plans/phase-3-archs.md`](plans/phase-3-archs.md)). Samplers / KV-quant / server still ❌; 3.2 MoE + 3.3 recurrent remain sketches. |
@@ -40,11 +40,12 @@ TinyLlama-1.1B Q4_K_M; Core Ultra 9 285H (AVX2, no AVX-512) + RTX 5070 Ti
 | CPU | decode | 49.8 tok/s | 73.6 | **1.48×** behind |
 | wgpu | decode | 45.9 tok/s | 375.9 (Vulkan) | 8.2× behind |
 | CUDA | prefill (pp512) | ~4,450 tok/s | 19,637 | **~4.4×** behind |
-| CUDA | decode (tg128) | ~123 tok/s | 419 | **~3.4×** behind |
+| CUDA | decode (tg128) | **~207 tok/s** | ~415 | **~2.0×** behind |
 
 Two distinct walls (see `04` and `../Research/03-cuda-kernels.md`):
-- **Decode ~3.4× = weight bandwidth.** Batch-1 GEMV reads each weight once; we
-  stream f16 (~2 B/weight) vs llama.cpp's packed Q4_K (~0.56 B). ≈3.5× ≈ the gap.
+- **Decode ~2× (was ~3.4×) — bandwidth wall closed (Phase 2).** The packed
+  Q4_K/Q6_K `__dp4a` GEMV streams ~0.56 B/weight vs f16's ~2 B — CUDA decode
+  86 → 207 tok/s same-session (2.4×). The residual ~2× is kernel tuning + flash attn.
 - **Prefill ~4.4× = GEMM kernel quality.** cuBLASLt `Matmul<f16>` + our nvrtc
   kernels vs llama.cpp's fused int8 tensor-core MMQ. Now compute-bound (per-op
   overhead already cut), so further gains require beating cuBLASLt.
@@ -104,12 +105,13 @@ than HANDOFF assumed** — llama.cpp's `mmvq` is a concrete, proven design to po
 - **`llama-bench` protocol parity** in the bench harness (already close; `08`).
 - **Embeddings/pooling mode**; **LoRA + control vectors** (GGUF loading exists).
 
-**Tier 2 — the one decode speed lever with a proven ceiling** (`04`, `../Research/03`):
-- **Warp-cooperative, coalesced dequant GEMV (MMVQ-style)**: q8_1 activation
-  quant once/step, `vec_dot_q4_K_q8_1`-style unpack-in-register + DP4A, weights
-  stay packed. The only thing that closes the ~3.5× decode bandwidth gap. The
-  naive version already lost (closed PR #23) — the win needs the warp-cooperative
-  craft. High effort, bounded, proven by llama.cpp's 419 tok/s.
+**Tier 2 — the one decode speed lever — ✅ DONE (Phase 2)** (`04`, `../Research/03`):
+- **Warp-cooperative, coalesced packed-weight DP4A GEMV (MMVQ-style)**:
+  `quantize_q8k` activation quant once/step + `gemv_q4_k`/`gemv_q6_k`
+  unpack-in-register + `__dp4a`, weights stay packed. **Shipped + adopted** —
+  CUDA decode 86 → 207 tok/s (2.4×), closing the bandwidth wall the naive PR #23
+  couldn't, plus 2.2 (device-resident prefill→decode KV handoff). Plan
+  [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md).
 
 **Tier 3 — large capability jumps** (`06`, `../Research/05`,`06`,`08`):
 - Arch registry → Qwen2/Phi-3/Gemma2 (near-Llama) ✅ **done — Phase 3.1** (`plans/phase-3-archs.md`); next MoE/Mamba/RWKV.

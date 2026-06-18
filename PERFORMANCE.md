@@ -179,27 +179,36 @@ separable from the CLI but is far below llama.cpp regardless).
    efficiency** (cuBLASLt + our nvrtc kernels vs llama.cpp's tuned, fused kernels),
    not overhead — further prefill gains are diminishing without beating cuBLASLt.
 
-   **Decode (`tg128`) — CUDA fused decode now live.** `CudaBackend::forward_step`
-   was CPU-delegated; it now runs a **resident single-token decode** (KV cache +
-   activations stay on device across steps, batch-1 GEMVs via the f16 GEMM + the
-   M2 kernels, the prompt's host KV uploaded once on the first step). Measured on
-   the real TinyLlama-1.1B Q4_K_M:
+   **Decode (`tg128`) — packed-weight DP4A GEMV (Phase 2, adopted).**
+   `CudaBackend::forward_step` runs a resident single-token decode (KV cache +
+   activations stay on device across steps). Decode is batch-1 GEMV —
+   bandwidth-bound, every weight read once — so the lever is **weight bytes
+   streamed**. We replaced the f16 cuBLASLt GEMV (~2 B/weight) with a
+   warp-cooperative, **coalesced packed-Q4_K/Q6_K `__dp4a` GEMV** that reads the
+   weights packed (~0.56 B/weight for Q4_K) and dot-products them against an
+   on-device Q8_K-quantized activation (`quantize_q8k` + `gemv_q4_k`/`gemv_q6_k`,
+   mirroring the CPU `vec_dot_q4_k`/`vec_dot_q6_k` oracles at the integer level).
+   Measured on the real TinyLlama-1.1B Q4_K_M (same session,
+   `bench_decode_real_tinyllama`):
 
    | Path | Decode (tg128) | |
    | --- | ---: | --- |
-   | rusty_llama — CPU | ~52 tok/s | — |
-   | rusty_llama — **CUDA (resident, f16)** | **~123 tok/s** | 2.4× CPU |
-   | llama.cpp — CUDA (`llama-bench`) | **419 tok/s** | ~3.4× ahead |
+   | rusty_llama — CPU | ~50 tok/s | — |
+   | rusty_llama — CUDA (resident, **f16** GEMV) | ~86 tok/s | 1.7× CPU |
+   | rusty_llama — **CUDA (resident, packed DP4A)** | **~207 tok/s** | **2.4× over f16** |
+   | llama.cpp — CUDA (`llama-bench`) | ~415 tok/s | ~2.0× ahead |
 
-   Correctness: multi-step decode + prefill→decode coherence vs CPU (rel L2 ≤6e-4
-   per step). The **~3.4× decode gap is weight bandwidth**: decode is batch-1 GEMV
-   (each weight read once, no reuse → bandwidth-bound), and we stream **f16**
-   weights (~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B) — ~3.5×, which roughly
-   *is* the gap. So **quantized-on-device weights / `dot4I8Packed` are the clear
-   high-ROI next lever for decode** (where they pay off, unlike compute-bound
-   prefill). Lower-ROI: keep KV resident across prefill→decode (drop the one-time
-   upload); warp-level / flash attention; a dedicated GEMV kernel vs cuBLASLt at
-   n=1.
+   The per-GEMV microbench (`bench_decode_gemv_quant_vs_f16`) shows **3.5–4.2×**
+   at the decode shapes — the full bandwidth ratio; end-to-end is 2.4× because the
+   non-GEMV ops (attention, rmsnorm, rope, embedding/logits transfers) don't speed
+   up (Amdahl). This is the **inverse** of the wgpu Stage-2 dead-end (item 2):
+   there int8 was compared against an *already-packed* dequant GEMV (same bytes →
+   no bandwidth delta); here the baseline is **f16** weights, so packing is a real
+   ~3.5× saving. Default-on for Q4_K/Q6_K decode; opt out with
+   `RUSTY_LLAMA_CUDA_NO_QGEMV`. Correctness: integer-core parity vs the CPU dot +
+   multi-step / prefill→decode coherence (rel L2 ≤6e-4). **Phase 2.2** also made
+   the prefill→decode KV handoff device-resident (the one-time host round-trip is
+   gone). The residual ~2× to llama.cpp is kernel tuning + flash attention.
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),
