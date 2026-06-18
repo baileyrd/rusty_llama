@@ -26,7 +26,7 @@ The roadmap is defined in `PERFORMANCE.md` §"Improvement roadmap". Status:
 | 2 | **GPU int8 / DP4A decode** | ✅ (CUDA) / 🟡 (wgpu) — **CUDA packed-weight DP4A GEMV ADOPTED** (Phase 2): warp-cooperative, coalesced Q4_K/Q6_K `__dp4a` decode GEMV (`quantize_q8k` + `gemv_q4_k`/`gemv_q6_k`), default-on, **2.4× decode** (86→207 tok/s on real TinyLlama; plan [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md)). The wgpu Stage-2 stays parked (int8 vs an already-packed dequant GEMV saves no bytes); the CUDA win is real because its baseline was f16. (`02`/`03`/`04`) |
 | 3 | **GPU tensor cores** | ✅ (CUDA) / ❌ (portable) — portable wgpu coopmat **ruled out** on this hardware (advertises only f16 16×16; wgpu 29 wires only 8×8 f32 → silent all-zero garbage). CUDA backend M0→M2b + resident decode **DONE and merged** (PRs #20–#22). Closed PR #23: a naive packed dequant-GEMV was ~1.6× *slower* than f16. (`03`/`04`) |
 | 4 | Flash attention; cache-blocked CPU prefill | ❌ not started |
-| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 arch breadth SHIPPED**: Qwen2 / Phi-3 / Gemma 2 grown off the `Arch` registry seam (`src/arch.rs`), each greedy-validated vs `llama-cli` (plan [`plans/phase-3-archs.md`](plans/phase-3-archs.md)). Samplers / KV-quant / server still ❌; 3.2 MoE + 3.3 recurrent remain sketches. |
+| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 arch breadth** (Qwen2/Phi-3/Gemma 2 off the `Arch` seam, greedy-validated vs `llama-cli`; [`plans/phase-3-archs.md`](plans/phase-3-archs.md)) **+ Phase 4.1 server SHIPPED**: OpenAI-compatible HTTP server (`src/server.rs`, `server` feature) — `/v1/chat/completions` + `/v1/completions`, streaming SSE, single-sequence ([`plans/phase-4-server.md`](plans/phase-4-server.md)). KV-quant ❌; 4.2 batching + 4.3 paged KV, 3.2 MoE, 3.3 recurrent remain. |
 
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ than HANDOFF assumed** — llama.cpp's `mmvq` is a concrete, proven design to po
 
 **Tier 3 — large capability jumps** (`06`, `../Research/05`,`06`,`08`):
 - Arch registry → Qwen2/Phi-3/Gemma2 (near-Llama) ✅ **done — Phase 3.1** (`plans/phase-3-archs.md`); next MoE/Mamba/RWKV.
-- Paged multi-sequence KV → continuous batching → minimal server.
+- Paged multi-sequence KV → continuous batching → minimal server: **4.1 server done** (single-seq, `plans/phase-4-server.md`); 4.2 batching + 4.3 paged KV remain.
 - GBNF grammar / JSON-schema structured output (needs the Tier-1 sampler layer).
 
 **Tier 4 — defer / proven dead-ends:**

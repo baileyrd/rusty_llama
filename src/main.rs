@@ -48,6 +48,9 @@ Options:
   --lora-scale <float>    LoRA strength multiplier         (default: 1.0)
   --control-vector <path> apply a control-vector GGUF
   --control-vector-scale <float>  control-vector strength      (default: 1.0)
+  --serve                 run an OpenAI-compatible HTTP server (needs --features server)
+  --host <addr>           server bind address       (default: 127.0.0.1)
+  --port <int>            server port               (default: 8080)
   -h            show this help";
 
 struct Args {
@@ -75,6 +78,9 @@ struct Args {
     lora_scale: f32,
     control_vector: String,
     control_vector_scale: f32,
+    serve: bool,
+    host: String,
+    port: u16,
 }
 
 fn main() -> ExitCode {
@@ -89,6 +95,21 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
+    if args.serve {
+        #[cfg(feature = "server")]
+        {
+            let ct = (!args.chat_template.is_empty()).then_some(args.chat_template.as_str());
+            return rusty_llama::serve(&args.checkpoint, &args.backend, &args.host, args.port, ct);
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            return Err(format!(
+                "built without server support (would serve {}:{}); rebuild with `--features server`",
+                args.host, args.port
+            )
+            .into());
+        }
+    }
     let checkpoint = Checkpoint::open(&args.checkpoint)
         .map_err(|e| format!("failed to open checkpoint '{}': {e}", args.checkpoint))?;
 
@@ -394,6 +415,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         lora_scale: 1.0,
         control_vector: String::new(),
         control_vector_scale: 1.0,
+        serve: false,
+        host: "127.0.0.1".to_string(),
+        port: 8080,
     };
 
     let rest: Vec<String> = raw.collect();
@@ -407,6 +431,11 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         }
         if flag == "--chat" {
             args.chat = true;
+            i += 1;
+            continue;
+        }
+        if flag == "--serve" {
+            args.serve = true;
             i += 1;
             continue;
         }
@@ -436,6 +465,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--lora-scale" => args.lora_scale = value()?.parse()?,
             "--control-vector" => args.control_vector = value()?.clone(),
             "--control-vector-scale" => args.control_vector_scale = value()?.parse()?,
+            "--host" => args.host = value()?.clone(),
+            "--port" => args.port = value()?.parse()?,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
