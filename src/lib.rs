@@ -35,12 +35,15 @@ pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
 
+#[cfg(feature = "server")]
+pub mod server;
+
 mod loader;
 
 #[cfg(test)]
 mod bench_util;
 
-pub use backend::{Backend, CpuBackend};
+pub use backend::{make_backend, Backend, CpuBackend};
 pub use arch::Arch;
 #[cfg(feature = "cuda")]
 pub use backend::CudaBackend;
@@ -60,3 +63,5 @@ pub use quant::GgmlType;
 pub use sampler::{SamplerChain, SamplerConfig};
 pub use tensor::QMatrix;
 pub use tokenizer::Tokenizer;
+#[cfg(feature = "server")]
+pub use server::serve;

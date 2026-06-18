@@ -258,3 +258,38 @@ pub trait Backend: Send + Sync {
         crate::model::forward_prefill(model, state, self, tokens, pos_base);
     }
 }
+
+/// Construct the compute backend named `name` (`"cpu"` | `"gpu"` | `"cuda"`).
+///
+/// `gpu`/`cuda` require their cargo features; without them this returns a clear
+/// error rather than silently falling back. Shared by the CLI and the server.
+pub fn make_backend(name: &str) -> Result<Box<dyn Backend>, String> {
+    match name {
+        "cpu" => Ok(Box::new(CpuBackend::new())),
+        "gpu" => {
+            #[cfg(feature = "gpu")]
+            {
+                Ok(Box::new(
+                    GpuBackend::new().map_err(|e| format!("GPU backend unavailable: {e}"))?,
+                ))
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                Err("built without GPU support; rebuild with `--features gpu`".into())
+            }
+        }
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                Ok(Box::new(
+                    CudaBackend::new().map_err(|e| format!("CUDA backend unavailable: {e}"))?,
+                ))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err("built without CUDA support; rebuild with `--features cuda`".into())
+            }
+        }
+        other => Err(format!("unknown backend '{other}' (have cpu/gpu/cuda)")),
+    }
+}
