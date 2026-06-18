@@ -527,13 +527,6 @@ impl KvCache {
         &self.v
     }
 
-    /// Write a resident prefill's computed K/V back into the host cache at flat
-    /// offset `loff` (the layer base).
-    #[cfg(feature = "cuda")]
-    fn store_at(&mut self, loff: usize, k: &[f32], v: &[f32]) {
-        self.k[loff..loff + k.len()].copy_from_slice(k);
-        self.v[loff..loff + v.len()].copy_from_slice(v);
-    }
 }
 
 /// Mutable scratch space reused across forward passes, including the KV cache.
@@ -593,14 +586,6 @@ impl RunState {
         self.kv.all_v()
     }
 
-    /// Write the K/V a resident fused prefill computed on-device into the host
-    /// KV cache, starting at flat offset `loff` (the layer's base). Used by the
-    /// CUDA backend so subsequent CPU [`forward_step`] decode reads the prompt's
-    /// cached keys/values. `k`/`v` are the layer's contiguous prompt rows.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn store_prefill_kv(&mut self, loff: usize, k: &[f32], v: &[f32]) {
-        self.kv.store_at(loff, k, v);
-    }
 }
 
 /// Run one transformer step for `token` at position `pos`.
