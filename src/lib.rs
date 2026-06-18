@@ -51,7 +51,7 @@ pub use error::{Error, Result};
 pub use gguf::Gguf;
 pub use loader::Checkpoint;
 pub use chat::{ChatTemplate, Message, Role};
-pub use adapter::{LoraAdapter, LoraBackend};
+pub use adapter::{AdapterBackend, ControlVector, LoraAdapter};
 pub use model::{
     forward, forward_embed, forward_prefill, generate, generate_tokens, Model, Pooling, RunState,
     Weights,

@@ -389,3 +389,122 @@ fn build_gguf(
     out.buf.extend_from_slice(&data);
     out.buf
 }
+
+/// A synthetic LoRA adapter GGUF targeting `targets` (`(base_name, out, in)`),
+/// each as an `(A, B)` pair at `rank` with scaling `alpha`. Tensors are F32.
+/// When `corrupt`, the first target's `lora_b` is emitted with a mismatched rank
+/// so [`crate::adapter::LoraAdapter::from_gguf`] rejects it.
+pub fn synthetic_lora_gguf(
+    targets: &[(&str, usize, usize)],
+    rank: usize,
+    alpha: f32,
+    corrupt: bool,
+) -> Vec<u8> {
+    // (name, ggml dims) in file order. ggml dims are [cols, rows] (input first):
+    // A is (rank, in) -> [in, rank]; B is (out, rank) -> [rank, out].
+    let mut tensors: Vec<(String, Vec<u64>)> = Vec::new();
+    for (i, &(name, out, inf)) in targets.iter().enumerate() {
+        tensors.push((format!("{name}.lora_a"), vec![inf as u64, rank as u64]));
+        let b_rank = if corrupt && i == 0 { rank + 1 } else { rank };
+        tensors.push((format!("{name}.lora_b"), vec![b_rank as u64, out as u64]));
+    }
+
+    // Deterministic small F32 data, each tensor aligned.
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut rng = 0xD1B5_4A32_D192_ED03u64 ^ tensors.len() as u64;
+    for (_, dims) in &tensors {
+        let n: usize = dims.iter().product::<u64>() as usize;
+        let mut bytes = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            let u = (rng.wrapping_mul(0x2545F491_4F6CDD1D) >> 40) as u32;
+            let v = (u as f32 / (1u32 << 24) as f32 - 0.5) * 0.2;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let off = data.len().next_multiple_of(GGUF_ALIGNMENT);
+        data.resize(off, 0);
+        offsets.push(off as u64);
+        data.extend_from_slice(&bytes);
+    }
+
+    let mut meta = GgufWriter::default();
+    meta.kv_str("general.architecture", "llama");
+    meta.kv_str("general.type", "adapter");
+    meta.kv_str("adapter.type", "lora");
+    meta.kv_u32("general.alignment", GGUF_ALIGNMENT as u32);
+    meta.kv_f32("adapter.lora.alpha", alpha);
+
+    let mut tinfo = GgufWriter::default();
+    for ((name, dims), off) in tensors.iter().zip(&offsets) {
+        tinfo.raw_str(name.as_bytes());
+        tinfo.u32(dims.len() as u32);
+        for &d in dims {
+            tinfo.u64(d);
+        }
+        tinfo.u32(GgmlType::F32.to_u32());
+        tinfo.u64(*off);
+    }
+
+    let mut out = GgufWriter::default();
+    out.buf.extend_from_slice(b"GGUF");
+    out.u32(3);
+    out.u64(tensors.len() as u64);
+    out.u64(meta.kv_count);
+    out.buf.extend_from_slice(&meta.buf);
+    out.buf.extend_from_slice(&tinfo.buf);
+    let padded = out.buf.len().next_multiple_of(GGUF_ALIGNMENT);
+    out.buf.resize(padded, 0);
+    out.buf.extend_from_slice(&data);
+    out.buf
+}
+
+/// A synthetic control-vector GGUF with a constant F32 `direction.{l}` tensor
+/// (length `dim`, all `fill`) for each layer index in `layers`.
+pub fn synthetic_control_vector_gguf(dim: usize, layers: &[usize], fill: f32) -> Vec<u8> {
+    let tensors: Vec<(String, Vec<u64>)> = layers
+        .iter()
+        .map(|&l| (format!("direction.{l}"), vec![dim as u64]))
+        .collect();
+
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(tensors.len());
+    for _ in &tensors {
+        let off = data.len().next_multiple_of(GGUF_ALIGNMENT);
+        data.resize(off, 0);
+        offsets.push(off as u64);
+        for _ in 0..dim {
+            data.extend_from_slice(&fill.to_le_bytes());
+        }
+    }
+
+    let mut meta = GgufWriter::default();
+    meta.kv_str("general.architecture", "llama");
+    meta.kv_str("general.type", "controlvector");
+    meta.kv_u32("general.alignment", GGUF_ALIGNMENT as u32);
+
+    let mut tinfo = GgufWriter::default();
+    for ((name, dims), off) in tensors.iter().zip(&offsets) {
+        tinfo.raw_str(name.as_bytes());
+        tinfo.u32(dims.len() as u32);
+        for &d in dims {
+            tinfo.u64(d);
+        }
+        tinfo.u32(GgmlType::F32.to_u32());
+        tinfo.u64(*off);
+    }
+
+    let mut out = GgufWriter::default();
+    out.buf.extend_from_slice(b"GGUF");
+    out.u32(3);
+    out.u64(tensors.len() as u64);
+    out.u64(meta.kv_count);
+    out.buf.extend_from_slice(&meta.buf);
+    out.buf.extend_from_slice(&tinfo.buf);
+    let padded = out.buf.len().next_multiple_of(GGUF_ALIGNMENT);
+    out.buf.resize(padded, 0);
+    out.buf.extend_from_slice(&data);
+    out.buf
+}

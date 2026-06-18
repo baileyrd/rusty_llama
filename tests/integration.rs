@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use rusty_llama::dummy::{dummy_tokenizer, synthetic_checkpoint};
 use rusty_llama::{
-    forward, forward_embed, generate, Checkpoint, Config, CpuBackend, Pooling, RunState,
-    SamplerChain,
+    forward, forward_embed, generate, AdapterBackend, Backend, Checkpoint, Config, ControlVector,
+    CpuBackend, Pooling, RunState, SamplerChain,
 };
 
 /// A small but non-trivial config (grouped-query attention: 4 q heads, 2 kv).
@@ -187,5 +187,39 @@ fn embed_pooling_variants_differ() {
     assert_ne!(mean, last);
     assert_ne!(mean, cls);
     assert_ne!(last, cls);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn control_vector_shifts_logits() {
+    let config = test_config();
+    let (cp, path) = mapped_checkpoint(&config, "ctrlvec");
+    let model = cp.model().unwrap();
+    let cpu = CpuBackend::new();
+    let dim = config.dim;
+
+    // Baseline: one plain decode step.
+    let mut s0 = RunState::new(&config);
+    forward(&model, &mut s0, &cpu, 1, 0);
+    let plain = s0.logits().to_vec();
+
+    // A control vector steering layer 1 must change the output.
+    let mut dirs = vec![None; config.n_layers];
+    dirs[1] = Some(vec![0.5f32; dim]);
+    let cv = ControlVector::from_dirs(dirs, 1.0);
+    let ab = AdapterBackend::new(&cpu, None, Some(&cv));
+    let mut s1 = RunState::new(&config);
+    ab.forward_step(&model, &mut s1, 1, 0);
+    assert_ne!(plain, s1.logits().to_vec(), "control vector must change logits");
+
+    // scale = 0 ⇒ byte-identical to the baseline.
+    let mut dirs0 = vec![None; config.n_layers];
+    dirs0[1] = Some(vec![0.5f32; dim]);
+    let cv0 = ControlVector::from_dirs(dirs0, 0.0);
+    let ab0 = AdapterBackend::new(&cpu, None, Some(&cv0));
+    let mut s2 = RunState::new(&config);
+    ab0.forward_step(&model, &mut s2, 1, 0);
+    assert_eq!(plain, s2.logits(), "scale 0 ⇒ no-op");
+
     let _ = std::fs::remove_file(path);
 }

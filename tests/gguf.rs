@@ -2,12 +2,13 @@
 //! weights/tokenizer, and run the forward pass.
 
 use rusty_llama::dummy::{
-    synthetic_gguf, synthetic_gguf_gpt2, synthetic_gguf_gpt2_special, synthetic_gguf_typed,
+    synthetic_control_vector_gguf, synthetic_gguf, synthetic_gguf_gpt2, synthetic_gguf_gpt2_special,
+    synthetic_gguf_typed, synthetic_lora_gguf,
 };
 use rusty_llama::quant::dequantize;
 use rusty_llama::{
-    forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RopeScaling, RunState, SamplerChain,
-    Tokenizer,
+    forward, generate, Config, ControlVector, CpuBackend, GgmlType, Gguf, LoraAdapter, Model,
+    RopeScaling, RunState, SamplerChain, Tokenizer,
 };
 
 fn cfg() -> Config {
@@ -304,4 +305,66 @@ fn q8_0_forward_approximates_f32() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(max_diff < 0.05, "Q8_0 logits diverge from f32 by {max_diff}");
+}
+
+#[test]
+fn lora_adapter_loads_from_gguf() {
+    let c = cfg();
+    let mb = synthetic_gguf(&c);
+    let mg = Gguf::parse(&mb).unwrap();
+    let model = Model::from_gguf(&mg).unwrap();
+
+    let kv_dim = c.n_kv_heads * (c.dim / c.n_heads);
+    let targets = [
+        ("blk.0.attn_q.weight", c.dim, c.dim),
+        ("blk.1.ffn_gate.weight", c.hidden_dim, c.dim),
+        ("blk.0.attn_v.weight", kv_dim, c.dim),
+    ];
+    let ab = synthetic_lora_gguf(&targets, 4, 16.0, false);
+    let ag = Gguf::parse(&ab).unwrap();
+    LoraAdapter::from_gguf(&ag, &model, 1.0).expect("valid LoRA adapter should load");
+}
+
+#[test]
+fn lora_adapter_rejects_shape_mismatch() {
+    let c = cfg();
+    let mb = synthetic_gguf(&c);
+    let mg = Gguf::parse(&mb).unwrap();
+    let model = Model::from_gguf(&mg).unwrap();
+    let targets = [("blk.0.attn_q.weight", c.dim, c.dim)];
+    let bad = synthetic_lora_gguf(&targets, 4, 16.0, true); // mismatched lora_b rank
+    let bg = Gguf::parse(&bad).unwrap();
+    assert!(LoraAdapter::from_gguf(&bg, &model, 1.0).is_err());
+}
+
+#[test]
+fn lora_from_gguf_rejects_non_adapter() {
+    // A plain model GGUF has no `adapter.type` ⇒ rejected.
+    let c = cfg();
+    let mb = synthetic_gguf(&c);
+    let mg = Gguf::parse(&mb).unwrap();
+    let model = Model::from_gguf(&mg).unwrap();
+    assert!(LoraAdapter::from_gguf(&mg, &model, 1.0).is_err());
+}
+
+#[test]
+fn control_vector_loads_from_gguf() {
+    let c = cfg();
+    let mb = synthetic_gguf(&c);
+    let mg = Gguf::parse(&mb).unwrap();
+    let model = Model::from_gguf(&mg).unwrap();
+    let cvb = synthetic_control_vector_gguf(c.dim, &[1], 0.5);
+    let cvg = Gguf::parse(&cvb).unwrap();
+    ControlVector::from_gguf(&cvg, &model, 1.0).expect("control vector should load");
+}
+
+#[test]
+fn control_vector_rejects_out_of_range_layer() {
+    let c = cfg();
+    let mb = synthetic_gguf(&c);
+    let mg = Gguf::parse(&mb).unwrap();
+    let model = Model::from_gguf(&mg).unwrap();
+    let cvb = synthetic_control_vector_gguf(c.dim, &[c.n_layers], 0.5); // layer == n_layers (OOB)
+    let cvg = Gguf::parse(&cvb).unwrap();
+    assert!(ControlVector::from_gguf(&cvg, &model, 1.0).is_err());
 }

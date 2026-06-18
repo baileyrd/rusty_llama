@@ -20,6 +20,7 @@ use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 use crate::model::{qmatrix_from_gguf, Model, RunState};
+use crate::quant::GgmlType;
 use crate::tensor::QMatrix;
 
 /// One LoRA low-rank pair: `a` is `(rank, in)`, `b` is `(out, rank)`.
@@ -158,29 +159,110 @@ fn base_weight<'m>(model: &'m Model, name: &str) -> Option<&'m QMatrix<'m>> {
     mats.get(l)
 }
 
-/// A [`Backend`] that injects a [`LoraAdapter`] after every base `matmul`. All
-/// other ops delegate to `inner`; `forward_step` runs the per-op
-/// [`crate::model::forward`] through `self`, so the resident fused decode is
-/// bypassed (the per-op fallback under an adapter) while LoRA applies everywhere.
-pub struct LoraBackend<'a> {
-    inner: &'a dyn Backend,
-    adapter: &'a LoraAdapter<'a>,
+/// A control vector: a per-layer steering direction added to the residual stream
+/// (`x += scale · dir[layer]`). `dirs[layer]` is `None` when a layer has no
+/// steering (layer 0 conventionally never does). Applied by the per-op forward
+/// via [`AdapterBackend`].
+pub struct ControlVector {
+    dirs: Vec<Option<Vec<f32>>>,
+    scale: f32,
 }
 
-impl<'a> LoraBackend<'a> {
-    pub fn new(inner: &'a dyn Backend, adapter: &'a LoraAdapter<'a>) -> Self {
-        LoraBackend { inner, adapter }
+impl ControlVector {
+    /// Build from per-layer directions (`dirs[layer]`, `None` = no steer).
+    pub fn from_dirs(dirs: Vec<Option<Vec<f32>>>, scale: f32) -> Self {
+        ControlVector { dirs, scale }
+    }
+
+    /// Load from a control-vector GGUF: one F32 `direction.{l}` tensor of length
+    /// `dim` per steered (0-based) layer `l`. Validates lengths and layer indices.
+    pub fn from_gguf(gguf: &Gguf, model: &Model, scale: f32) -> Result<Self> {
+        let n_layers = model.config.n_layers;
+        let dim = model.config.dim;
+        let mut dirs: Vec<Option<Vec<f32>>> = vec![None; n_layers];
+        let mut any = false;
+        for info in &gguf.tensors {
+            let Some(idx) = info.name.strip_prefix("direction.") else {
+                continue;
+            };
+            let l: usize = idx.parse().map_err(|_| {
+                Error::Format(format!("bad control-vector tensor name '{}'", info.name))
+            })?;
+            if l >= n_layers {
+                return Err(Error::Format(format!(
+                    "control-vector layer {l} out of range (n_layers = {n_layers})"
+                )));
+            }
+            if info.ggml_type != GgmlType::F32 {
+                return Err(Error::Format(format!(
+                    "control-vector '{}' must be F32",
+                    info.name
+                )));
+            }
+            let bytes = gguf.tensor_bytes(info)?;
+            if bytes.len() < dim * 4 {
+                return Err(Error::Format(format!(
+                    "control-vector '{}' too short: need {} bytes",
+                    info.name,
+                    dim * 4
+                )));
+            }
+            let v: Vec<f32> = bytes[..dim * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            dirs[l] = Some(v);
+            any = true;
+        }
+        if !any {
+            return Err(Error::Format(
+                "control vector has no direction.* tensors".into(),
+            ));
+        }
+        Ok(ControlVector { dirs, scale })
+    }
+
+    /// Add this layer's scaled direction to one residual vector `x` (length dim).
+    pub(crate) fn apply_layer(&self, layer: usize, x: &mut [f32]) {
+        if let Some(Some(dir)) = self.dirs.get(layer) {
+            for (xi, di) in x.iter_mut().zip(dir) {
+                *xi += self.scale * *di;
+            }
+        }
     }
 }
 
-impl Backend for LoraBackend<'_> {
+/// A [`Backend`] that injects optional LoRA + control-vector adapters. LoRA is
+/// added after every base `matmul` (keyed by weight pointer); the control vector
+/// is applied per layer inside the per-op forward. `forward_step`/`forward_prefill`
+/// run the per-op path through `self`, so the resident fused decode is bypassed
+/// (the per-op fallback under an adapter) and both adapters apply on every backend.
+pub struct AdapterBackend<'a> {
+    inner: &'a dyn Backend,
+    lora: Option<&'a LoraAdapter<'a>>,
+    control: Option<&'a ControlVector>,
+}
+
+impl<'a> AdapterBackend<'a> {
+    pub fn new(
+        inner: &'a dyn Backend,
+        lora: Option<&'a LoraAdapter<'a>>,
+        control: Option<&'a ControlVector>,
+    ) -> Self {
+        AdapterBackend { inner, lora, control }
+    }
+}
+
+impl Backend for AdapterBackend<'_> {
     fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
         self.inner.rmsnorm(out, x, weight, eps);
     }
 
     fn matmul(&self, out: &mut [f32], x: &[f32], w: &QMatrix) {
         self.inner.matmul(out, x, w);
-        self.adapter.apply(self.inner, out, x, w);
+        if let Some(lora) = self.lora {
+            lora.apply(self.inner, out, x, w);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -228,9 +310,19 @@ impl Backend for LoraBackend<'_> {
     }
 
     fn forward_step(&self, model: &Model, state: &mut RunState, token: usize, pos: usize) {
-        // Per-op path through `self` ⇒ LoRA applies and the resident fused decode
-        // (an `inner` override) is bypassed.
-        crate::model::forward(model, state, self, token, pos);
+        // Per-op path through `self` ⇒ adapters apply and the resident fused
+        // decode (an `inner` override) is bypassed.
+        crate::model::forward_with(model, state, self, token, pos, self.control);
+    }
+
+    fn forward_prefill(
+        &self,
+        model: &Model,
+        state: &mut RunState,
+        tokens: &[usize],
+        pos_base: usize,
+    ) {
+        crate::model::forward_prefill_with(model, state, self, tokens, pos_base, self.control);
     }
 }
 
@@ -279,7 +371,7 @@ mod tests {
         let adapter = LoraAdapter::from_pairs(pairs, alpha, scale);
 
         let cpu = CpuBackend::new();
-        let lora = LoraBackend::new(&cpu, &adapter);
+        let lora = AdapterBackend::new(&cpu, Some(&adapter), None);
         let mut out_lora = vec![0.0f32; out];
         lora.matmul(&mut out_lora, &x, &base);
         let mut out_ref = vec![0.0f32; out];
@@ -302,7 +394,7 @@ mod tests {
         );
         let adapter = LoraAdapter::from_pairs(pairs, 8.0, 0.0); // user_scale = 0
         let cpu = CpuBackend::new();
-        let lora = LoraBackend::new(&cpu, &adapter);
+        let lora = AdapterBackend::new(&cpu, Some(&adapter), None);
         let x = vec![1.0f32, -1.0, 0.5];
         let mut with = vec![0.0f32; 2];
         let mut without = vec![0.0f32; 2];
@@ -325,12 +417,32 @@ mod tests {
         );
         let adapter = LoraAdapter::from_pairs(pairs, 1.0, 1.0);
         let cpu = CpuBackend::new();
-        let lora = LoraBackend::new(&cpu, &adapter);
+        let lora = AdapterBackend::new(&cpu, Some(&adapter), None);
         let x = vec![3.0f32, 4.0];
         let mut lo = vec![0.0f32; 2];
         let mut co = vec![0.0f32; 2];
         lora.matmul(&mut lo, &x, &other); // 'other' has no pair
         cpu.matmul(&mut co, &x, &other);
         assert_eq!(lo, co);
+    }
+
+    #[test]
+    fn control_vector_adds_scaled_direction() {
+        let cv = ControlVector::from_dirs(vec![None, Some(vec![1.0, 2.0, 3.0])], 0.5);
+        let mut x = vec![10.0f32, 10.0, 10.0];
+        cv.apply_layer(0, &mut x); // layer 0 -> None -> unchanged
+        assert_eq!(x, vec![10.0, 10.0, 10.0]);
+        cv.apply_layer(1, &mut x); // += 0.5 * [1,2,3]
+        assert_eq!(x, vec![10.5, 11.0, 11.5]);
+        cv.apply_layer(9, &mut x); // out of range -> unchanged
+        assert_eq!(x, vec![10.5, 11.0, 11.5]);
+    }
+
+    #[test]
+    fn control_vector_scale_zero_is_noop() {
+        let cv = ControlVector::from_dirs(vec![None, Some(vec![5.0, -5.0])], 0.0);
+        let mut x = vec![1.0f32, 2.0];
+        cv.apply_layer(1, &mut x);
+        assert_eq!(x, vec![1.0, 2.0]);
     }
 }

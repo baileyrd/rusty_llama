@@ -16,8 +16,9 @@ use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_llama::{
-    forward_embed, generate_tokens, Backend, ChatTemplate, Checkpoint, CpuBackend, Gguf, LoraAdapter,
-    LoraBackend, Message, Model, Pooling, Role, RunState, SamplerChain, SamplerConfig, Tokenizer,
+    forward_embed, generate_tokens, AdapterBackend, Backend, ChatTemplate, Checkpoint, ControlVector,
+    CpuBackend, Gguf, LoraAdapter, Message, Model, Pooling, Role, RunState, SamplerChain,
+    SamplerConfig, Tokenizer,
 };
 
 const USAGE: &str = "\
@@ -45,6 +46,8 @@ Options:
   --chat-template <name>  chatml|llama3|qwen2 (default: auto-detect)
   --lora <path>           apply a LoRA adapter GGUF
   --lora-scale <float>    LoRA strength multiplier         (default: 1.0)
+  --control-vector <path> apply a control-vector GGUF
+  --control-vector-scale <float>  control-vector strength      (default: 1.0)
   -h            show this help";
 
 struct Args {
@@ -70,6 +73,8 @@ struct Args {
     chat_template: String,
     lora: String,
     lora_scale: f32,
+    control_vector: String,
+    control_vector_scale: f32,
 }
 
 fn main() -> ExitCode {
@@ -221,9 +226,9 @@ fn stream_generation(
     }
     let backend = make_backend(&args.backend)?;
 
-    // Optional LoRA adapter: load its GGUF, build it against this model, and wrap
-    // the backend. Binding an adapter falls back to the per-op path (LoRA applies
-    // on every backend; the fused resident decode is bypassed).
+    // Optional adapters: LoRA + control vector, each from its own GGUF, matched
+    // against this model. Binding either falls back to the per-op path (adapters
+    // apply on every backend; the fused resident decode is bypassed).
     let lora_cp = if args.lora.is_empty() {
         None
     } else {
@@ -236,15 +241,37 @@ fn stream_generation(
         Some(cp) => Some(Gguf::parse(cp.bytes())?),
         None => None,
     };
-    let lora_adapter = match &lora_gguf {
+    let lora = match &lora_gguf {
         Some(g) => Some(LoraAdapter::from_gguf(g, model, args.lora_scale)?),
         None => None,
     };
-    let lora_backend = lora_adapter
-        .as_ref()
-        .map(|a| LoraBackend::new(backend.as_ref(), a));
-    let active: &dyn Backend = match &lora_backend {
-        Some(lb) => lb,
+    let cv_cp = if args.control_vector.is_empty() {
+        None
+    } else {
+        Some(
+            Checkpoint::open(&args.control_vector)
+                .map_err(|e| format!("failed to open control vector '{}': {e}", args.control_vector))?,
+        )
+    };
+    let cv_gguf = match &cv_cp {
+        Some(cp) => Some(Gguf::parse(cp.bytes())?),
+        None => None,
+    };
+    let control = match &cv_gguf {
+        Some(g) => Some(ControlVector::from_gguf(g, model, args.control_vector_scale)?),
+        None => None,
+    };
+    let adapter_backend = if lora.is_some() || control.is_some() {
+        Some(AdapterBackend::new(
+            backend.as_ref(),
+            lora.as_ref(),
+            control.as_ref(),
+        ))
+    } else {
+        None
+    };
+    let active: &dyn Backend = match &adapter_backend {
+        Some(ab) => ab,
         None => backend.as_ref(),
     };
 
@@ -364,6 +391,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         chat_template: String::new(),
         lora: String::new(),
         lora_scale: 1.0,
+        control_vector: String::new(),
+        control_vector_scale: 1.0,
     };
 
     let rest: Vec<String> = raw.collect();
@@ -404,6 +433,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--chat-template" => args.chat_template = value()?.clone(),
             "--lora" => args.lora = value()?.clone(),
             "--lora-scale" => args.lora_scale = value()?.parse()?,
+            "--control-vector" => args.control_vector = value()?.clone(),
+            "--control-vector-scale" => args.control_vector_scale = value()?.parse()?,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
