@@ -23,14 +23,33 @@ roadmap this serves.
   correctness failure → dead end until wgpu wires f16 16×16. Full write-up in
   `PERFORMANCE.md` item 3.
 
-**Next session → build the NVIDIA-only CUDA backend** (`mma` / cuBLASLt) — the
-pre-agreed fallback and where ~80% of the GPU gap lives. Start with **prefill
-GEMM** (the ~24× gap, the clearest tensor-core win; decode at batch=1 is
-GEMV/bandwidth-bound and helps less). CUDA 13.3 toolkit is installed. Open
-question to settle first: FFI strategy (`cudarc` crate vs hand-rolled
-`build.rs` + `cc`/`nvcc`), behind a new `cuda` cargo feature, kept off by
-default so the portable wgpu/CPU build stays dependency-light. `dot4I8Packed`
-(item 2) is also exhausted.
+- **Roadmap #3 (tensor cores) — CUDA backend M0 DONE.** FFI decision settled:
+  **cudarc 0.19** (dynamic-loading — no CUDA libs/nvcc at build time). A third
+  `Backend` impl `CudaBackend` lives in `src/backend/cuda.rs` behind a new `cuda`
+  cargo feature (off by default, NVIDIA-only). M0 = device + cuBLASLt handle init
+  with a graceful no-CUDA fallback (gated on `cudarc::driver::sys::is_culib_present`
+  because `CudaContext::new` *panics* on a CUDA-less host), all ops delegated to
+  `CpuBackend` for now. `--backend cuda` wired; smoke test passes on the RTX 5070
+  Ti (device detected + htod/dtoh round-trip). `cargo test`/`clippy --all-targets`
+  clean with and without `--features cuda`.
+
+**Next session → M1: cuBLASLt f16 prefill GEMM** (the ~24× gap, the clearest
+tensor-core win; decode at batch=1 is GEMV/bandwidth-bound and helps less).
+Override `matmul`/`matmul_batch` on `CudaBackend`: dequant each weight to f16
+once + upload/cache (pointer-keyed, like wgpu's `GpuWeight`), convert the f32
+activation tile to f16, run `out(n,oc) = x(n,ic)·Wᵀ` via cuBLASLt (f16 in, f32
+accumulate). Verified API in `src/backend/cuda.rs` and the cudarc source:
+`CudaBlasLT::matmul(cfg: MatmulConfig, a, b, c, bias, act)` is **unsafe**,
+**column-major** (CUDA default — the test swaps A/B args for row-major
+semantics), `Matmul<half::f16>` uses `CUBLAS_COMPUTE_32F`. Gate with per-op
+parity vs `CpuBackend` + e2e coherence; report prefill tok/s (CUDA vs wgpu vs
+CPU) and re-bench vs `llama-bench`. The resident `ctx`/`stream`/`blas` fields are
+`#[allow(dead_code)]` until M1 uses them. `dot4I8Packed` (item 2) is exhausted.
+
+CAUTION for M1: the cuBLASLt column-major/leading-dimension layout for `x·Wᵀ` is
+the one fiddly part — nail it down against `src/cublaslt/safe.rs` (the
+`test_matmul_half` test there is a worked f16 example) and let the parity test be
+the guard.
 
 ---
 
