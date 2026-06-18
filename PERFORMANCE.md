@@ -90,6 +90,86 @@ separable from the CLI but is far below llama.cpp regardless).
    Metal simdgroup-matrix, but experimental in wgpu 29 with an immature WGSL
    surface) or a NVIDIA-only **CUDA backend** (cuBLASLt / `mma`, most certain to
    deliver). This is where ~80% of the GPU gap lives.
+
+   **Portable wgpu coopmat path — spiked and ruled out (on this hardware, wgpu
+   29).** A cheap go/no-go probe (`probe_cooperative_matrix`, an ignored test in
+   `gpu.rs`) found the portable path silently broken here:
+   - The RTX 5070 Ti (Blackwell, Vulkan `VK_KHR_cooperative_matrix`) advertises
+     **only f16-input configs** — 16×16×16, 16×8×16, 16×8×8 with f16 A/B and
+     f16-or-f32 accumulate. It exposes **no 8×8 f32 config**.
+   - wgpu 29's coopmat backend **only wires 8×8 f32** (per its own feature doc).
+     So the one shape wgpu supports, this driver doesn't expose; the shapes this
+     driver exposes (f16 16×16), wgpu doesn't wire.
+   - Worst of all, requesting an 8×8 f32 `coopMultiplyAdd` **compiles and runs
+     with no validation error** (after the `ExperimentalFeatures` token) yet
+     returns **all-zero garbage** — a silent correctness failure, exactly the
+     "experimental, may be UB" warning made real.
+
+   Conclusion: the portable coopmat path is a dead end until wgpu wires f16
+   16×16 (and naga's WGSL surface matures). The real tensor-core win on this
+   machine needs the **NVIDIA-only CUDA backend** (`mma` / cuBLASLt).
+   `dot4I8Packed` (item 2) is also exhausted.
+
+   **CUDA backend (cudarc + cuBLASLt) — M0/M1 done, M2a kernels landed.** A third
+   `Backend` impl (`src/backend/cuda.rs`, behind the `cuda` cargo feature; cudarc
+   `dynamic-loading` so it needs no CUDA libs/nvcc at build time and fails
+   gracefully on a CUDA-less host). The `forward_prefill` matmuls + classifier run
+   on **cuBLASLt TF32 tensor cores** (`Matmul<f32>` → `CUBLAS_COMPUTE_32F_FAST_TF32`;
+   dequantized f32 weights cached on-device). Pure f32 throughout — no f16, so no
+   `cuda_fp16.h`/header dependency, and the per-call host f16 conversion that
+   throttled the first cut is gone. Per-op parity vs the CPU oracle (maxdiff
+   ~6e-3) + prefill coherence (relative L2 ~3e-4, top token matches) confirm the
+   column-major `x·Wᵀ` layout. **Measured prefill (synthetic, 256 tok, dim 1024 ×
+   4L, same shape for all three): CPU ~70–280 · wgpu f32 GEMV 533 · CUDA TF32
+   ~2800 tok/s** (CPU baseline is single-shot and noisy). Still under llama.cpp's
+   CUDA prefill (~18.5k on the real Q4_K_M), because this is synthetic f32 and the
+   per-op path still round-trips activations to the host per matmul.
+
+   **M2a + M2b done — resident fused prefill.** Five nvrtc kernels (add, swiglu,
+   rmsnorm, rope, attention), each parity-verified vs the CPU op (maxdiff ≤ 3e-7),
+   are assembled with the TF32 GEMMs into a `Backend::forward_prefill` override
+   (`generate` dispatches through it): a prompt runs entirely on-device — `x`/`xb`/
+   `q`/`hb` + the per-layer KV stay resident, only the token embeddings go up and
+   the final logits come down. The prompt's K/V are copied back to the host KV
+   cache so subsequent CPU decode is correct (guarded by a prefill→decode
+   coherence test, rel L2 ~3e-4). **Fused prefill: ~3300 tok/s** on the synthetic
+   shape (256 tok, dim 1024 × 4L) — up from ~2800 (per-op TF32) and 533 (wgpu).
+
+   **Real-model result (the north star), measured on the actual TinyLlama-1.1B
+   Q4_K_M — 22 layers, dim 2048, GQA 32/4 — prefill 512 tokens, same machine:**
+
+   | Path | Prefill (pp512) | vs llama.cpp |
+   | --- | ---: | --- |
+   | rusty_llama — CUDA, naive attention + f32 weights | 744 tok/s | ~26× behind |
+   | rusty_llama — CUDA, tiled attention + f32 weights | ~2,700 tok/s | ~7.3× behind |
+   | rusty_llama — CUDA, tiled attention + f16 weights | ~3,560 tok/s | ~5.5× behind |
+   | rusty_llama — **CUDA, + batched KV download** | **~4,450 tok/s** | **~4.4× behind** |
+   | llama.cpp — CUDA (`llama-bench`, fresh) | **19,637 tok/s** | — |
+
+   Three changes closed most of the gap from the first cut's ~26×. (1) Replacing
+   the naive one-thread-per-(row,head) attention with a **cooperative
+   block-per-(row,head) kernel** (threads split the key dot-products and the output
+   head-dims; scores + softmax reduction in shared memory, no global scratch):
+   **744 → ~2,700 tok/s** (the synthetic 4-layer proxy past 10k) — attention was
+   the dominant cost. (2) Caching weights as **f16** and running the GEMM as
+   `Matmul<f16>` (activations narrowed f32↔f16 on-device via inline-PTX `cvt`
+   kernels — no `cuda_fp16.h`): half the weight bandwidth + VRAM, faster f16 tensor
+   cores: **~2,700 → ~3,560**. (3) **Batching the per-layer KV download** — each
+   layer keeps its own resident device K/V so the whole prefill runs with no
+   in-loop `synchronize`; the KV is copied to host once at the end for the decode
+   handoff: **~3,560 → ~4,450**. Now **~4.4× behind llama.cpp**, correctness held
+   throughout (per-op parity + prefill/decode coherence, rel L2 ≤6e-4). The CPU
+   prefill baseline here is unreliable (laptop thermal throttling under sustained
+   GPU load), so CUDA-vs-llama.cpp is the meaningful comparison.
+
+   Remaining gap, in ROI order: (a) keep weights **quantized on device** +
+   dequant-in-kernel — the host dequant→f16 cache still streams f16 weight bytes,
+   ~2× the Q4_K bytes llama.cpp streams (a bigger lift: cuBLASLt wants dense input,
+   so it needs a custom dequant→GEMM); (b) keep KV resident across prefill→decode
+   (a fused decode `forward_step`, like the wgpu path) to drop the end-of-prefill
+   KV round-trip entirely; (c) further attention tuning (warp-level reductions,
+   online-softmax flash for long context). Decode
+   itself stays on the CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),

@@ -1,118 +1,167 @@
-# Handoff: GPU int8/DP4A decode (roadmap #2)
+# Handoff: GPU tensor cores (roadmap #3)
 
-A cold-start prompt for continuing the in-progress int8 GPU decode work. See
-[`PERFORMANCE.md`](PERFORMANCE.md) for the benchmark + full roadmap this serves.
+A cold-start prompt for the tensor-core GPU work — the ~8× decode / ~24× prefill
+gap vs llama.cpp. See [`PERFORMANCE.md`](PERFORMANCE.md) for the benchmark + full
+roadmap this serves.
 
 ---
 
-## ✅ Status update (2026-06-17): roadmap #2 (int8/DP4A) is DONE — next is #3
+## ✅ Status update (2026-06-17): #2 merged; #3 portable path spiked + ruled out
 
-This handoff's task is complete; the rest of the doc is kept for context. All on
-branch `feat/gpu-int8-probe`, **PR #19** (open, not merged):
+- **Roadmap #2 (int8/DP4A) — DONE and merged to `main` (PR #19).** Stage 1 (Q8_0
+  int8 decode, ~1.5–1.6×) is adopted behind an all-Q8_0 gate + `RUSTY_LLAMA_NO_INT8`
+  toggle. Stage 2 (Q4_K/Q6_K int8) is built + bit-exact but **not wired** — on a
+  bandwidth-bound decode the packed k-quant unpack erases the win (~0.94–0.98×
+  Q4_K, ~0.70× Q6_K). **Don't re-litigate scalar DP4A for k-quants — it loses.**
 
-- **Stage 1 — Q8_0 int8 decode: ADOPTED.** Wired into the fused decode behind an
-  all-Q8_0 eligibility gate + toggle (`RUSTY_LLAMA_NO_INT8` / `set_int8_decode`).
-  Measured **~1.5–1.6×** decode over the dequant path (TinyLlama-shaped synthetic
-  Q8_0). Per-op parity (vs exact int dot) + acc=1 fold + gate/toggle + e2e
-  coherence vs CPU.
-- **Stage 2 — Q4_K/Q6_K int8: MEASURED, NOT WIRED.** The three k-quant int8
-  kernels are built and **bit-exact** (per-op parity), but the gating microbench
-  `bench_kquant_int8_vs_dequant_gemv` shows int8 at **~0.94–0.98× (Q4_K) / ~0.70×
-  (Q6_K)** of the dequant GEMV — k-quants stay packed, so int8 saves no weight
-  bandwidth and the in-shader unpack is pure added compute on a bandwidth-bound
-  decode. Kept behind their tests (kill-criterion); Q4_K_M decode stays on
-  dequant. **Don't re-litigate scalar DP4A for k-quants** — it loses here.
+- **Roadmap #3 (tensor cores) — portable wgpu coopmat path SPIKED and RULED OUT
+  on this hardware.** Branch `feat/gpu-tensor-cores`. A go/no-go probe
+  (`probe_cooperative_matrix`, ignored test in `src/backend/gpu.rs`) found that
+  the RTX 5070 Ti / Vulkan advertises **only f16 coopmat configs** (16×16, 16×8),
+  while wgpu 29 **only wires 8×8 f32** — and an 8×8 f32 `coopMultiplyAdd`
+  compiles + runs with **no error but returns all-zero garbage**. Silent
+  correctness failure → dead end until wgpu wires f16 16×16. Full write-up in
+  `PERFORMANCE.md` item 3.
 
-**Next session → roadmap #3: tensor cores** (the ~8× GPU decode / ~24× prefill
-gap). Either wgpu `EXPERIMENTAL_COOPERATIVE_MATRIX` (portable, but immature WGSL
-in wgpu 29) or a NVIDIA-only CUDA backend (`mma`/cuBLASLt, most certain). That's
-where ~80% of the GPU gap lives; `dot4I8Packed` has been exhausted.
+- **Roadmap #3 (tensor cores) — CUDA backend M0 DONE.** FFI decision settled:
+  **cudarc 0.19** (dynamic-loading — no CUDA libs/nvcc at build time). A third
+  `Backend` impl `CudaBackend` lives in `src/backend/cuda.rs` behind a new `cuda`
+  cargo feature (off by default, NVIDIA-only). M0 = device + cuBLASLt handle init
+  with a graceful no-CUDA fallback (gated on `cudarc::driver::sys::is_culib_present`
+  because `CudaContext::new` *panics* on a CUDA-less host), all ops delegated to
+  `CpuBackend` for now. `--backend cuda` wired; smoke test passes on the RTX 5070
+  Ti (device detected + htod/dtoh round-trip). `cargo test`/`clippy --all-targets`
+  clean with and without `--features cuda`.
+
+- **Roadmap #3 — CUDA backend M1 DONE + M2a DONE.**
+  - **M1:** `CudaBackend::matmul`/`matmul_batch` run on **cuBLASLt TF32 tensor
+    cores** (`Matmul<f32>`; dequantized f32 weights cached on-device by data
+    pointer). Pure f32 — switched off f16 to drop the `cuda_fp16.h` dependency and
+    the per-call host f16 conversion. Layout `out(n,oc)=x(n,ic)·Wᵀ` =
+    `transa=true, m=oc, n=rows, k=ic, lda=ldb=ic, ldc=oc, matmul(cfg, a=W, b=X,
+    c=out)` (in [`CudaBackend::gemm_dev`]) — verified by per-op parity + prefill
+    coherence (rel L2 ~3e-4). **Per-op prefill ~2800 tok/s** (256 tok, dim 1024
+    ×4L) vs wgpu 533, CPU noisy.
+  - **M2a:** five nvrtc kernels (add/swiglu/rmsnorm/rope/attention) in `KERNEL_SRC`
+    + `dev_*` launchers, each parity-verified vs the CPU op (maxdiff ≤ 3e-7).
+  - **M2b:** `Backend::forward_prefill` (defaulted to the free fn; `generate`
+    dispatches through it) overridden on `CudaBackend` with a **resident fused
+    prefill** — embeddings up once, `x`/`xb`/`q`/`hb` + per-layer KV resident,
+    TF32 GEMMs + the `dev_*` kernels, logits down. The prompt's K/V are copied
+    back to host `state` (`RunState::store_prefill_kv`) so CPU decode is correct;
+    guarded by `prefill_then_decode_coherent` (rel L2 ~3e-4). Handles `pos_base==0`
+    (delegates otherwise). **Fused prefill ~3300 tok/s** (256 tok, dim 1024 ×4L)
+    vs ~2800 per-op TF32, 533 wgpu.
+
+- **Real-model bench + tiled attention + f16 weights DONE.**
+  `bench_prefill_real_tinyllama` loads the actual TinyLlama-1.1B Q4_K_M (22
+  layers, dim 2048, GQA 32/4), prefills 512 tokens. Progression on real-model
+  prefill vs llama.cpp's **19,637**:
+  - naive attention + f32 weights: **744 tok/s** (~26× behind);
+  - **cooperative block-per-(row,head)** `attention_kernel` (threads split the key
+    dot-products + output head-dims; scores+softmax in shared mem; global `att`
+    scratch removed): **~2,700** (~7.3×);
+  - **f16 weights + `Matmul<f16>`** (host dequant→f16 cache; activations narrowed
+    f32↔f16 on-device via inline-PTX `cvt` kernels — no `cuda_fp16.h`; half the
+    weight bytes/VRAM + faster f16 tensor cores): **~3,560 tok/s, ~5.5× behind**.
+  - **Batched KV download:** each layer keeps its own resident device K/V (Vec of
+    buffers), so the whole prefill runs with no in-loop `synchronize`; the KV is
+    copied to host once after the loop for the decode handoff: **~4,450 tok/s,
+    ~4.4× behind**.
+  Correctness held throughout (parity + prefill/decode coherence, rel L2 ≤6e-4).
+  CPU baseline is throttle-noisy under sustained load — compare CUDA-vs-llama.cpp.
+
+**Next session → close the remaining ~4.4×, in ROI order:**
+1. **Keep weights quantized on device** + dequant-in-kernel before the GEMM —
+   `weight_f16` host-dequants then streams f16 weight bytes (~2× the Q4_K bytes
+   llama.cpp streams). The lift: cuBLASLt wants dense input, so this needs a
+   custom dequant→GEMM kernel (or a dequant-into-f16-scratch pass that still
+   streams the packed Q4_K from VRAM). Biggest remaining lever.
+2. **Keep KV resident across prefill→decode** — a fused decode `forward_step`
+   (like the wgpu `DecodeState` path) with the KV cache living on device, so the
+   end-of-prefill KV round-trip to host disappears entirely.
+3. **Further attention tuning** (warp-level reductions; online-softmax flash for
+   long context) and larger GEMM batching / overlap.
+
+Decode stays GEMV/bandwidth-bound at batch=1. `dot4I8Packed` (item 2) and the
+portable wgpu coopmat path are both exhausted.
 
 ---
 
 You're picking up **`rusty_llama`** — a from-scratch Llama inference engine in
-Rust ("llama.cpp, the Rust way"). The CPU path is mature; over recent sessions a
-full **GPU backend** (wgpu, behind the `gpu` cargo feature) was built and merged,
-and CPU **AVX2/AVX-512 integer kernels** were added. You're continuing **GPU
-decode performance work (roadmap #2: int8/DP4A)** — finishing **Stage 1** (a
-partly-built feature branch).
+Rust ("llama.cpp, the Rust way"). The CPU path is mature; a full **GPU backend**
+(wgpu, behind the `gpu` cargo feature) is built + merged, CPU **AVX2/AVX-512
+integer kernels** and **GPU int8/DP4A decode** are done. You're starting
+**roadmap #3: tensor cores** — the single biggest remaining gap vs llama.cpp.
 
 ## This is a local GPU machine — confirm hardware first
 - **GPU:** NVIDIA RTX 5070 Ti Laptop (Blackwell, sm_120, 12 GB), CUDA 13.3
-  toolkit installed; wgpu runs on Vulkan/DX12. `dot4I8Packed` (DP4A) works in
-  wgpu 29 / naga with no special feature (device reports `int dot: 1`).
-- **CPU:** Intel Core Ultra 9 285H — **AVX2 but NO AVX-512**. So the AVX-512 VNNI
-  kernels (`x86::vec_dot_*`) are **dormant here** (run-verifiable only on CI / an
-  AVX-512 host); the AVX2 kernels (`x86::vec_dot_*_avx2`) *do* run here. Confirm
-  with `nvidia-smi` and an `is_x86_feature_detected!` probe.
+  toolkit installed (`nvcc`/cuBLAS available); wgpu runs on Vulkan/DX12.
+- **Coopmat caveat (already proven):** on this GPU the Vulkan
+  `VK_KHR_cooperative_matrix` advertises **only f16 configs** (16×16/16×8); wgpu
+  29 only wires **8×8 f32**, which compiles but **silently returns zeros**. So
+  tensor cores here mean **CUDA**, not portable wgpu coopmat. See `PERFORMANCE.md`
+  item 3 and the `probe_cooperative_matrix` test in `src/backend/gpu.rs`.
+- **CPU:** Intel Core Ultra 9 285H — **AVX2 but NO AVX-512** (VNNI kernels dormant
+  here; AVX2 ones run). Confirm with `nvidia-smi` and an
+  `is_x86_feature_detected!` probe.
 
 ## Read first, in order
-- `PERFORMANCE.md` — the llama.cpp head-to-head (same machine/model) + the
-  ROI-ranked roadmap. **North star.** On TinyLlama-1.1B Q4_K_M we're ~1.48×
-  behind on CPU decode (after AVX2), ~8× on GPU decode, ~24× on prefill. The GPU
-  gap is **tensor cores** (llama.cpp uses `NV_coopmat2`/CUDA `mma`; we don't).
-- `src/backend/gpu.rs` (~2400 LOC, the big file) — the wgpu `GpuBackend`. The
-  decode hot path is `build_decode_state` + `fused_step` (one command encoder per
-  token, resident KV + activations, cooperative-GEMV matmuls with residual-add
-  folded in). Weights are kept quantized on-device, dequantized in-shader.
-- `src/quant.rs` — quant types + scalar/VNNI/AVX2 integer dot kernels
-  (`vec_dot_*`, the `x86` module).
-- `src/backend/mod.rs` (`Backend` trait), `src/model.rs` (`forward`,
-  `forward_prefill`, `generate`).
+- `PERFORMANCE.md` — the llama.cpp head-to-head + ROI-ranked roadmap. **North
+  star.** TinyLlama-1.1B Q4_K_M: ~1.48× behind on CPU decode, ~8× on GPU decode,
+  **~24× on prefill** — the prefill GEMM gap is the clearest tensor-core win.
+- `src/backend/mod.rs` (`Backend` trait — every op a backend must implement) and
+  `src/model.rs` (`forward`, `forward_prefill`, `generate`) — how a backend is
+  selected and driven. A CUDA backend is a **third `Backend` impl** alongside
+  CPU/GPU, behind a new `cuda` cargo feature.
+- `src/backend/gpu.rs` — the wgpu `GpuBackend` for reference: resident-weight
+  caching keyed on data pointer, batched prefill (`matmul_batch`, the GEMM that
+  tensor cores should accelerate), fused decode (`build_decode_state`/`fused_step`).
+- `src/quant.rs` — quant types + dequant (CUDA will need weights on-device too).
 
 ## Branch state
-- `main` (merged): GPU backend, batched prefill, fused decode, on-device quant,
-  cooperative GEMV (GPU decode beats CPU here: ~46 vs ~35 tok/s), residual-fold
-  fusion, Q6_K VNNI, AVX2 integer kernels (PRs #10, #12–#18).
-- **`feat/gpu-int8-probe`** (NOT merged — your branch): (1) an int8 DP4A
-  prototype microbench showing the int8 GEMV is **~2.5× faster** than the f32
-  dequant GEMV for Q8_0; (2) **Stage 1 foundation** — production kernels
-  `WGSL_QUANTIZE_Q8` (on-device f32→int8 + per-32 scale) and
-  `WGSL_MATMUL_Q8_0_I8` (Q8_0 DP4A cooperative GEMV with `acc` residual-fold),
-  each with passing GPU parity tests (`matmul_q8_0_i8_matches_int_dot`,
-  `quantize_q8_kernel_is_valid`). The two pipeline fields are
-  `#[allow(dead_code)]` until wired in.
+- `main` (merged): CPU + wgpu GPU backends, batched prefill, fused decode,
+  on-device quant, cooperative GEMV, AVX2 integer kernels, int8/DP4A Q8_0 decode
+  (PRs #10–#19).
+- **`feat/gpu-tensor-cores`** (your branch): the coopmat go/no-go spike only —
+  `probe_cooperative_matrix` + the `PERFORMANCE.md`/`HANDOFF.md` write-ups ruling
+  out the portable path. No CUDA code yet.
 
-## Task: finish Stage 1, then Stage 2
+## Task: NVIDIA CUDA backend — prefill GEMM first
 
-**Stage 1 — wire the int8 path into the fused decode (Q8_0) and measure.**
-- In `build_decode_state`/`fused_step`, when the model's matmul weights are all
-  Q8_0-eligible (and not disabled by a new `RUSTY_LLAMA_NO_INT8` env toggle for
-  A/B): add resident int8 activation+scale buffers (`xb_i8`/`xb_scale`,
-  `hb_i8`/`hb_scale`), run a `quantize_q8` pass before each matmul group
-  (quantize once per activation, reused — 4 points/layer: after attn-rmsnorm,
-  after attention, after ffn-rmsnorm, after swiglu), and use `matmul_q8_0_i8`
-  bind groups (`acc=1` for `mo`/`m2`). Add `weight_buffer_i8` (Q8_0 → contiguous
-  int8 + f32 scales, cached). Cleanest as a parallel `fused_step_int8` + a
-  `DecodeInt8` bundle on `DecodeState`, so the f32 path stays untouched.
-- Remove the `#[allow(dead_code)]` once wired. **Measure** real decode tok/s on a
-  synthetic Q8_0 model (`dummy::synthetic_gguf_typed(.., GgmlType::Q8_0)`), int8
-  vs f32 (toggle), and an e2e greedy coherence check (output won't be
-  bit-identical — int8 activation error — but must stay coherent; prototype
-  maxdiff ~0.07).
-- Known Stage-1 shortcut to undo: it's fine to build both f32 and int8 weight
-  buffers (2× weight VRAM) on the measurement model to get the number, then drop
-  the f32 build when int8 is active.
+**Settle the FFI strategy first** (open question): the [`cudarc`] crate (safe-ish
+Rust bindings to the CUDA driver API + cuBLAS, no `nvcc` at build time) vs a
+hand-rolled `build.rs` + `cc`/`nvcc` compiling `.cu` kernels. `cudarc` is likely
+the faster, more legible path and matches the "Rust way" ethos; hand-rolled gives
+full control over custom `mma` kernels. Decide, then put everything behind a new
+`cuda` cargo feature (off by default — the portable wgpu/CPU build must stay
+dependency-light and keep building/testing without CUDA).
 
-**Stage 2 — int8 Q4_K + Q6_K.** Do **not** pre-expand the packed k-quant weights
-to int8 — that inflates weight bandwidth ~1.8× for Q4_K and can erase the win
-(decode is bandwidth-sensitive). Keep weights **packed** and unpack-to-int8
-**in-shader** before `dot4I8Packed`, with the Q8K activation. Measure the
-bandwidth/compute trade-off; this is where TinyLlama Q4_K_M's real formats live.
+**Then build the backend incrementally:**
+1. A `CudaBackend` skeleton implementing `Backend`, device init + graceful
+   "no CUDA device" fallback (mirror `GpuBackend::new`'s `Result`).
+2. **Prefill GEMM via cuBLASLt (f16 tensor cores)** — the ~24× gap and the
+   highest-confidence win. Dequant weights to f16 on-device (cached, pointer-keyed
+   like the wgpu path), run the prefill matmuls through cuBLASLt. Per-op parity
+   vs the CPU backend + an e2e coherence check.
+3. Only after prefill lands, consider decode (batch=1 GEMV is bandwidth-bound —
+   tensor cores help less; may stay on a tuned GEMV/int8 path).
 
 ## Acceptance / conventions
-- Per-op parity (int8 kernels vs the exact integer dot) + e2e coherence;
-  `cargo test` and `cargo clippy --all-targets` clean **with and without**
-  `--features gpu`. (`cargo fmt --check` is noisy — match style by hand.)
-- Report decode tok/s honestly (int8 vs f32, and vs CPU). Expect end-to-end gain
-  **< the 2.5× kernel number** (re-quantize passes + non-matmul ops dilute it).
+- Per-op parity (new kernels vs the CPU backend, the oracle) + e2e coherence;
+  `cargo test` and `cargo clippy --all-targets` clean **with and without** each
+  GPU feature (`gpu`, and the new `cuda`). (`cargo fmt --check` is noisy — match
+  style by hand.)
+- Report prefill/decode tok/s honestly (CUDA vs wgpu vs CPU, same model).
 - Feature branch, small commits ending with
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`; PR per
-  stage; **don't merge without the human's say-so**.
+  milestone; **don't merge without the human's say-so**.
 - Re-benchmark vs llama.cpp:
   `llamacpp_bench/lc/llama-bench.exe -m tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -ngl 99`
   (CUDA) / `-ngl 0` (CPU); dir is gitignored. The TinyLlama GGUF +
   `stories15M.bin`/`tokenizer.bin` are already in the repo root.
+
+[`cudarc`]: https://crates.io/crates/cudarc
 
 Start by confirming the GPU, checking out `feat/gpu-int8-probe`, reading the
 files above and the current `build_decode_state`/`fused_step`, then propose a

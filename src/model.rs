@@ -374,6 +374,16 @@ impl RunState {
     pub(crate) fn value_cache(&self) -> &[f32] {
         &self.value_cache
     }
+
+    /// Write the K/V a resident fused prefill computed on-device into the host
+    /// KV cache, starting at flat offset `loff` (the layer's base). Used by the
+    /// CUDA backend so subsequent CPU [`forward_step`] decode reads the prompt's
+    /// cached keys/values. `k`/`v` are the layer's contiguous prompt rows.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn store_prefill_kv(&mut self, loff: usize, k: &[f32], v: &[f32]) {
+        self.key_cache[loff..loff + k.len()].copy_from_slice(k);
+        self.value_cache[loff..loff + v.len()].copy_from_slice(v);
+    }
 }
 
 /// Run one transformer step for `token` at position `pos`.
@@ -478,10 +488,10 @@ pub fn forward(
 ///
 /// `pos_base` is general, but the prompt is normally prefilled in one call with
 /// `pos_base == 0`; the cache rows for the batch are then contiguous.
-pub fn forward_prefill(
+pub fn forward_prefill<B: Backend + ?Sized>(
     model: &Model,
     state: &mut RunState,
-    backend: &dyn Backend,
+    backend: &B,
     tokens: &[usize],
     pos_base: usize,
 ) {
@@ -660,7 +670,9 @@ fn generate_prefilled(
     let n = prompt_tokens.len();
     let mut generated = 0;
 
-    forward_prefill(model, state, backend, prompt_tokens, 0);
+    // Dispatch through the trait method so a backend with a resident fused
+    // prefill (CUDA) is used; the default delegates to `forward_prefill`.
+    backend.forward_prefill(model, state, prompt_tokens, 0);
 
     // Echo the prompt's internal transitions, exactly as the sequential loop
     // streams them (decode(prev, cur) renders `cur`'s piece).

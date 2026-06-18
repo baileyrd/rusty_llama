@@ -3242,4 +3242,222 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         );
         close(&a, &b);
     }
+
+    // --- Roadmap #3 spike: cooperative matrix (tensor cores) -------------
+    //
+    // Go/no-go for the portable wgpu path. Probes whether this adapter
+    // advertises `EXPERIMENTAL_COOPERATIVE_MATRIX` and an 8x8 f32 config (all
+    // wgpu 29 wires), then compiles + runs one 8x8x8 coopmat GEMM and checks it
+    // against a CPU reference. Self-contained (own instance/adapter/device) so
+    // it can request the feature, which `GpuBackend::new` does not.
+    #[test]
+    #[ignore = "roadmap #3 spike; run with --release --features gpu -- --ignored --nocapture"]
+    fn probe_cooperative_matrix() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            },
+        )) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("skipping coopmat probe: no adapter: {e}");
+                return;
+            }
+        };
+        eprintln!("adapter: {}", adapter.get_info().name);
+
+        let advertised = adapter
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        eprintln!("EXPERIMENTAL_COOPERATIVE_MATRIX advertised: {advertised}");
+
+        let props = adapter.cooperative_matrix_properties();
+        eprintln!("cooperative_matrix_properties: {} config(s)", props.len());
+        for p in &props {
+            eprintln!(
+                "  MxNxK={}x{}x{} ab={:?} cr={:?} sat={}",
+                p.m_size, p.n_size, p.k_size, p.ab_type, p.cr_type, p.saturating_accumulation,
+            );
+        }
+
+        if !advertised {
+            eprintln!(
+                "=> coopmat NOT advertised by this adapter via wgpu 29. \
+                 The portable wgpu path is a no-go on this hardware/driver."
+            );
+            return;
+        }
+
+        let has_8x8_f32 = props.iter().any(|p| {
+            p.m_size == 8
+                && p.n_size == 8
+                && p.k_size == 8
+                && p.ab_type == wgpu::CooperativeScalarType::F32
+                && p.cr_type == wgpu::CooperativeScalarType::F32
+        });
+        eprintln!(
+            "adapter advertises an 8x8x8 f32 config (the only shape wgpu 29 wires): {has_8x8_f32}"
+        );
+
+        // The experimental-features token is required to even request the
+        // feature; `enabled()` is unsafe (acknowledges possible UB in the WIP
+        // coopmat path). Safe here — this is a throwaway probe.
+        let (device, _queue) = match pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("coopmat-probe"),
+                required_features: wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+                required_limits: adapter.limits(),
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                ..Default::default()
+            },
+        )) {
+            Ok(dq) => dq,
+            Err(e) => {
+                eprintln!("=> device with coopmat feature failed: {e}");
+                return;
+            }
+        };
+        let queue = _queue;
+        eprintln!("device created with coopmat feature OK");
+
+        // Minimal 8x8x8 GEMM: C = A * B, all row-major f32 in storage. coopLoadT
+        // loads row-major (stride inferred = 8); one full subgroup cooperates.
+        const SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@compute @workgroup_size(32)
+fn main() {
+    let am = coopLoadT<coop_mat8x8<f32, A>>(&a[0]);
+    let bm = coopLoadT<coop_mat8x8<f32, B>>(&b[0]);
+    let zero = coopLoadT<coop_mat8x8<f32, C>>(&c[0]);
+    let cm = coopMultiplyAdd(am, bm, zero);
+    coopStoreT(cm, &c[0]);
+}
+"#;
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("coopmat-gemm"),
+            source: wgpu::ShaderSource::Wgsl(SRC.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("coopmat-gemm"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(err) = pollster::block_on(error_scope.pop()) {
+            eprintln!(
+                "=> coopmat 8x8 f32 shader/pipeline REJECTED: {err}\n\
+                 The portable wgpu path is a no-go on this hardware/driver \
+                 (wgpu 29 wires only 8x8 f32; this adapter exposes only f16 configs)."
+            );
+            return;
+        }
+
+        // Inputs: deterministic noise, 8x8 row-major.
+        let a: Vec<f32> = noise(64, 11);
+        let b: Vec<f32> = noise(64, 22);
+        let mk = |label: &str, data: &[f32]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: f32_bytes(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+        };
+        let a_buf = mk("a", &a);
+        let b_buf = mk("b", &b);
+        let c_buf = mk("c", &vec![0.0f32; 64]);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: 64 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bgl = pipeline.get_bind_group_layout(0);
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("coopmat-binds"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: c_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            p.set_pipeline(&pipeline);
+            p.set_bind_group(0, &bind, &[]);
+            p.dispatch_workgroups(1, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&c_buf, 0, &readback, 0, 64 * 4);
+        queue.submit([enc.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let got: Vec<f32> = {
+            let view = slice.get_mapped_range();
+            bytemuck_cast(&view)
+        };
+
+        // CPU reference: row-major C = A * B.
+        let mut want = vec![0.0f32; 64];
+        for i in 0..8 {
+            for j in 0..8 {
+                let mut acc = 0.0f32;
+                for k in 0..8 {
+                    acc += a[i * 8 + k] * b[k * 8 + j];
+                }
+                want[i * 8 + j] = acc;
+            }
+        }
+        let maxdiff = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+
+        if has_8x8_f32 {
+            close(&got, &want);
+            eprintln!(
+                "=> coopmat 8x8x8 f32 GEMM MATCHES the CPU reference (maxdiff {maxdiff:.2e}). \
+                 Portable wgpu path is GO."
+            );
+        } else {
+            // The shape wgpu wires (8x8 f32) has no hardware config here, yet the
+            // pipeline compiled with NO validation error. The result is the
+            // tell: silent garbage, not an error.
+            eprintln!(
+                "=> coopmat 8x8x8 f32 GEMM produced WRONG results with no error \
+                 (maxdiff {maxdiff:.2e}; output is all-zero = {}). \
+                 wgpu 29 wires only 8x8 f32, which this NVIDIA/Vulkan driver does not \
+                 expose (only f16 16x16/16x8). The portable wgpu coopmat path is a \
+                 NO-GO on this hardware: it compiles but silently misbehaves.",
+                got.iter().all(|&v| v == 0.0),
+            );
+        }
+    }
+
+    /// Reinterpret a byte slice as f32s (readback helper for the probe).
+    fn bytemuck_cast(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
 }

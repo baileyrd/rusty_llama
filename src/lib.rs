@@ -35,6 +35,8 @@ pub mod tokenizer;
 mod loader;
 
 pub use backend::{Backend, CpuBackend};
+#[cfg(feature = "cuda")]
+pub use backend::CudaBackend;
 #[cfg(feature = "gpu")]
 pub use backend::GpuBackend;
 pub use config::{Config, RopeScaling, RopeTable};

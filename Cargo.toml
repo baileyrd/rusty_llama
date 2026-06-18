@@ -8,7 +8,9 @@ repository = "https://github.com/baileyrd/rusty_llama"
 readme = "README.md"
 
 [dependencies]
+cudarc = { version = "0.19", optional = true, default-features = false }
 fancy-regex = "0.18.0"
+half = { version = "2", optional = true }
 memmap2 = "0.9"
 pollster = { version = "0.4.0", optional = true }
 rayon = "1"
@@ -23,3 +25,20 @@ codegen-units = 1
 # Optional GPU backend (wgpu: Vulkan/DX12/Metal). Off by default so the
 # baseline build stays at three small dependencies.
 gpu = ["dep:wgpu", "dep:pollster"]
+
+# Optional NVIDIA CUDA backend (cuBLASLt tensor cores), behind cudarc. Off by
+# default and NVIDIA-only. `dynamic-loading` means no CUDA libraries or nvcc are
+# needed at build time — cudarc dlopen's the driver/cuBLASLt at run time, so this
+# feature builds fine on a CUDA-less machine and the backend fails gracefully
+# there. `cuda-13020` selects cudarc's newest (13.2) sys bindings, ABI-compatible
+# with the installed 13.3 runtime; `f16` pulls the half crate for the f16 GEMM.
+cuda = [
+    "dep:cudarc",
+    "dep:half",
+    "cudarc/std",
+    "cudarc/cuda-13020",
+    "cudarc/dynamic-loading",
+    "cudarc/cublaslt",
+    "cudarc/nvrtc",
+    "cudarc/f16",
+]
