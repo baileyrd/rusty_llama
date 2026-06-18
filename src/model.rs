@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use crate::adapter::ControlVector;
 use crate::arch::Arch;
 use crate::backend::Backend;
 use crate::config::{Config, RopeScaling, RopeTable};
@@ -479,12 +480,19 @@ impl RunState {
 ///
 /// Reads/writes the KV cache in `state` and leaves the next-token logits in
 /// `state.logits()`. Mirrors the reference llama2.c `forward()` op-for-op.
-pub fn forward(
+pub fn forward(model: &Model, state: &mut RunState, backend: &dyn Backend, token: usize, pos: usize) {
+    forward_with(model, state, backend, token, pos, None);
+}
+
+/// [`forward`] with an optional control vector added to the residual after each
+/// layer (the steering hook for [`crate::adapter::ControlVector`]).
+pub fn forward_with(
     model: &Model,
     state: &mut RunState,
     backend: &dyn Backend,
     token: usize,
     pos: usize,
+    control: Option<&ControlVector>,
 ) {
     let p = &model.config;
     let w = &model.weights;
@@ -555,6 +563,9 @@ pub fn forward(
         backend.swiglu(&mut state.hb, &state.hb2);
         backend.matmul(&mut state.xb, &state.hb, &w.w2[layer]);
         backend.add(&mut state.x, &state.xb);
+        if let Some(cv) = control {
+            cv.apply_layer(layer, &mut state.x);
+        }
     }
 
     // Final norm (written into `xb` to avoid aliasing `x`) then classifier.
@@ -581,9 +592,22 @@ pub fn forward_prefill<B: Backend + ?Sized>(
     tokens: &[usize],
     pos_base: usize,
 ) {
+    forward_prefill_with(model, state, backend, tokens, pos_base, None);
+}
+
+/// [`forward_prefill`] with an optional control vector applied per position after
+/// each layer.
+pub fn forward_prefill_with<B: Backend + ?Sized>(
+    model: &Model,
+    state: &mut RunState,
+    backend: &B,
+    tokens: &[usize],
+    pos_base: usize,
+    control: Option<&ControlVector>,
+) {
     let dim = model.config.dim;
     let n = tokens.len();
-    let x = prefill_residual(model, state, backend, tokens, pos_base);
+    let x = prefill_residual(model, state, backend, tokens, pos_base, control);
 
     // Only the final position predicts the next token, so norm + classify just
     // that row (the classifier matmul is the widest — no need to run it n×).
@@ -608,6 +632,7 @@ fn prefill_residual<B: Backend + ?Sized>(
     backend: &B,
     tokens: &[usize],
     pos_base: usize,
+    control: Option<&ControlVector>,
 ) -> Vec<f32> {
     let p = &model.config;
     let w = &model.weights;
@@ -676,6 +701,11 @@ fn prefill_residual<B: Backend + ?Sized>(
         backend.swiglu(&mut hb, &hb2);
         backend.matmul_batch(&mut xb, &hb, &w.w2[layer], n);
         backend.add(&mut x, &xb);
+        if let Some(cv) = control {
+            for r in 0..n {
+                cv.apply_layer(layer, &mut x[r * dim..(r + 1) * dim]);
+            }
+        }
     }
     x
 }
@@ -709,7 +739,7 @@ pub fn forward_embed<B: Backend + ?Sized>(
     let dim = p.dim;
     let n = tokens.len();
 
-    let x = prefill_residual(model, state, backend, tokens, 0);
+    let x = prefill_residual(model, state, backend, tokens, 0, None);
     // Final RMSNorm every row (the classifier is skipped for embeddings).
     let mut normed = vec![0.0f32; n * dim];
     backend.rmsnorm_batch(&mut normed, &x, &w.rms_final_weight, p.rms_eps, n);
