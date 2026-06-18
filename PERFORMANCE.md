@@ -138,25 +138,29 @@ separable from the CLI but is far below llama.cpp regardless).
    **Real-model result (the north star), measured on the actual TinyLlama-1.1B
    Q4_K_M — 22 layers, dim 2048, GQA 32/4 — prefill 512 tokens, same machine:**
 
-   | Path | Prefill (pp512) | vs CUDA |
+   | Path | Prefill (pp512) | vs llama.cpp |
    | --- | ---: | --- |
-   | rusty_llama — CPU | 57 tok/s | — |
-   | rusty_llama — **CUDA (fused, TF32)** | **744 tok/s** | 13.1× CPU |
-   | llama.cpp — CUDA (`llama-bench`, fresh) | **19,637 tok/s** | **~26× faster** |
+   | rusty_llama — CUDA, naive attention | 744 tok/s | ~26× behind |
+   | rusty_llama — **CUDA, tiled attention** | **~2,700 tok/s** | **~7.3× behind** |
+   | llama.cpp — CUDA (`llama-bench`, fresh) | **19,637 tok/s** | — |
 
-   So the resident fused CUDA prefill is **~13× the CPU** but still **~26× behind
-   llama.cpp** on the real model — the synthetic 4-layer proxy (where we hit
-   ~3300) badly overstated our position. The tensor cores are engaged and we beat
-   both CPU and our own wgpu f32 path, but the real gap is now **kernel quality,
-   not "do we use tensor cores"**: (a) the attention kernel is a naive
-   one-thread-per-(row,head) O(n²) loop (llama.cpp uses flash attention) — the
-   dominant cost at 512 tokens; (b) weights are dequantized to **f32** on device
-   (~4.4 GB, ~7× the Q4_K bandwidth llama.cpp streams); (c) the fused path still
+   The first cut was ~26× behind llama.cpp; replacing the naive
+   one-thread-per-(row,head) attention with a **cooperative block-per-(row,head)
+   kernel** (threads split the key dot-products and the output head-dims; scores +
+   softmax reduction in shared memory, no global scratch) took real-model prefill
+   **744 → ~2,700 tok/s (3.6×)** and the synthetic 4-layer proxy past 10k tok/s —
+   attention really was the dominant cost. Now **~7.3× behind llama.cpp**, with
+   correctness held (per-op parity + prefill/decode coherence, rel L2 ~3e-4). The
+   CPU prefill baseline here is unreliable (laptop thermal throttling under the
+   sustained GPU+dequant load), so CUDA-vs-llama.cpp is the meaningful comparison.
+
+   Remaining gap, in ROI order: (a) weights are dequantized to **f32** on device
+   (~4.4 GB, ~7× the Q4_K weight bandwidth llama.cpp streams) — keep them
+   **quantized on device** + dequant-in-kernel, or store f16; (b) the fused path
    downloads each layer's K/V to host with a per-layer `synchronize` for the
-   decode handoff. **Next, in ROI order:** a tiled/flash attention kernel; keep
-   weights **quantized on device** + dequant-in-kernel (or f16); batch the KV
-   download / keep KV resident across prefill→decode. Decode itself stays on the
-   CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
+   decode handoff — batch it / keep KV resident across prefill→decode; (c) further
+   attention tuning (warp-level, online-softmax flash for long context). Decode
+   itself stays on the CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),

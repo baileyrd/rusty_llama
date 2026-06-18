@@ -103,42 +103,76 @@ extern "C" __global__ void rope_kernel(float* q, float* k, const float* inv_freq
         kr[i + 1] = k0 * fci + k1 * fcr;
     }
 }
-// One thread per (row, head); causal GQA over keys 0..=pos_base+row. `att` is
-// scratch of (rows*n_heads, seq_len). Matches CpuBackend::attention_batch.
+// Causal GQA, one thread BLOCK per (row, head) — cooperative, not one thread
+// per (row, head). Threads split the keys for the scores and the head dims for
+// the output; the score row + softmax reduction live in shared memory (no
+// global scratch). `blockDim.x` must be a power of two. Dynamic shared layout:
+// [ sq: head_size | sc: seq_len | red: blockDim.x ] floats. Matches
+// CpuBackend::attention_batch.
 extern "C" __global__ void attention_kernel(float* out, const float* q,
-        const float* kcache, const float* vcache, float* att,
+        const float* kcache, const float* vcache,
         int rows, int pos_base, int n_heads, int kv_mul, int head_size,
         int seq_len, int kv_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = blockIdx.x;
     if (idx >= rows * n_heads) return;
-    int r = idx / n_heads;
-    int h = idx % n_heads;
+    int r = idx / n_heads, h = idx % n_heads;
     int pos = pos_base + r;
     int dim = n_heads * head_size;
     int kv_off = (h / kv_mul) * head_size;
     const float* qh = q + (long long)r * dim + (long long)h * head_size;
-    float* sc = att + (long long)idx * seq_len;
+    int tid = threadIdx.x, nt = blockDim.x;
+
+    extern __shared__ float smem[];
+    float* sq = smem;                 // head_size: this (row,head)'s query
+    float* sc = sq + head_size;       // seq_len: scores, used 0..=pos
+    float* red = sc + seq_len;        // nt: reduction scratch
+
+    for (int i = tid; i < head_size; i += nt) sq[i] = qh[i];
+    __syncthreads();
+
     float scale = 1.0f / sqrtf((float)head_size);
-    float maxv = -1e30f;
-    for (int t = 0; t <= pos; t++) {
+    // Scores q·k_t (threads split the keys), tracking a per-thread max.
+    float lmax = -1e30f;
+    for (int t = tid; t <= pos; t += nt) {
         const float* kt = kcache + (long long)t * kv_dim + kv_off;
         float s = 0.0f;
-        for (int i = 0; i < head_size; i++) s += qh[i] * kt[i];
+        for (int i = 0; i < head_size; i++) s += sq[i] * kt[i];
         s *= scale;
         sc[t] = s;
-        if (s > maxv) maxv = s;
+        if (s > lmax) lmax = s;
     }
-    float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) { float e = expf(sc[t] - maxv); sc[t] = e; sum += e; }
-    float invsum = 1.0f / sum;
+    red[tid] = lmax;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float maxv = red[0];
+    __syncthreads();
+
+    // Exponentiate (threads split the keys), reduce the sum.
+    float lsum = 0.0f;
+    for (int t = tid; t <= pos; t += nt) {
+        float e = expf(sc[t] - maxv);
+        sc[t] = e;
+        lsum += e;
+    }
+    red[tid] = lsum;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    float invsum = 1.0f / red[0];
+
+    // Output: each thread owns a stride of head dims, summed over all keys.
     float* outh = out + (long long)r * dim + (long long)h * head_size;
-    for (int i = 0; i < head_size; i++) {
-        float o = 0.0f;
+    for (int i = tid; i < head_size; i += nt) {
+        float acc = 0.0f;
         for (int t = 0; t <= pos; t++) {
-            const float* vt = vcache + (long long)t * kv_dim + kv_off;
-            o += sc[t] * vt[i];
+            acc += sc[t] * vcache[(long long)t * kv_dim + kv_off + i];
         }
-        outh[i] = o * invsum;
+        outh[i] = acc * invsum;
     }
 }
 "#;
@@ -406,7 +440,8 @@ impl CudaBackend {
     }
 
     /// Batched causal GQA: query row `r` (at `pos_base + r`) over cached keys
-    /// `0..=pos_base+r`. `att` is scratch of `rows*n_heads*seq_len`.
+    /// `0..=pos_base+r`. One thread block per (row, head); scores + softmax live
+    /// in shared memory, so no global scratch is needed.
     #[allow(clippy::too_many_arguments)]
     fn dev_attention(
         &self,
@@ -414,7 +449,6 @@ impl CudaBackend {
         q: &CudaSlice<f32>,
         kcache: &CudaSlice<f32>,
         vcache: &CudaSlice<f32>,
-        att: &mut CudaSlice<f32>,
         rows: usize,
         pos_base: usize,
         n_heads: usize,
@@ -432,12 +466,19 @@ impl CudaBackend {
             seq_len as i32,
             kv_dim as i32,
         );
+        // One block per (row, head); 128 (power-of-two) threads cooperate.
+        // Shared: [ query head_size | scores seq_len | reduction 128 ] floats.
+        const BLOCK: u32 = 128;
+        let cfg = LaunchConfig {
+            grid_dim: ((rows * n_heads) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: (head_size as u32 + seq_len as u32 + BLOCK) * 4,
+        };
         let mut b = self.stream.launch_builder(&self.kernels.attention);
         b.arg(out)
             .arg(q)
             .arg(kcache)
             .arg(vcache)
-            .arg(att)
             .arg(&rows_i)
             .arg(&pos_i)
             .arg(&nh_i)
@@ -445,8 +486,7 @@ impl CudaBackend {
             .arg(&hs_i)
             .arg(&sl_i)
             .arg(&kv_i);
-        unsafe { b.launch(LaunchConfig::for_num_elems((rows * n_heads) as u32)) }
-            .expect("launch attention");
+        unsafe { b.launch(cfg) }.expect("launch attention");
     }
 }
 
@@ -557,7 +597,6 @@ impl Backend for CudaBackend {
         let mut q = st.alloc_zeros::<f32>(n * dim).expect("alloc q");
         let mut hb = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb");
         let mut hb2 = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb2");
-        let mut att = st.alloc_zeros::<f32>(n * n_heads * n).expect("alloc att");
         let mut keyc = st.alloc_zeros::<f32>(n * kv_dim).expect("alloc keyc");
         let mut valuec = st.alloc_zeros::<f32>(n * kv_dim).expect("alloc valuec");
         let inv = st
@@ -576,7 +615,7 @@ impl Backend for CudaBackend {
             self.gemm_dev(&mut valuec, &xb, &w.wv[layer], n);
             self.dev_rope(&mut q, &mut keyc, &inv, n, 0, head_size, kv_dim, dim, n_freqs, mscale);
             self.dev_attention(
-                &mut xb, &q, &keyc, &valuec, &mut att, n, 0, n_heads, kv_mul, head_size, n, kv_dim,
+                &mut xb, &q, &keyc, &valuec, n, 0, n_heads, kv_mul, head_size, n, kv_dim,
             );
             self.gemm_dev(&mut xb2, &xb, &w.wo[layer], n);
             self.dev_add(&mut x, &xb2, n * dim);
@@ -1059,10 +1098,9 @@ mod tests {
         let kcd = b.stream.clone_htod(&kc).unwrap();
         let vcd = b.stream.clone_htod(&vc).unwrap();
         let mut outd = b.stream.alloc_zeros::<f32>(n * dim).unwrap();
-        let mut attd = b.stream.alloc_zeros::<f32>(n * n_heads * seq_len).unwrap();
         b.dev_attention(
-            &mut outd, &qd, &kcd, &vcd, &mut attd, n, 0, n_heads, n_heads / n_kv_heads, head_size,
-            seq_len, kv_dim,
+            &mut outd, &qd, &kcd, &vcd, n, 0, n_heads, n_heads / n_kv_heads, head_size, seq_len,
+            kv_dim,
         );
         b.stream.synchronize().unwrap();
         let got = b.stream.clone_dtoh(&outd).unwrap();

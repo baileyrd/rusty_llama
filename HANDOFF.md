@@ -53,25 +53,29 @@ roadmap this serves.
     (delegates otherwise). **Fused prefill ~3300 tok/s** (256 tok, dim 1024 ×4L)
     vs ~2800 per-op TF32, 533 wgpu.
 
-- **Real-model bench DONE (the honest number).** `bench_prefill_real_tinyllama`
-  loads the actual TinyLlama-1.1B Q4_K_M (22 layers, dim 2048, GQA 32/4) and
-  prefills 512 tokens. **CUDA fused 744 tok/s · CPU 57 · llama.cpp CUDA 19,637**
-  (fresh `llama-bench`). So we're **13× CPU but ~26× behind llama.cpp** on the
-  real model — the synthetic 4-layer proxy (3300) badly overstated us. f32
-  weights (~4.4 GB) fit in the 12 GB card; no OOM.
+- **Real-model bench DONE + tiled attention DONE.** `bench_prefill_real_tinyllama`
+  loads the actual TinyLlama-1.1B Q4_K_M (22 layers, dim 2048, GQA 32/4), prefills
+  512 tokens. The first cut (naive one-thread-per-(row,head) attention) was **744
+  tok/s, ~26× behind llama.cpp's 19,637**. Replacing it with a **cooperative
+  block-per-(row,head)** `attention_kernel` (threads split the key dot-products +
+  the output head-dims; scores + softmax in shared memory, global `att` scratch
+  removed) took real-model prefill to **~2,700 tok/s (3.6×), ~7.3× behind
+  llama.cpp**; synthetic 4-layer past 10k. Correctness held (parity + prefill/
+  decode coherence, rel L2 ~3e-4). CPU baseline is throttle-noisy under sustained
+  load — compare CUDA-vs-llama.cpp.
 
-**Next session → close the real gap, in ROI order (it's kernel quality now, not
-"use tensor cores"):**
-1. **Flash/tiled attention kernel.** The current `attention_kernel` is a naive
-   one-thread-per-(row,head) O(n²) serial loop — the dominant cost at 512 tokens.
-   A tiled, shared-memory, multi-thread-per-head kernel (or coopmat) is the
-   biggest single win.
-2. **Keep weights quantized on device** (Q4_K/Q6_K) + dequant-in-kernel before
-   the GEMM, or store f16 — instead of the current f32 expansion (~7× the Q4_K
-   weight bandwidth llama.cpp streams, and 2× VRAM).
-3. **Batch the per-layer KV download** (keep per-layer device KV, one download at
-   the end) and/or keep KV resident across prefill→decode (a fused decode
-   `forward_step`, like the wgpu path).
+**Next session → close the remaining ~7× gap, in ROI order:**
+1. **Stop expanding weights to f32.** `weight_f32` dequantizes Q4_K/Q6_K to f32
+   on device (~4.4 GB, ~7× the weight bandwidth llama.cpp streams). Keep weights
+   **quantized on device** + dequant-in-kernel before the GEMM, or store f16
+   (would also halve VRAM). Biggest remaining lever — prefill GEMMs are weight-
+   bandwidth-heavy.
+2. **Batch the per-layer KV download** (keep per-layer device KV, one download at
+   the end of prefill) and/or keep KV resident across prefill→decode (a fused
+   decode `forward_step`, like the wgpu path), removing the per-layer
+   `synchronize`.
+3. **Further attention tuning** (warp-level reductions; online-softmax flash for
+   long context) and larger GEMM batching.
 
 Decode stays GEMV/bandwidth-bound at batch=1. `dot4I8Packed` (item 2) and the
 portable wgpu coopmat path are both exhausted.
