@@ -178,6 +178,8 @@ and that greedy generation reproduces.
 - [x] RoPE long-context scaling (`linear`/`yarn`/`llama3`)
 - [x] Explicit AVX-512 VNNI (`vpdpbusd`) integer dot products for Q8_0/Q4_0/Q4_K/Q6_K (~2.2–2.5×, bit-identical to scalar)
 - [x] GPU backend (`wgpu`) behind the existing `Backend` trait — per-op parity + byte-identical e2e output; decode currently latency-bound (honest verdict above)
+- [x] Architecture breadth beyond Llama: **Qwen2** (QKV bias), **Phi-3** (fused qkv / gate-up), **Gemma 2** (GeGLU, sandwich norms, logit softcap, explicit head-dim) via an `Arch` registry seam — greedy output validated against `llama-cli`
+- [x] NeoX vs NORM RoPE handled by a load-time Q/K permute (one rope kernel); built-in chat templates (chatml / llama-3 / qwen2 / gemma / phi-3) + EOS/turn-end stop
 
 See [`BACKLOG.md`](BACKLOG.md) for the history of these items.
 

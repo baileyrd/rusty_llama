@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::arch::LLAMA_NAMES;
+use crate::arch::TENSOR_NAMES;
 use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
@@ -120,7 +120,7 @@ impl<'a> LoraAdapter<'a> {
 
 /// Map each LoRA-targetable base weight's GGUF name to its [`QMatrix::data_ptr`].
 fn base_weight_ptrs(model: &Model) -> HashMap<String, usize> {
-    let n = &LLAMA_NAMES;
+    let n = &TENSOR_NAMES;
     let w = &model.weights;
     let per_layer: [(&str, &Vec<QMatrix>); 7] = [
         (n.attn_q, &w.wq),
@@ -142,7 +142,7 @@ fn base_weight_ptrs(model: &Model) -> HashMap<String, usize> {
 
 /// Resolve a base GGUF tensor name to its [`QMatrix`] in `model` (shape check).
 fn base_weight<'m>(model: &'m Model, name: &str) -> Option<&'m QMatrix<'m>> {
-    let n = &LLAMA_NAMES;
+    let n = &TENSOR_NAMES;
     let w = &model.weights;
     let (l, suffix) = name.strip_prefix("blk.")?.split_once('.')?;
     let l: usize = l.parse().ok()?;
@@ -294,10 +294,11 @@ impl Backend for AdapterBackend<'_> {
         head_size: usize,
         seq_len: usize,
         kv_dim: usize,
+        logit_softcap: f32,
     ) {
         self.inner.attention(
             out, q, key_cache, value_cache, att, pos, n_heads, n_kv_heads, head_size, seq_len,
-            kv_dim,
+            kv_dim, logit_softcap,
         );
     }
 

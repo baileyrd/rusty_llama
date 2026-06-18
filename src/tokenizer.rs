@@ -24,8 +24,8 @@ use crate::gguf::{Gguf, MetaValue};
 
 /// A tokenizer: either SentencePiece-style (SPM) or byte-level BPE.
 pub enum Tokenizer {
-    /// SentencePiece-style (llama2.c / `llama` GGUF).
-    Spm(Spm),
+    /// SentencePiece-style (llama2.c / `llama` GGUF). Boxed to keep the enum small.
+    Spm(Box<Spm>),
     /// GPT-2 byte-level BPE (`gpt2` GGUF). Boxed — it's much larger than `Spm`.
     Bpe(Box<Bpe>),
 }
@@ -33,7 +33,7 @@ pub enum Tokenizer {
 impl Tokenizer {
     /// Build an SPM tokenizer directly from pieces and merge scores.
     pub fn from_vocab(vocab: Vec<Vec<u8>>, scores: Vec<f32>) -> Self {
-        Tokenizer::Spm(Spm::from_vocab(vocab, scores))
+        Tokenizer::Spm(Box::new(Spm::from_vocab(vocab, scores)))
     }
 
     /// Build a BPE tokenizer from encoded tokens and ordered merges.
@@ -48,7 +48,7 @@ impl Tokenizer {
 
     /// Load an SPM `tokenizer.bin` with exactly `vocab_size` entries.
     pub fn load<P: AsRef<Path>>(path: P, vocab_size: usize) -> Result<Self> {
-        Ok(Tokenizer::Spm(Spm::load(path, vocab_size)?))
+        Ok(Tokenizer::Spm(Box::new(Spm::load(path, vocab_size)?)))
     }
 
     /// Build a tokenizer from a GGUF file, dispatching on
@@ -56,7 +56,7 @@ impl Tokenizer {
     pub fn from_gguf(gguf: &Gguf) -> Result<Self> {
         let model = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
         match model {
-            "llama" => Ok(Tokenizer::Spm(Spm::from_gguf(gguf)?)),
+            "llama" => Ok(Tokenizer::Spm(Box::new(Spm::from_gguf(gguf)?))),
             "gpt2" => Ok(Tokenizer::Bpe(Box::new(Bpe::from_gguf(gguf)?))),
             other => Err(Error::Format(format!(
                 "unsupported GGUF tokenizer model '{other}' (have 'llama'/SPM, 'gpt2'/BPE)"
@@ -70,6 +70,36 @@ impl Tokenizer {
             Tokenizer::Spm(t) => t.encode(text, bos, eos),
             Tokenizer::Bpe(t) => t.encode(text, bos, eos),
         }
+    }
+
+    /// Whether a BOS token should be prepended on encode (GGUF
+    /// `tokenizer.ggml.add_bos_token`, default `true`). Llama/SPM models set
+    /// `true`; Qwen2 sets `false`, so callers must not force a BOS for it.
+    pub fn add_bos(&self) -> bool {
+        match self {
+            Tokenizer::Spm(t) => t.add_bos,
+            Tokenizer::Bpe(t) => t.add_bos,
+        }
+    }
+
+    /// The model's primary EOS token id (GGUF `eos_token_id`), for stopping
+    /// generation. `None` if the GGUF declared none.
+    pub fn eos(&self) -> Option<usize> {
+        match self {
+            Tokenizer::Spm(t) => t.eos,
+            Tokenizer::Bpe(t) => t.eos,
+        }
+    }
+
+    /// Whether `token` ends generation: the EOS or end-of-turn (`eot`) token.
+    /// Used by the decode loop to stop at a turn boundary (e.g. Qwen2
+    /// `<|im_end|>`, Gemma `<end_of_turn>`, Phi-3 `<|end|>`).
+    pub fn is_eog(&self, token: usize) -> bool {
+        let (eos, eot) = match self {
+            Tokenizer::Spm(t) => (t.eos, t.eot),
+            Tokenizer::Bpe(t) => (t.eos, t.eot),
+        };
+        eos == Some(token) || eot == Some(token)
     }
 
     /// Decode `token` (preceded by `prev_token`) into the bytes to emit.
@@ -201,6 +231,15 @@ pub struct Spm {
     /// Control / user-defined tokens recognized verbatim (empty unless built
     /// from a GGUF that marks them via `tokenizer.ggml.token_type`).
     specials: SpecialTokens,
+    /// Whether to prepend BOS on encode (GGUF `add_bos_token`, default true).
+    add_bos: bool,
+    /// BOS / EOS token ids (GGUF `bos_token_id` / `eos_token_id`; default 1 / 2,
+    /// the llama2.c `tokenizer.bin` convention).
+    bos: usize,
+    eos: Option<usize>,
+    /// End-of-turn token id (GGUF `eot_token_id`), if the model declares a chat
+    /// turn-end distinct from `eos` (e.g. Gemma's `<end_of_turn>`).
+    eot: Option<usize>,
 }
 
 impl Spm {
@@ -219,6 +258,10 @@ impl Spm {
             lookup,
             max_token_length,
             specials: SpecialTokens::default(),
+            add_bos: true,
+            bos: 1,
+            eos: Some(2),
+            eot: None,
         }
     }
 
@@ -293,6 +336,23 @@ impl Spm {
 
         let mut tk = Spm::from_vocab(vocab, scores);
         tk.specials = SpecialTokens::from_gguf(gguf, &raw);
+        tk.add_bos = gguf
+            .meta_u64("tokenizer.ggml.add_bos_token")
+            .map(|v| v != 0)
+            .unwrap_or(true);
+        tk.bos = gguf
+            .meta_u64("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+            .unwrap_or(1);
+        tk.eos = gguf
+            .meta_u64("tokenizer.ggml.eos_token_id")
+            .ok()
+            .map(|v| v as usize)
+            .or(tk.eos);
+        tk.eot = gguf
+            .meta_u64("tokenizer.ggml.eot_token_id")
+            .ok()
+            .map(|v| v as usize);
         Ok(tk)
     }
 
@@ -304,7 +364,7 @@ impl Spm {
     pub fn encode(&self, text: &str, bos: bool, eos: bool) -> Vec<usize> {
         let mut tokens: Vec<usize> = Vec::new();
         if bos {
-            tokens.push(1);
+            tokens.push(self.bos);
         }
         // The dummy leading space is added only to the first ordinary span.
         let mut first = true;
@@ -319,7 +379,9 @@ impl Spm {
             }
         });
         if eos {
-            tokens.push(2);
+            if let Some(e) = self.eos {
+                tokens.push(e);
+            }
         }
         tokens
     }
@@ -443,6 +505,9 @@ pub struct Bpe {
     specials: SpecialTokens,
     bos: Option<usize>,
     eos: Option<usize>,
+    eot: Option<usize>,
+    /// Whether to prepend BOS on encode (GGUF `add_bos_token`, default true).
+    add_bos: bool,
 }
 
 impl Bpe {
@@ -498,6 +563,8 @@ impl Bpe {
             specials,
             bos,
             eos,
+            eot: None,
+            add_bos: true,
         }
     }
 
@@ -540,7 +607,16 @@ impl Bpe {
         let pre = gguf.meta_str("tokenizer.ggml.pre").unwrap_or("gpt-2");
         let specials = SpecialTokens::from_gguf(gguf, &tokens);
 
-        Ok(Bpe::build(tokens, merges, bos, eos, pre, specials))
+        let mut bpe = Bpe::build(tokens, merges, bos, eos, pre, specials);
+        bpe.add_bos = gguf
+            .meta_u64("tokenizer.ggml.add_bos_token")
+            .map(|v| v != 0)
+            .unwrap_or(true);
+        bpe.eot = gguf
+            .meta_u64("tokenizer.ggml.eot_token_id")
+            .ok()
+            .map(|v| v as usize);
+        Ok(bpe)
     }
 
     /// Encode `text`, optionally bracketing with BOS/EOS.

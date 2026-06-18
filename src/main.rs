@@ -43,7 +43,7 @@ Options:
   --embd-normalize <n>    embedding norm: 2 = L2, -1 = none     (default: 2)
   --chat                  treat -i as one user turn via the chat template
   --system <text>         system message for --chat
-  --chat-template <name>  chatml|llama3|qwen2 (default: auto-detect)
+  --chat-template <name>  chatml|llama3|qwen2|gemma|phi3 (default: auto-detect)
   --lora <path>           apply a LoRA adapter GGUF
   --lora-scale <float>    LoRA strength multiplier         (default: 1.0)
   --control-vector <path> apply a control-vector GGUF
@@ -136,7 +136,7 @@ fn resolve_chat_template(
     }
     if !args.chat_template.is_empty() {
         return ChatTemplate::from_name(&args.chat_template).map(Some).ok_or_else(|| {
-            format!("unknown --chat-template '{}' (chatml|llama3|qwen2)", args.chat_template).into()
+            format!("unknown --chat-template '{}'", args.chat_template).into()
         });
     }
     if let Some(g) = gguf {
@@ -145,13 +145,13 @@ fn resolve_chat_template(
             return Ok(Some(t));
         }
     }
-    Err("could not detect a chat template; pass --chat-template chatml|llama3|qwen2".into())
+    Err("could not detect a chat template; pass --chat-template (chatml|llama3|qwen2|gemma|phi3)".into())
 }
 
 fn run_embedding(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
     let backend = make_backend(&args.backend)?;
     let mut state = RunState::new(&model.config);
-    let tokens = tokenizer.encode(&args.prompt, true, false);
+    let tokens = tokenizer.encode(&args.prompt, tokenizer.add_bos(), false);
     if tokens.is_empty() {
         return Err("embedding mode needs a non-empty prompt (-i)".into());
     }
@@ -186,7 +186,7 @@ fn run_embedding(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<()
 }
 
 fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
-    let tokens = tokenizer.encode(&args.prompt, true, false);
+    let tokens = tokenizer.encode(&args.prompt, tokenizer.add_bos(), false);
     stream_generation(model, tokenizer, args, &tokens)
 }
 
@@ -209,8 +209,9 @@ fn run_chat(
         content: args.prompt.clone(),
     });
     let prompt = template.render(&msgs, true);
-    // llama-3 emits its own <|begin_of_text|>; others rely on the tokenizer BOS.
-    let tokens = tokenizer.encode(&prompt, !template.emits_bos(), false);
+    // Prepend BOS only if the model wants one (add_bos_token) and the template
+    // doesn't already emit its own (llama-3's <|begin_of_text|>).
+    let tokens = tokenizer.encode(&prompt, tokenizer.add_bos() && !template.emits_bos(), false);
     stream_generation(model, tokenizer, args, &tokens)
 }
 

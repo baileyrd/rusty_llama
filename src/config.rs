@@ -2,6 +2,7 @@
 
 use std::f64::consts::PI;
 
+use crate::arch::Arch;
 use crate::error::{Error, Result};
 
 /// RoPE long-context scaling, as carried in GGUF `{arch}.rope.scaling.*`.
@@ -87,6 +88,18 @@ pub struct Config {
     pub rope_dim: usize,
     /// RoPE long-context frequency scaling (none for short-context models).
     pub rope_scaling: RopeScaling,
+    /// Model architecture (selects the graph variant and tensor set).
+    pub arch: Arch,
+    /// Explicit attention head dimension. `0` means "derive from `dim / n_heads`"
+    /// (Llama / Qwen2 / Phi-3); Gemma sets it independently, so `n_heads *
+    /// head_dim` need not equal `dim`.
+    pub head_dim: usize,
+    /// Scale applied to the input token embeddings (`1.0`, except Gemma = `sqrt(dim)`).
+    pub embd_scale: f32,
+    /// tanh softcap on attention scores before softmax (`0.0` = off; Gemma2 = 50).
+    pub attn_logit_softcap: f32,
+    /// tanh softcap on the final output logits (`0.0` = off; Gemma2 = 30).
+    pub final_logit_softcap: f32,
 }
 
 impl Default for Config {
@@ -104,6 +117,11 @@ impl Default for Config {
             rms_eps: 1e-5,
             rope_dim: 0,
             rope_scaling: RopeScaling::None,
+            arch: Arch::Llama,
+            head_dim: 0,
+            embd_scale: 1.0,
+            attn_logit_softcap: 0.0,
+            final_logit_softcap: 0.0,
         }
     }
 }
@@ -115,13 +133,24 @@ impl Config {
     /// Dimension of a single attention head.
     #[inline]
     pub fn head_size(&self) -> usize {
-        self.dim / self.n_heads
+        if self.head_dim != 0 {
+            self.head_dim
+        } else {
+            self.dim / self.n_heads
+        }
     }
 
     /// Total width of the key/value projections (`n_kv_heads * head_size`).
     #[inline]
     pub fn kv_dim(&self) -> usize {
-        self.dim * self.n_kv_heads / self.n_heads
+        self.head_size() * self.n_kv_heads
+    }
+
+    /// Total width of the query projection (`n_heads * head_size`). Equals `dim`
+    /// for Llama-style models but differs when `head_dim` is set (Gemma).
+    #[inline]
+    pub fn q_dim(&self) -> usize {
+        self.n_heads * self.head_size()
     }
 
     /// How many query heads share each key/value head.
@@ -270,7 +299,9 @@ impl Config {
         if self.dim == 0 || self.n_heads == 0 || self.n_kv_heads == 0 || self.vocab_size == 0 {
             return bad("dim/n_heads/n_kv_heads/vocab_size must be non-zero".into());
         }
-        if !self.dim.is_multiple_of(self.n_heads) {
+        // When the head dim is derived from `dim` (Llama-style) it must divide
+        // evenly; an explicit `head_dim` (Gemma) decouples the two.
+        if self.head_dim == 0 && !self.dim.is_multiple_of(self.n_heads) {
             return bad(format!(
                 "dim ({}) must be divisible by n_heads ({})",
                 self.dim, self.n_heads

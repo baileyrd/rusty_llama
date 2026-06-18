@@ -2,13 +2,13 @@
 //! weights/tokenizer, and run the forward pass.
 
 use rusty_llama::dummy::{
-    synthetic_control_vector_gguf, synthetic_gguf, synthetic_gguf_gpt2, synthetic_gguf_gpt2_special,
-    synthetic_gguf_typed, synthetic_lora_gguf,
+    synthetic_control_vector_gguf, synthetic_gguf, synthetic_gguf_arch, synthetic_gguf_gpt2,
+    synthetic_gguf_gpt2_special, synthetic_gguf_typed, synthetic_lora_gguf,
 };
 use rusty_llama::quant::dequantize;
 use rusty_llama::{
-    forward, generate, Config, ControlVector, CpuBackend, GgmlType, Gguf, LoraAdapter, Model,
-    RopeScaling, RunState, SamplerChain, Tokenizer,
+    forward, forward_prefill, generate, Arch, Config, ControlVector, CpuBackend, GgmlType, Gguf,
+    LoraAdapter, Model, RopeScaling, RunState, SamplerChain, Tokenizer,
 };
 
 fn cfg() -> Config {
@@ -367,4 +367,121 @@ fn control_vector_rejects_out_of_range_layer() {
     let cvb = synthetic_control_vector_gguf(c.dim, &[c.n_layers], 0.5); // layer == n_layers (OOB)
     let cvg = Gguf::parse(&cvb).unwrap();
     assert!(ControlVector::from_gguf(&cvg, &model, 1.0).is_err());
+}
+
+// --- Breadth architectures (Phase 3.1): Qwen2 / Phi-3 / Gemma2 ---------------
+//
+// All three are NeoX-RoPE archs, so a successful load + finite forward also
+// exercises the load-time NeoX→interleaved Q/K (and bias) permute that
+// `model::neox_src`/`permute_neox` implement — there is no separate unit test
+// for that private helper.
+
+#[test]
+fn qwen2_loads_with_qkv_bias_and_forward_finite() {
+    let c = cfg();
+    let bytes = synthetic_gguf_arch(&c, "qwen2");
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+
+    assert_eq!(model.config.arch, Arch::Qwen2);
+    // Qwen2 carries additive Q/K/V projection biases.
+    let q_dim = model.config.q_dim();
+    let kv_dim = model.config.kv_dim();
+    assert_eq!(model.weights.bq.len(), c.n_layers * q_dim);
+    assert_eq!(model.weights.bk.len(), c.n_layers * kv_dim);
+    assert_eq!(model.weights.bv.len(), c.n_layers * kv_dim);
+    assert!(!model.weights.bq.is_empty());
+
+    // A short prefill over a couple of tokens runs without panic, finite logits.
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward_prefill(&model, &mut s, &backend, &[1, 2, 3], 0);
+    assert_eq!(s.logits().len(), c.vocab_size);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn phi3_fused_qkv_and_gate_up_split_shapes() {
+    let c = cfg();
+    let bytes = synthetic_gguf_arch(&c, "phi3");
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+
+    assert_eq!(model.config.arch, Arch::Phi3);
+    // The fused `attn_qkv` and gate+up `ffn_up` tensors split into the standard
+    // projections with the right row counts.
+    let q_dim = model.config.q_dim();
+    let kv_dim = model.config.kv_dim();
+    assert_eq!(model.weights.wq[0].rows(), q_dim);
+    assert_eq!(model.weights.wk[0].rows(), kv_dim);
+    assert_eq!(model.weights.wv[0].rows(), kv_dim);
+    assert_eq!(model.weights.w1[0].rows(), c.hidden_dim);
+    assert_eq!(model.weights.w3[0].rows(), c.hidden_dim);
+    // No QKV bias / sandwich norms for Phi-3.
+    assert!(model.weights.bq.is_empty());
+    assert!(model.weights.rms_attn_post.is_empty());
+
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward_prefill(&model, &mut s, &backend, &[1, 2, 3], 0);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn gemma2_loads_softcaps_and_sandwich_norms() {
+    let c = cfg();
+    let bytes = synthetic_gguf_arch(&c, "gemma2");
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+
+    assert_eq!(model.config.arch, Arch::Gemma2);
+    // Gemma scales the input embeddings by sqrt(dim); Gemma2 softcaps the
+    // attention scores (50) and the final logits (30).
+    assert_eq!(model.config.embd_scale, (c.dim as f32).sqrt());
+    assert_eq!(model.config.attn_logit_softcap, 50.0);
+    assert_eq!(model.config.final_logit_softcap, 30.0);
+    // "Sandwich" post-attention / post-FFN norms are present.
+    assert_eq!(model.weights.rms_attn_post.len(), c.n_layers * c.dim);
+    assert_eq!(model.weights.rms_ffn_post.len(), c.n_layers * c.dim);
+    assert!(!model.weights.rms_attn_post.is_empty());
+    assert!(!model.weights.rms_ffn_post.is_empty());
+
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward_prefill(&model, &mut s, &backend, &[1, 2, 3], 0);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn gemma2_explicit_head_dim_q_dim_ne_dim_forward_finite() {
+    // An explicit head_dim decouples q_dim from dim: dim=32, n_heads=4,
+    // head_dim=16 ⇒ q_dim = 64 ≠ 32, exercising the q_dim != dim attention path
+    // (and the NeoX permute over q_dim rows).
+    let c = Config {
+        dim: 32,
+        hidden_dim: 32,
+        n_layers: 2,
+        n_heads: 4,
+        n_kv_heads: 2,
+        vocab_size: 32,
+        seq_len: 8,
+        shared_weights: true,
+        head_dim: 16,
+        ..Default::default()
+    };
+    let bytes = synthetic_gguf_arch(&c, "gemma2");
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+
+    assert_eq!(model.config.arch, Arch::Gemma2);
+    assert_eq!(model.config.head_dim, 16);
+    assert_eq!(model.config.q_dim(), 64);
+    assert_ne!(model.config.q_dim(), model.config.dim);
+    assert_eq!(model.config.embd_scale, (c.dim as f32).sqrt());
+
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward_prefill(&model, &mut s, &backend, &[1, 2, 3], 0);
+    assert_eq!(s.logits().len(), c.vocab_size);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
 }

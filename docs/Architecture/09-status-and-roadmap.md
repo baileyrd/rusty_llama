@@ -26,7 +26,7 @@ The roadmap is defined in `PERFORMANCE.md` §"Improvement roadmap". Status:
 | 2 | **GPU int8 / DP4A decode** | 🟡 PARTIAL — Stage 1 (Q8_0) adopted behind an all-Q8_0 gate (~1.5–1.6×). Stage 2 (Q4_K/Q6_K) built + **bit-exact** but **intentionally not wired**: on bandwidth-bound decode the packed-kquant unpack saves no bytes (~0.94–0.98× Q4_K, ~0.70× Q6_K). Kept behind tests per a pre-agreed kill-criterion. (`02`/`03`/`05`) |
 | 3 | **GPU tensor cores** | ✅ (CUDA) / ❌ (portable) — portable wgpu coopmat **ruled out** on this hardware (advertises only f16 16×16; wgpu 29 wires only 8×8 f32 → silent all-zero garbage). CUDA backend M0→M2b + resident decode **DONE and merged** (PRs #20–#22). Closed PR #23: a naive packed dequant-GEMV was ~1.6× *slower* than f16. (`03`/`04`) |
 | 4 | Flash attention; cache-blocked CPU prefill | ❌ not started |
-| 5 | **Breadth** (archs, samplers, KV-quant, server) | ❌ not started |
+| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 arch breadth SHIPPED**: Qwen2 / Phi-3 / Gemma 2 grown off the `Arch` registry seam (`src/arch.rs`), each greedy-validated vs `llama-cli` (plan [`plans/phase-3-archs.md`](plans/phase-3-archs.md)). Samplers / KV-quant / server still ❌; 3.2 MoE + 3.3 recurrent remain sketches. |
 
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ Two distinct walls (see `04` and `../Research/03-cuda-kernels.md`):
 
 | Area | State | Doc |
 |---|---|---|
-| Architectures | Llama family only (name-prefix dispatch, not a registry) | `01`,`06` |
+| Architectures | Llama, Qwen2, Phi-3, Gemma 2 (`Arch` registry seam, `src/arch.rs`; Phase 3.1) | `01`,`06`,`plans/phase-3-archs.md` |
 | Quant (consume) | F32/F16/Q4_0/Q8_0/Q4_K/Q6_K | `05` |
 | Quant (produce) | only `quantize_q8_0` (test fixtures); no quantize-to-disk | `05` |
 | Tokenizers | SPM + GPT-2 BPE (GPT-2/Llama-3/Qwen2 pretokenizers) | `07` |
@@ -112,7 +112,7 @@ than HANDOFF assumed** — llama.cpp's `mmvq` is a concrete, proven design to po
   craft. High effort, bounded, proven by llama.cpp's 419 tok/s.
 
 **Tier 3 — large capability jumps** (`06`, `../Research/05`,`06`,`08`):
-- Arch registry → Qwen/Gemma/Phi (near-Llama) then MoE/Mamba/RWKV.
+- Arch registry → Qwen2/Phi-3/Gemma2 (near-Llama) ✅ **done — Phase 3.1** (`plans/phase-3-archs.md`); next MoE/Mamba/RWKV.
 - Paged multi-sequence KV → continuous batching → minimal server.
 - GBNF grammar / JSON-schema structured output (needs the Tier-1 sampler layer).
 

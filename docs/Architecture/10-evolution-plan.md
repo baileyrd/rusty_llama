@@ -125,13 +125,13 @@ vs the f16 path and vs `llama-bench`; adopt only on a win, else park behind test
 
 ## Phase 3 — Architecture breadth
 
-_Detailed plans for Phases 3–5 are deepened just-in-time once their prerequisites land (see [`plans/README.md`](plans/README.md)); they stay at this sketch level for now._
+**Phase 3.1 detailed plan (shipped) → [`plans/phase-3-archs.md`](plans/phase-3-archs.md).** 3.2/3.3 stay master-plan sketches, deepened just-in-time once their prerequisites land (see [`plans/README.md`](plans/README.md)).
 
 Built on the Phase-0.2 registry. Tiered by distance from Llama (`../Research/05`).
 
 | # | Work | Notes | Size |
 |---|---|---|---|
-| 3.1 | **Near-Llama archs: Qwen2, Gemma(2), Phi-3.** | Mostly hparam/norm/activation/rope variants (QK-norm, attn/ffn scaling, tied embeddings); reuse the existing block. Biggest capability/effort ratio. | M each |
+| 3.1 | **Near-Llama archs: Qwen2, Phi-3, Gemma 2.** ✅ **SHIPPED** | Hparam/norm/activation/rope variants off the shared block: Qwen2 QKV bias, Phi-3 fused QKV+gate/up split at load, Gemma2 GeGLU/√dim-embed/explicit-head_dim/sandwich-norms/logit-softcap; cross-cutting NeoX-rope handled by a load-time Q/K permute (one rope kernel). Greedy-validated vs `llama-cli`. Detail: [`plans/phase-3-archs.md`](plans/phase-3-archs.md). | M each |
 | 3.2 | **MoE (Mixtral / Qwen-MoE).** | Needs expert routing — a `MUL_MAT_ID`-equivalent: a new `Backend` op (gather top-k experts + weighted matmul) implemented on CPU first (oracle), then CUDA. | L |
 | 3.3 | **Recurrent (Mamba/RWKV).** | New state model (not a KV cache) + new ops; large, separable. Defer unless demanded. | XL |
 

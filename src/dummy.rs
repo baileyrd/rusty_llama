@@ -4,6 +4,7 @@
 //! without downloading multi-megabyte weights. The output is, of course,
 //! gibberish — the weights are deterministic noise.
 
+use crate::arch::Arch;
 use crate::config::{Config, RopeScaling};
 use crate::quant::GgmlType;
 use crate::tokenizer::Tokenizer;
@@ -373,6 +374,153 @@ fn build_gguf(
             tinfo.u64(d);
         }
         tinfo.u32(tensor_type(dims).to_u32());
+        tinfo.u64(*off);
+    }
+
+    // Assemble: header | metadata | tensor infos | pad | data.
+    let mut out = GgufWriter::default();
+    out.buf.extend_from_slice(b"GGUF");
+    out.u32(3); // version
+    out.u64(tensors.len() as u64);
+    out.u64(meta.kv_count);
+    out.buf.extend_from_slice(&meta.buf);
+    out.buf.extend_from_slice(&tinfo.buf);
+    let padded = out.buf.len().next_multiple_of(GGUF_ALIGNMENT);
+    out.buf.resize(padded, 0);
+    out.buf.extend_from_slice(&data);
+    out.buf
+}
+
+/// A synthetic GGUF for one of the breadth architectures — `"qwen2"`, `"phi3"`,
+/// or `"gemma2"` — emitting that arch's tensor set and `{arch}.*` hparam keys so
+/// [`crate::Model::from_gguf`] exercises the non-Llama load paths: Qwen2 QKV
+/// bias, Phi-3 fused `attn_qkv` / gate+up splits, Gemma2 sandwich norms +
+/// logit softcaps + `sqrt(dim)` embedding scale, and the NeoX→interleaved Q/K
+/// permute shared by all three. F32 weights with a dummy SentencePiece
+/// tokenizer; the byte layout mirrors [`synthetic_gguf`].
+///
+/// `config.head_dim` is honoured: leave it `0` for the derived `head_size =
+/// dim / n_heads` (so `q_dim == dim`), or set it to emit `{arch}.attention.
+/// key_length` and drive the `q_dim != dim` path (Gemma2). An unrecognized
+/// `arch` falls back to the plain Llama tensor set.
+pub fn synthetic_gguf_arch(config: &Config, arch: &str) -> Vec<u8> {
+    let c = config;
+    let a = Arch::from_name(arch);
+    let q_dim = c.q_dim();
+    let kv_dim = c.kv_dim();
+
+    // (name, ggml dims) in file order. ggml dims are [cols, rows] = input axis
+    // first, output axis second — exactly as [`build_gguf`] lays them out.
+    let mut tensors: Vec<(String, Vec<u64>)> = vec![
+        ("token_embd.weight".into(), vec![c.dim as u64, c.vocab_size as u64]),
+        ("output_norm.weight".into(), vec![c.dim as u64]),
+    ];
+    if !c.shared_weights {
+        tensors.push((
+            "output.weight".into(),
+            vec![c.dim as u64, c.vocab_size as u64],
+        ));
+    }
+    for i in 0..c.n_layers {
+        let p = format!("blk.{i}.");
+        tensors.push((format!("{p}attn_norm.weight"), vec![c.dim as u64]));
+        if a.fused_qkv() {
+            // Phi-3: one fused Q+K+V projection, split at load.
+            tensors.push((
+                format!("{p}attn_qkv.weight"),
+                vec![c.dim as u64, (q_dim + 2 * kv_dim) as u64],
+            ));
+        } else {
+            tensors.push((format!("{p}attn_q.weight"), vec![c.dim as u64, q_dim as u64]));
+            tensors.push((format!("{p}attn_k.weight"), vec![c.dim as u64, kv_dim as u64]));
+            tensors.push((format!("{p}attn_v.weight"), vec![c.dim as u64, kv_dim as u64]));
+        }
+        if a.has_qkv_bias() {
+            // Qwen2: additive Q/K/V projection biases (1-D).
+            tensors.push((format!("{p}attn_q.bias"), vec![q_dim as u64]));
+            tensors.push((format!("{p}attn_k.bias"), vec![kv_dim as u64]));
+            tensors.push((format!("{p}attn_v.bias"), vec![kv_dim as u64]));
+        }
+        tensors.push((format!("{p}attn_output.weight"), vec![q_dim as u64, c.dim as u64]));
+        tensors.push((format!("{p}ffn_norm.weight"), vec![c.dim as u64]));
+        if a.fused_gate_up() {
+            // Phi-3: fused gate+up in `ffn_up` (rows = 2*hidden_dim), split at load.
+            tensors.push((
+                format!("{p}ffn_up.weight"),
+                vec![c.dim as u64, (2 * c.hidden_dim) as u64],
+            ));
+        } else {
+            tensors.push((format!("{p}ffn_gate.weight"), vec![c.dim as u64, c.hidden_dim as u64]));
+            tensors.push((format!("{p}ffn_up.weight"), vec![c.dim as u64, c.hidden_dim as u64]));
+        }
+        tensors.push((format!("{p}ffn_down.weight"), vec![c.hidden_dim as u64, c.dim as u64]));
+        if a.sandwich_norm() {
+            // Gemma2: post-attention / post-FFN "sandwich" norms (1-D).
+            tensors.push((format!("{p}post_attention_norm.weight"), vec![c.dim as u64]));
+            tensors.push((format!("{p}post_ffw_norm.weight"), vec![c.dim as u64]));
+        }
+    }
+
+    // Build the (aligned) tensor-data section, recording each tensor's offset.
+    // Deterministic small F32 values, byte-for-byte the [`build_gguf`] scheme.
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ tensors.len() as u64;
+    for (_, dims) in &tensors {
+        let n: usize = dims.iter().product::<u64>() as usize;
+        let mut bytes = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            let u = (rng.wrapping_mul(0x2545F491_4F6CDD1D) >> 40) as u32;
+            let v = (u as f32 / (1u32 << 24) as f32 - 0.5) * 0.2;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let off = data.len().next_multiple_of(GGUF_ALIGNMENT);
+        data.resize(off, 0);
+        offsets.push(off as u64);
+        data.extend_from_slice(&bytes);
+    }
+
+    // Metadata, all under the `{arch}.` prefix the loader keys on.
+    let mut meta = GgufWriter::default();
+    meta.kv_str("general.architecture", arch);
+    meta.kv_u32("general.alignment", GGUF_ALIGNMENT as u32);
+    meta.kv_u32(&format!("{arch}.embedding_length"), c.dim as u32);
+    meta.kv_u32(&format!("{arch}.block_count"), c.n_layers as u32);
+    meta.kv_u32(&format!("{arch}.attention.head_count"), c.n_heads as u32);
+    meta.kv_u32(&format!("{arch}.attention.head_count_kv"), c.n_kv_heads as u32);
+    meta.kv_u32(&format!("{arch}.feed_forward_length"), c.hidden_dim as u32);
+    meta.kv_u32(&format!("{arch}.context_length"), c.seq_len as u32);
+    meta.kv_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), c.rms_eps);
+    meta.kv_f32(&format!("{arch}.rope.freq_base"), c.rope_freq_base);
+    meta.kv_u32(&format!("{arch}.rope.dimension_count"), c.rotary_dim() as u32);
+    // Explicit attention head dim (drives q_dim != dim); emitted only when set.
+    if c.head_dim != 0 {
+        meta.kv_u32(&format!("{arch}.attention.key_length"), c.head_dim as u32);
+    }
+    // Gemma2 tanh logit softcaps on the attention scores and the final logits.
+    if a.sandwich_norm() {
+        meta.kv_f32(&format!("{arch}.attn_logit_softcapping"), 50.0);
+        meta.kv_f32(&format!("{arch}.final_logit_softcapping"), 30.0);
+    }
+    // A dummy SentencePiece tokenizer so the file is also tokenizer-loadable.
+    meta.kv_str("tokenizer.ggml.model", "llama");
+    meta.kv_str_array("tokenizer.ggml.tokens", &dummy_tokens(c.vocab_size));
+    meta.kv_f32_array("tokenizer.ggml.scores", &vec![0.0; c.vocab_size]);
+    meta.kv_u32("tokenizer.ggml.bos_token_id", 1);
+    meta.kv_u32("tokenizer.ggml.eos_token_id", 2);
+
+    // Tensor info table (all F32).
+    let mut tinfo = GgufWriter::default();
+    for ((name, dims), off) in tensors.iter().zip(&offsets) {
+        tinfo.raw_str(name.as_bytes());
+        tinfo.u32(dims.len() as u32);
+        for &d in dims {
+            tinfo.u64(d);
+        }
+        tinfo.u32(GgmlType::F32.to_u32());
         tinfo.u64(*off);
     }
 
