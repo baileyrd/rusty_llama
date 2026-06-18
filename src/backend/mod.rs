@@ -9,10 +9,14 @@
 //! backend (rayon for parallelism, autovectorized inner loops for SIMD).
 
 mod cpu;
+#[cfg(feature = "cuda")]
+mod cuda;
 #[cfg(feature = "gpu")]
 mod gpu;
 
 pub use cpu::CpuBackend;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;
 #[cfg(feature = "gpu")]
 pub use gpu::GpuBackend;
 

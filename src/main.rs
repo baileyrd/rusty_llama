@@ -29,7 +29,7 @@ Options:
   -s <int>      RNG seed                  (default: wall-clock time)
   -n <int>      number of steps to run    (default: 256)
   -i <text>     prompt                    (default: \"\")
-  --backend <b> compute backend: cpu|gpu  (default: cpu; gpu needs --features gpu)
+  --backend <b> compute backend: cpu|gpu|cuda  (default: cpu; gpu/cuda need their cargo feature)
   -h            show this help";
 
 struct Args {
@@ -131,7 +131,22 @@ fn make_backend(name: &str) -> Result<Box<dyn Backend>, Box<dyn Error>> {
                     .into())
             }
         }
-        other => Err(format!("unknown backend '{other}' (have cpu/gpu)").into()),
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                let cuda = rusty_llama::CudaBackend::new()
+                    .map_err(|e| format!("CUDA backend unavailable: {e}"))?;
+                eprintln!("[cuda] device: {}", cuda.device_name());
+                Ok(Box::new(cuda))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err("this binary was built without CUDA support; rebuild with \
+                     `cargo build --release --features cuda`"
+                    .into())
+            }
+        }
+        other => Err(format!("unknown backend '{other}' (have cpu/gpu/cuda)").into()),
     }
 }
 
