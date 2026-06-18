@@ -53,16 +53,28 @@ roadmap this serves.
     (delegates otherwise). **Fused prefill ~3300 tok/s** (256 tok, dim 1024 ×4L)
     vs ~2800 per-op TF32, 533 wgpu.
 
-**Next session → measure on the real model + tighten residency.** (1) Re-bench
-the **real TinyLlama-1.1B Q4_K_M** prefill via the CLI / a dedicated harness vs
-`llama-bench -ngl 99`; the synthetic 4-layer number understates the win on 22
-layers. (2) The fused prefill still downloads each layer's K/V with a per-layer
-`synchronize` (for the decode handoff) — batch those (keep per-layer device KV,
-one download at the end) to recover the serialization cost. (3) Optionally keep
-the KV resident across prefill→decode (a fused decode `forward_step`, like the
-wgpu path) instead of round-tripping to host. Decode stays GEMV/bandwidth-bound
-at batch=1. `dot4I8Packed` (item 2) and the portable wgpu coopmat path are both
-exhausted.
+- **Real-model bench DONE (the honest number).** `bench_prefill_real_tinyllama`
+  loads the actual TinyLlama-1.1B Q4_K_M (22 layers, dim 2048, GQA 32/4) and
+  prefills 512 tokens. **CUDA fused 744 tok/s · CPU 57 · llama.cpp CUDA 19,637**
+  (fresh `llama-bench`). So we're **13× CPU but ~26× behind llama.cpp** on the
+  real model — the synthetic 4-layer proxy (3300) badly overstated us. f32
+  weights (~4.4 GB) fit in the 12 GB card; no OOM.
+
+**Next session → close the real gap, in ROI order (it's kernel quality now, not
+"use tensor cores"):**
+1. **Flash/tiled attention kernel.** The current `attention_kernel` is a naive
+   one-thread-per-(row,head) O(n²) serial loop — the dominant cost at 512 tokens.
+   A tiled, shared-memory, multi-thread-per-head kernel (or coopmat) is the
+   biggest single win.
+2. **Keep weights quantized on device** (Q4_K/Q6_K) + dequant-in-kernel before
+   the GEMM, or store f16 — instead of the current f32 expansion (~7× the Q4_K
+   weight bandwidth llama.cpp streams, and 2× VRAM).
+3. **Batch the per-layer KV download** (keep per-layer device KV, one download at
+   the end) and/or keep KV resident across prefill→decode (a fused decode
+   `forward_step`, like the wgpu path).
+
+Decode stays GEMV/bandwidth-bound at batch=1. `dot4I8Packed` (item 2) and the
+portable wgpu coopmat path are both exhausted.
 
 ---
 

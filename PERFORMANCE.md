@@ -135,11 +135,27 @@ separable from the CLI but is far below llama.cpp regardless).
    coherence test, rel L2 ~3e-4). **Fused prefill: ~3300 tok/s** on the synthetic
    shape (256 tok, dim 1024 × 4L) — up from ~2800 (per-op TF32) and 533 (wgpu).
 
-   Remaining headroom: the fused path still downloads each layer's K/V to host
-   with a per-layer sync (for the decode handoff) — batching those would help,
-   and the real win is on deep models (TinyLlama's 22 layers ≫ the 4-layer
-   synthetic). **Next:** re-bench the real TinyLlama Q4_K_M vs `llama-bench` and
-   keep KV resident across prefill→decode. Decode itself stays on the
+   **Real-model result (the north star), measured on the actual TinyLlama-1.1B
+   Q4_K_M — 22 layers, dim 2048, GQA 32/4 — prefill 512 tokens, same machine:**
+
+   | Path | Prefill (pp512) | vs CUDA |
+   | --- | ---: | --- |
+   | rusty_llama — CPU | 57 tok/s | — |
+   | rusty_llama — **CUDA (fused, TF32)** | **744 tok/s** | 13.1× CPU |
+   | llama.cpp — CUDA (`llama-bench`, fresh) | **19,637 tok/s** | **~26× faster** |
+
+   So the resident fused CUDA prefill is **~13× the CPU** but still **~26× behind
+   llama.cpp** on the real model — the synthetic 4-layer proxy (where we hit
+   ~3300) badly overstated our position. The tensor cores are engaged and we beat
+   both CPU and our own wgpu f32 path, but the real gap is now **kernel quality,
+   not "do we use tensor cores"**: (a) the attention kernel is a naive
+   one-thread-per-(row,head) O(n²) loop (llama.cpp uses flash attention) — the
+   dominant cost at 512 tokens; (b) weights are dequantized to **f32** on device
+   (~4.4 GB, ~7× the Q4_K bandwidth llama.cpp streams); (c) the fused path still
+   downloads each layer's K/V to host with a per-layer `synchronize` for the
+   decode handoff. **Next, in ROI order:** a tiled/flash attention kernel; keep
+   weights **quantized on device** + dequant-in-kernel (or f16); batch the KV
+   download / keep KV resident across prefill→decode. Decode itself stays on the
    CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.

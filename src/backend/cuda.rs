@@ -893,6 +893,67 @@ mod tests {
         );
     }
 
+    /// Real-model prefill: the fused CUDA prefill vs CPU on the actual
+    /// TinyLlama-1.1B Q4_K_M GGUF (22 layers, dim 2048) — the north-star shape,
+    /// not the 4-layer synthetic proxy. Set `RUSTY_LLAMA_GGUF` to override the
+    /// path (default: the repo-root TinyLlama). Compare the CUDA tok/s against
+    /// `llamacpp_bench/lc/llama-bench.exe -m <gguf> -ngl 99` (pp512). NOTE: the
+    /// weights are cached as **f32** on-device (~4.4 GB for this model — the cost
+    /// of the TF32 path); if it OOMs, that motivates f16 weights.
+    #[test]
+    #[ignore = "needs the real GGUF + a CUDA device; run with --release --features cuda -- --ignored --nocapture"]
+    fn bench_prefill_real_tinyllama() {
+        use std::time::Instant;
+        let Some(b) = cuda() else { return };
+
+        let path = std::env::var("RUSTY_LLAMA_GGUF")
+            .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string());
+        let cp = match crate::Checkpoint::open(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping real-model bench: can't open {path}: {e}");
+                return;
+            }
+        };
+        if !crate::Gguf::is_gguf(cp.bytes()) {
+            eprintln!("skipping real-model bench: {path} is not a GGUF");
+            return;
+        }
+        let gguf = crate::Gguf::parse(cp.bytes()).expect("parse gguf");
+        let model = crate::Model::from_gguf(&gguf).expect("build model");
+        let c = &model.config;
+        let n = 512.min(c.seq_len);
+        let tokens: Vec<usize> = (0..n).map(|i| (i * 7 + 1) % c.vocab_size).collect();
+        eprintln!(
+            "model {path}: dim {} hidden {} layers {} heads {}/{} vocab {} seq {} | prefill {n} tok",
+            c.dim, c.hidden_dim, c.n_layers, c.n_heads, c.n_kv_heads, c.vocab_size, c.seq_len,
+        );
+
+        let prefill = |backend: &dyn Backend| {
+            let mut s = crate::RunState::new(&model.config);
+            backend.forward_prefill(&model, &mut s, &tokens, 0);
+        };
+
+        // Warm up: dequantize + upload weights to device, make them resident.
+        prefill(&b);
+        let t = Instant::now();
+        prefill(&b);
+        let cuda = t.elapsed();
+
+        let cpu_backend = CpuBackend::new();
+        let t = Instant::now();
+        prefill(&cpu_backend);
+        let cpu = t.elapsed();
+
+        eprintln!(
+            "real prefill {n} tok: cuda={cuda:?} ({:.0} tok/s) cpu={cpu:?} ({:.0} tok/s) \
+             -> cuda {:.1}x cpu",
+            n as f64 / cuda.as_secs_f64(),
+            n as f64 / cpu.as_secs_f64(),
+            cpu.as_secs_f64() / cuda.as_secs_f64(),
+        );
+    }
+
     // --- M2a: on-device kernel parity (vs the CpuBackend oracle) ---------
 
     /// Assert two slices match within `atol + rtol·|want|`.
