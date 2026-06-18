@@ -38,6 +38,8 @@ pub enum ChatTemplate {
     ChatMl,
     Llama3,
     Qwen2,
+    Gemma,
+    Phi3,
 }
 
 impl ChatTemplate {
@@ -57,9 +59,17 @@ impl ChatTemplate {
             if t.contains("<|im_start|>") {
                 return Some(ChatTemplate::ChatMl);
             }
+            if t.contains("<start_of_turn>") {
+                return Some(ChatTemplate::Gemma);
+            }
+            if t.contains("<|assistant|>") {
+                return Some(ChatTemplate::Phi3);
+            }
         }
         match arch {
             "qwen2" | "qwen" => Some(ChatTemplate::Qwen2),
+            "gemma" | "gemma2" => Some(ChatTemplate::Gemma),
+            "phi3" => Some(ChatTemplate::Phi3),
             _ => None,
         }
     }
@@ -70,6 +80,8 @@ impl ChatTemplate {
             "chatml" => Some(ChatTemplate::ChatMl),
             "llama3" => Some(ChatTemplate::Llama3),
             "qwen2" => Some(ChatTemplate::Qwen2),
+            "gemma" => Some(ChatTemplate::Gemma),
+            "phi3" => Some(ChatTemplate::Phi3),
             _ => None,
         }
     }
@@ -86,6 +98,8 @@ impl ChatTemplate {
         match self {
             ChatTemplate::ChatMl | ChatTemplate::Qwen2 => render_chatml(msgs, add_gen),
             ChatTemplate::Llama3 => render_llama3(msgs, add_gen),
+            ChatTemplate::Gemma => render_gemma(msgs, add_gen),
+            ChatTemplate::Phi3 => render_phi3(msgs, add_gen),
         }
     }
 }
@@ -116,6 +130,54 @@ fn render_llama3(msgs: &[Message], add_gen: bool) -> String {
     }
     if add_gen {
         s.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    s
+}
+
+/// Gemma chat format: `<start_of_turn>{user|model}\n…<end_of_turn>`. Gemma has no
+/// system role, so a system message is folded into the first user turn. The
+/// tokenizer supplies `<bos>` (add_bos), so the template doesn't emit it.
+fn render_gemma(msgs: &[Message], add_gen: bool) -> String {
+    let mut s = String::new();
+    let mut sys = String::new();
+    for m in msgs {
+        match m.role {
+            Role::System => sys = m.content.clone(),
+            Role::User => {
+                s.push_str("<start_of_turn>user\n");
+                if !sys.is_empty() {
+                    s.push_str(&sys);
+                    s.push_str("\n\n");
+                    sys.clear();
+                }
+                s.push_str(&m.content);
+                s.push_str("<end_of_turn>\n");
+            }
+            Role::Assistant => {
+                s.push_str("<start_of_turn>model\n");
+                s.push_str(&m.content);
+                s.push_str("<end_of_turn>\n");
+            }
+        }
+    }
+    if add_gen {
+        s.push_str("<start_of_turn>model\n");
+    }
+    s
+}
+
+/// Phi-3 chat format: `<|system|>\n…<|end|>\n<|user|>\n…<|end|>\n<|assistant|>\n`.
+fn render_phi3(msgs: &[Message], add_gen: bool) -> String {
+    let mut s = String::new();
+    for m in msgs {
+        s.push_str("<|");
+        s.push_str(m.role.as_str());
+        s.push_str("|>\n");
+        s.push_str(&m.content);
+        s.push_str("<|end|>\n");
+    }
+    if add_gen {
+        s.push_str("<|assistant|>\n");
     }
     s
 }
@@ -158,6 +220,29 @@ mod tests {
     }
 
     #[test]
+    fn gemma_folds_system_into_user_and_maps_roles() {
+        let m = vec![
+            Message { role: Role::System, content: "S".into() },
+            Message { role: Role::User, content: "U".into() },
+            Message { role: Role::Assistant, content: "A".into() },
+        ];
+        assert_eq!(
+            ChatTemplate::Gemma.render(&m, true),
+            "<start_of_turn>user\nS\n\nU<end_of_turn>\n\
+             <start_of_turn>model\nA<end_of_turn>\n\
+             <start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn phi3_renders_role_tags() {
+        assert_eq!(
+            ChatTemplate::Phi3.render(&msgs(), true),
+            "<|system|>\nS<|end|>\n<|user|>\nU<|end|>\n<|assistant|>\n"
+        );
+    }
+
+    #[test]
     fn add_gen_false_omits_assistant_header() {
         assert!(!ChatTemplate::ChatMl.render(&msgs(), false).contains("assistant"));
     }
@@ -168,6 +253,8 @@ mod tests {
         assert_eq!(ChatTemplate::from_name("llama3"), Some(ChatTemplate::Llama3));
         assert_eq!(ChatTemplate::from_name("qwen2"), Some(ChatTemplate::Qwen2));
         assert_eq!(ChatTemplate::from_name("jinja"), None);
+        assert_eq!(ChatTemplate::from_name("gemma"), Some(ChatTemplate::Gemma));
+        assert_eq!(ChatTemplate::from_name("phi3"), Some(ChatTemplate::Phi3));
     }
 
     #[test]

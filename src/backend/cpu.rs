@@ -156,6 +156,7 @@ impl Backend for CpuBackend {
         head_size: usize,
         seq_len: usize,
         kv_dim: usize,
+        logit_softcap: f32,
     ) {
         let kv_mul = n_heads / n_kv_heads;
         let scale = 1.0 / (head_size as f32).sqrt();
@@ -175,6 +176,13 @@ impl Backend for CpuBackend {
                     let base = t * kv_dim + kv_off;
                     let k = &key_cache[base..base + head_size];
                     *score = q_h.iter().zip(k).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                }
+
+                // Gemma2 tanh logit softcapping on the raw scores.
+                if logit_softcap > 0.0 {
+                    for score in att_h[..=pos].iter_mut() {
+                        *score = logit_softcap * (*score / logit_softcap).tanh();
+                    }
                 }
 
                 softmax(&mut att_h[..=pos]);
@@ -538,6 +546,7 @@ mod tests {
             head_size,
             1,
             2,
+            0.0,
         );
         approx(out[0], 3.0);
         approx(out[1], -4.0);
@@ -565,6 +574,7 @@ mod tests {
             head_size,
             2,
             2,
+            0.0,
         );
         approx(out[0], 4.0); // mean(2, 6)
         approx(out[1], 6.0); // mean(4, 8)

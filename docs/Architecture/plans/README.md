@@ -15,7 +15,7 @@ speculative and likely rewritten).
 | 0 — Foundations & seams | **Detailed** (next up) | [`phase-0-foundations.md`](phase-0-foundations.md) |
 | 1 — Cheap breadth | **Detailed** | [`phase-1-breadth.md`](phase-1-breadth.md) |
 | 2 — Decode speed lever | **Detailed** | [`phase-2-decode-gemv.md`](phase-2-decode-gemv.md) |
-| 3 — Architecture breadth | Sketch | `../10-evolution-plan.md` → deepen when Phase 0.2 lands |
+| 3 — Architecture breadth | **3.1 Detailed** (shipped); 3.2/3.3 sketch | [`phase-3-archs.md`](phase-3-archs.md) |
 | 4 — Paged KV → server | Sketch | `../10-evolution-plan.md` → deepen when Phase 0.4 + Phase 1 land |
 | 5 — Structured output & advanced | Sketch | `../10-evolution-plan.md` → deepen opportunistically |
 

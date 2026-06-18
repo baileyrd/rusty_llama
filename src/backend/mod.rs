@@ -92,6 +92,8 @@ pub trait Backend: Send + Sync {
         head_size: usize,
         seq_len: usize,
         kv_dim: usize,
+        // tanh softcap on the QK scores before softmax (0.0 = disabled; Gemma2 = 50).
+        logit_softcap: f32,
     );
 
     /// SwiGLU gate: `hb[i] = silu(hb[i]) * hb2[i]`.
@@ -99,6 +101,27 @@ pub trait Backend: Send + Sync {
     /// Operates on the whole slice, so it doubles as the batched form: pass a
     /// `(rows, hidden_dim)` buffer flattened row-major.
     fn swiglu(&self, hb: &mut [f32], hb2: &[f32]);
+
+    /// GeGLU gate: `hb[i] = gelu(hb[i]) * hb2[i]` (tanh-approximation GELU).
+    ///
+    /// The Gemma FFN counterpart to [`Backend::swiglu`]; like it, elementwise over
+    /// the whole slice, so it doubles as the batched form. The default scalar impl
+    /// is shared by every backend — the GeGLU archs run the per-op path, where the
+    /// activation operates on host `f32` slices regardless of backend.
+    ///
+    /// Matches ggml's `GGML_UNARY_OP_GELU`, which evaluates GELU through an f16
+    /// lookup table: the input is rounded to f16, GELU is computed, and the result
+    /// is rounded to f16. Replicating those roundings keeps decode bit-close to
+    /// llama.cpp (a measurable difference on Gemma's deep stacks).
+    fn geglu(&self, hb: &mut [f32], hb2: &[f32]) {
+        use crate::quant::{f16_to_f32, f32_to_f16};
+        const C: f32 = 0.797_884_6; // sqrt(2/pi)
+        for (h, &g) in hb.iter_mut().zip(hb2) {
+            let x = f16_to_f32(f32_to_f16(*h));
+            let gelu = 0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh());
+            *h = f16_to_f32(f32_to_f16(gelu)) * g;
+        }
+    }
 
     /// Residual add: `out[i] += x[i]`.
     ///
@@ -183,6 +206,7 @@ pub trait Backend: Send + Sync {
         head_size: usize,
         seq_len: usize,
         kv_dim: usize,
+        logit_softcap: f32,
     ) {
         let dim = n_heads * head_size;
         for r in 0..rows {
@@ -198,6 +222,7 @@ pub trait Backend: Send + Sync {
                 head_size,
                 seq_len,
                 kv_dim,
+                logit_softcap,
             );
         }
     }

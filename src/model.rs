@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use crate::adapter::ControlVector;
-use crate::arch::Arch;
+use crate::arch::{Arch, FfnActivation};
 use crate::backend::Backend;
 use crate::config::{Config, RopeScaling, RopeTable};
 use crate::error::{Error, Result};
@@ -45,6 +45,15 @@ pub struct Weights<'a> {
     pub w2: Vec<QMatrix<'a>>,
     /// Per-layer SwiGLU up projection, each `(hidden_dim, dim)`.
     pub w3: Vec<QMatrix<'a>>,
+    /// Per-layer Q/K/V projection biases (Qwen2), flattened `(n_layers, q_dim)`,
+    /// `(n_layers, kv_dim)`, `(n_layers, kv_dim)`. Empty unless the arch has QKV bias.
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
+    /// Per-layer post-attention / post-FFN "sandwich" RMSNorm weights (Gemma2),
+    /// flattened `(n_layers, dim)`. Empty unless `arch.sandwich_norm()`.
+    pub rms_attn_post: Vec<f32>,
+    pub rms_ffn_post: Vec<f32>,
 }
 
 /// A parsed model: hyper-parameters plus weights.
@@ -121,6 +130,11 @@ impl<'a> Model<'a> {
                 w1: f32_layers(w1, l, p.hidden_dim, p.dim)?,
                 w2: f32_layers(w2, l, p.dim, p.hidden_dim)?,
                 w3: f32_layers(w3, l, p.hidden_dim, p.dim)?,
+                bq: Vec::new(),
+                bk: Vec::new(),
+                bv: Vec::new(),
+                rms_attn_post: Vec::new(),
+                rms_ffn_post: Vec::new(),
             },
         })
     }
@@ -137,7 +151,8 @@ impl<'a> Model<'a> {
     /// long-context RoPE scaling (`linear` / `llama3` / `yarn`).
     pub fn from_gguf(gguf: &Gguf<'a>) -> Result<Self> {
         let arch_str = gguf.meta_str("general.architecture")?.to_owned();
-        let names = Arch::from_name(&arch_str).tensor_names();
+        let arch = Arch::from_name(&arch_str);
+        let names = arch.tensor_names();
         let key = |k: &str| format!("{arch_str}.{k}");
 
         let dim = gguf.meta_u64(&key("embedding_length"))? as usize;
@@ -153,9 +168,16 @@ impl<'a> Model<'a> {
             .meta_f32(&key("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
 
+        // Explicit attention head dim (Gemma); 0 ⇒ derive from dim / n_heads.
+        let head_dim = gguf.meta_u64(&key("attention.key_length")).unwrap_or(0) as usize;
+        let head_size = if head_dim != 0 {
+            head_dim
+        } else {
+            dim.checked_div(n_heads).unwrap_or(0)
+        };
+
         // RoPE rotary dimension. Defaults to the full head size; a smaller value
         // (partial rotary) leaves each head's trailing dims unrotated.
-        let head_size = dim.checked_div(n_heads).unwrap_or(0);
         let rope_dim = gguf
             .meta_u64(&key("rope.dimension_count"))
             .unwrap_or(head_size as u64) as usize;
@@ -167,6 +189,16 @@ impl<'a> Model<'a> {
 
         // Long-context RoPE frequency scaling (linear / llama3 / yarn), if any.
         let rope_scaling = read_rope_scaling(gguf, &arch_str)?;
+
+        // Gemma scales the input embeddings by sqrt(dim); Gemma2 also softcaps
+        // attention scores and final logits (keys absent ⇒ 0.0 ⇒ disabled).
+        let embd_scale = if matches!(arch, Arch::Gemma2) {
+            (dim as f32).sqrt()
+        } else {
+            1.0
+        };
+        let attn_logit_softcap = gguf.meta_f32(&key("attn_logit_softcapping")).unwrap_or(0.0);
+        let final_logit_softcap = gguf.meta_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
 
         // Vocabulary size = second (row) dimension of the embedding tensor.
         let tok_embd = gguf
@@ -193,12 +225,30 @@ impl<'a> Model<'a> {
             rms_eps,
             rope_dim,
             rope_scaling,
+            arch,
+            head_dim,
+            embd_scale,
+            attn_logit_softcap,
+            final_logit_softcap,
         };
         config.validate()?;
+        let q_dim = config.q_dim();
+        let kv_dim = config.kv_dim();
 
-        // RMSNorm weights are tiny; concatenate them to owned f32.
-        let concat = |suffix: &str| -> Result<Vec<f32>> {
+        // RMSNorm weights are tiny; concatenate to owned f32. (Gemma stores them
+        // as `1 + offset`, but modern GGUF converters bake the `+1` in, so they
+        // are used as-is like every other arch — matching current llama.cpp.)
+        let concat_norm = |suffix: &str| -> Result<Vec<f32>> {
             let mut v = Vec::with_capacity(n_layers * dim);
+            for i in 0..n_layers {
+                v.extend_from_slice(&deq_tensor(gguf, &format!("blk.{i}.{suffix}"))?);
+            }
+            Ok(v)
+        };
+        let final_norm = deq_tensor(gguf, names.output_norm)?;
+        // Per-layer bias vectors (Qwen2), concatenated to owned f32.
+        let concat_bias = |suffix: &str| -> Result<Vec<f32>> {
+            let mut v = Vec::new();
             for i in 0..n_layers {
                 v.extend_from_slice(&deq_tensor(gguf, &format!("blk.{i}.{suffix}"))?);
             }
@@ -209,6 +259,74 @@ impl<'a> Model<'a> {
             (0..n_layers)
                 .map(|i| qmatrix_from_gguf(gguf, &format!("blk.{i}.{suffix}")))
                 .collect()
+        };
+
+        // Q/K/V: a fused `attn_qkv` split into the three projections (Phi-3), or
+        // one tensor each (everything else).
+        let (wq, wk, wv) = if arch.fused_qkv() {
+            let (mut wq, mut wk, mut wv) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n_layers {
+                let qkv = qmatrix_from_gguf(gguf, &format!("blk.{i}.{}", names.attn_qkv))?;
+                let mut parts = split_rows(qkv, &[q_dim, kv_dim, kv_dim])?.into_iter();
+                wq.push(parts.next().unwrap());
+                wk.push(parts.next().unwrap());
+                wv.push(parts.next().unwrap());
+            }
+            (wq, wk, wv)
+        } else {
+            (layers(names.attn_q)?, layers(names.attn_k)?, layers(names.attn_v)?)
+        };
+
+        // Gate/up FFN: a fused gate+up tensor in `ffn_up` split in half (Phi-3),
+        // or separate `ffn_gate` / `ffn_up` tensors.
+        let (w1, w3) = if arch.fused_gate_up() {
+            let (mut w1, mut w3) = (Vec::new(), Vec::new());
+            for i in 0..n_layers {
+                let gate_up = qmatrix_from_gguf(gguf, &format!("blk.{i}.{}", names.ffn_up))?;
+                let mut parts = split_rows(gate_up, &[hidden_dim, hidden_dim])?.into_iter();
+                w1.push(parts.next().unwrap());
+                w3.push(parts.next().unwrap());
+            }
+            (w1, w3)
+        } else {
+            (layers(names.ffn_gate)?, layers(names.ffn_up)?)
+        };
+
+        let (bq, bk, bv) = if arch.has_qkv_bias() {
+            (
+                concat_bias(names.attn_q_bias)?,
+                concat_bias(names.attn_k_bias)?,
+                concat_bias(names.attn_v_bias)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+
+        // NeoX-RoPE archs (Qwen2/Phi-3/Gemma): permute Q/K weights + biases into
+        // the interleaved layout the NORM rope kernel expects — the inverse of the
+        // permutation Llama GGUFs ship baked in. V / output projections untouched.
+        let (wq, wk, bq, bk) = if arch.rope_neox() {
+            let (hs, rot) = (config.head_size(), config.rotary_dim());
+            let wq = wq
+                .into_iter()
+                .map(|m| permute_neox(m, hs, rot))
+                .collect::<Result<Vec<_>>>()?;
+            let wk = wk
+                .into_iter()
+                .map(|m| permute_neox(m, hs, rot))
+                .collect::<Result<Vec<_>>>()?;
+            let (mut bq, mut bk) = (bq, bk);
+            permute_neox_bias(&mut bq, n_layers, q_dim, hs, rot);
+            permute_neox_bias(&mut bk, n_layers, kv_dim, hs, rot);
+            (wq, wk, bq, bk)
+        } else {
+            (wq, wk, bq, bk)
+        };
+
+        let (rms_attn_post, rms_ffn_post) = if arch.sandwich_norm() {
+            (concat_norm(names.attn_post_norm)?, concat_norm(names.ffn_post_norm)?)
+        } else {
+            (Vec::new(), Vec::new())
         };
 
         let token_embedding_table = qmatrix_from_gguf(gguf, names.token_embd)?;
@@ -224,16 +342,21 @@ impl<'a> Model<'a> {
             weights: Weights {
                 token_embedding_table,
                 wcls,
-                rms_att_weight: Cow::Owned(concat(names.attn_norm)?),
-                rms_ffn_weight: Cow::Owned(concat(names.ffn_norm)?),
-                rms_final_weight: Cow::Owned(deq_tensor(gguf, names.output_norm)?),
-                wq: layers(names.attn_q)?,
-                wk: layers(names.attn_k)?,
-                wv: layers(names.attn_v)?,
+                rms_att_weight: Cow::Owned(concat_norm(names.attn_norm)?),
+                rms_ffn_weight: Cow::Owned(concat_norm(names.ffn_norm)?),
+                rms_final_weight: Cow::Owned(final_norm),
+                wq,
+                wk,
+                wv,
                 wo: layers(names.attn_output)?,
-                w1: layers(names.ffn_gate)?,
+                w1,
                 w2: layers(names.ffn_down)?,
-                w3: layers(names.ffn_up)?,
+                w3,
+                bq,
+                bk,
+                bv,
+                rms_attn_post,
+                rms_ffn_post,
             },
         })
     }
@@ -430,13 +553,17 @@ impl RunState {
     /// Allocate all scratch buffers for a given model configuration.
     pub fn new(c: &Config) -> Self {
         let kv_dim = c.kv_dim();
+        let q_dim = c.q_dim();
+        // Attention buffers follow `q_dim` (= dim for Llama-style, but distinct
+        // when an explicit head_dim makes n_heads*head_dim ≠ dim, e.g. Gemma).
+        let big = c.dim.max(q_dim);
         RunState {
             x: vec![0.0; c.dim],
-            xb: vec![0.0; c.dim],
-            xb2: vec![0.0; c.dim],
+            xb: vec![0.0; big],
+            xb2: vec![0.0; big],
             hb: vec![0.0; c.hidden_dim],
             hb2: vec![0.0; c.hidden_dim],
-            q: vec![0.0; c.dim],
+            q: vec![0.0; q_dim],
             att: vec![0.0; c.n_heads * c.seq_len],
             logits: vec![0.0; c.vocab_size],
             kv: KvCache::new(c.n_layers, c.seq_len, kv_dim),
@@ -499,33 +626,40 @@ pub fn forward_with(
     let dim = p.dim;
     let kv_dim = p.kv_dim();
     let head_size = p.head_size();
+    let q_dim = p.q_dim();
+    let bias = p.arch.has_qkv_bias();
+    let sandwich = p.arch.sandwich_norm();
+    let act = p.arch.ffn_activation();
 
-    // Seed the residual stream with this token's (dequantized) embedding.
+    // Seed the residual stream with this token's (dequantized) embedding,
+    // scaled by `embd_scale` (1.0 except Gemma).
     w.token_embedding_table.dequant_row(token, &mut state.x);
+    if p.embd_scale != 1.0 {
+        for v in state.x.iter_mut() {
+            *v *= p.embd_scale;
+        }
+    }
 
     for layer in 0..p.n_layers {
         // --- Attention ---------------------------------------------------
         backend.rmsnorm(
-            &mut state.xb,
+            &mut state.xb[..dim],
             &state.x,
             slice(&w.rms_att_weight, layer, dim),
             p.rms_eps,
         );
 
-        backend.matmul(&mut state.q, &state.xb, &w.wq[layer]);
-        backend.matmul(
-            state.kv.k_slot_mut(layer, pos),
-            &state.xb,
-            &w.wk[layer],
-        );
-        backend.matmul(
-            state.kv.v_slot_mut(layer, pos),
-            &state.xb,
-            &w.wv[layer],
-        );
+        backend.matmul(&mut state.q[..q_dim], &state.xb[..dim], &w.wq[layer]);
+        backend.matmul(state.kv.k_slot_mut(layer, pos), &state.xb[..dim], &w.wk[layer]);
+        backend.matmul(state.kv.v_slot_mut(layer, pos), &state.xb[..dim], &w.wv[layer]);
+        if bias {
+            add_bias(&mut state.q[..q_dim], slice(&w.bq, layer, q_dim));
+            add_bias(state.kv.k_slot_mut(layer, pos), slice(&w.bk, layer, kv_dim));
+            add_bias(state.kv.v_slot_mut(layer, pos), slice(&w.bv, layer, kv_dim));
+        }
 
         backend.rope(
-            &mut state.q,
+            &mut state.q[..q_dim],
             state.kv.k_slot_mut(layer, pos),
             pos,
             head_size,
@@ -535,8 +669,8 @@ pub fn forward_with(
         );
 
         backend.attention(
-            &mut state.xb,
-            &state.q,
+            &mut state.xb[..q_dim],
+            &state.q[..q_dim],
             state.kv.layer_k(layer),
             state.kv.layer_v(layer),
             &mut state.att,
@@ -546,31 +680,58 @@ pub fn forward_with(
             head_size,
             p.seq_len,
             kv_dim,
+            p.attn_logit_softcap,
         );
 
-        backend.matmul(&mut state.xb2, &state.xb, &w.wo[layer]);
-        backend.add(&mut state.x, &state.xb2);
+        backend.matmul(&mut state.xb2[..dim], &state.xb[..q_dim], &w.wo[layer]);
+        if sandwich {
+            // Gemma2 post-attention "sandwich" norm on the block output before
+            // the residual add.
+            backend.rmsnorm(
+                &mut state.xb[..dim],
+                &state.xb2[..dim],
+                slice(&w.rms_attn_post, layer, dim),
+                p.rms_eps,
+            );
+            backend.add(&mut state.x, &state.xb[..dim]);
+        } else {
+            backend.add(&mut state.x, &state.xb2[..dim]);
+        }
 
-        // --- Feed-forward (SwiGLU) --------------------------------------
+        // --- Feed-forward ------------------------------------------------
         backend.rmsnorm(
-            &mut state.xb,
+            &mut state.xb[..dim],
             &state.x,
             slice(&w.rms_ffn_weight, layer, dim),
             p.rms_eps,
         );
-        backend.matmul(&mut state.hb, &state.xb, &w.w1[layer]);
-        backend.matmul(&mut state.hb2, &state.xb, &w.w3[layer]);
-        backend.swiglu(&mut state.hb, &state.hb2);
-        backend.matmul(&mut state.xb, &state.hb, &w.w2[layer]);
-        backend.add(&mut state.x, &state.xb);
+        backend.matmul(&mut state.hb, &state.xb[..dim], &w.w1[layer]);
+        backend.matmul(&mut state.hb2, &state.xb[..dim], &w.w3[layer]);
+        match act {
+            FfnActivation::SwiGlu => backend.swiglu(&mut state.hb, &state.hb2),
+            FfnActivation::GeGlu => backend.geglu(&mut state.hb, &state.hb2),
+        }
+        backend.matmul(&mut state.xb[..dim], &state.hb, &w.w2[layer]);
+        if sandwich {
+            backend.rmsnorm(
+                &mut state.xb2[..dim],
+                &state.xb[..dim],
+                slice(&w.rms_ffn_post, layer, dim),
+                p.rms_eps,
+            );
+            backend.add(&mut state.x, &state.xb2[..dim]);
+        } else {
+            backend.add(&mut state.x, &state.xb[..dim]);
+        }
         if let Some(cv) = control {
             cv.apply_layer(layer, &mut state.x);
         }
     }
 
     // Final norm (written into `xb` to avoid aliasing `x`) then classifier.
-    backend.rmsnorm(&mut state.xb, &state.x, &w.rms_final_weight, p.rms_eps);
-    backend.matmul(&mut state.logits, &state.xb, &w.wcls);
+    backend.rmsnorm(&mut state.xb[..dim], &state.x, &w.rms_final_weight, p.rms_eps);
+    backend.matmul(&mut state.logits, &state.xb[..dim], &w.wcls);
+    softcap(&mut state.logits, p.final_logit_softcap);
 }
 
 /// Run the transformer over a whole batch of `tokens` at once (prompt prefill).
@@ -621,6 +782,7 @@ pub fn forward_prefill_with<B: Backend + ?Sized>(
         model.config.rms_eps,
     );
     backend.matmul(&mut state.logits, &xb_last, &w.wcls);
+    softcap(&mut state.logits, model.config.final_logit_softcap);
 }
 
 /// Run the batched layer stack over `tokens` (writing their KV at `pos_base`) and
@@ -639,21 +801,33 @@ fn prefill_residual<B: Backend + ?Sized>(
     let dim = p.dim;
     let kv_dim = p.kv_dim();
     let head_size = p.head_size();
+    let q_dim = p.q_dim();
     let hidden = p.hidden_dim;
     let n = tokens.len();
+    let bias = p.arch.has_qkv_bias();
+    let sandwich = p.arch.sandwich_norm();
+    let act = p.arch.ffn_activation();
 
-    // Row-major (n, *) scratch for the batch.
+    // Row-major (n, *) scratch for the batch. Attention output `ao` is `(n,
+    // q_dim)` and kept separate from the `(n, dim)` norm scratch `xb`, since
+    // q_dim need not equal dim (Gemma).
     let mut x = vec![0.0f32; n * dim];
     let mut xb = vec![0.0f32; n * dim];
     let mut xb2 = vec![0.0f32; n * dim];
-    let mut q = vec![0.0f32; n * dim];
+    let mut q = vec![0.0f32; n * q_dim];
+    let mut ao = vec![0.0f32; n * q_dim];
     let mut hb = vec![0.0f32; n * hidden];
     let mut hb2 = vec![0.0f32; n * hidden];
 
-    // Seed each row with its token's (dequantized) embedding.
+    // Seed each row with its token's (dequantized) embedding, scaled (Gemma).
     for (r, &tok) in tokens.iter().enumerate() {
         w.token_embedding_table
             .dequant_row(tok, &mut x[r * dim..r * dim + dim]);
+    }
+    if p.embd_scale != 1.0 {
+        for v in x.iter_mut() {
+            *v *= p.embd_scale;
+        }
     }
 
     for layer in 0..p.n_layers {
@@ -663,6 +837,11 @@ fn prefill_residual<B: Backend + ?Sized>(
         backend.matmul_batch(&mut q, &xb, &w.wq[layer], n);
         backend.matmul_batch(state.kv.k_span_mut(layer, pos_base, n), &xb, &w.wk[layer], n);
         backend.matmul_batch(state.kv.v_span_mut(layer, pos_base, n), &xb, &w.wv[layer], n);
+        if bias {
+            add_bias_batch(&mut q, slice(&w.bq, layer, q_dim), q_dim, n);
+            add_bias_batch(state.kv.k_span_mut(layer, pos_base, n), slice(&w.bk, layer, kv_dim), kv_dim, n);
+            add_bias_batch(state.kv.v_span_mut(layer, pos_base, n), slice(&w.bv, layer, kv_dim), kv_dim, n);
+        }
 
         backend.rope_batch(
             &mut q,
@@ -671,13 +850,13 @@ fn prefill_residual<B: Backend + ?Sized>(
             n,
             head_size,
             kv_dim,
-            dim,
+            q_dim,
             &model.rope.inv_freq,
             model.rope.mscale,
         );
 
         backend.attention_batch(
-            &mut xb,
+            &mut ao,
             &q,
             state.kv.layer_k(layer),
             state.kv.layer_v(layer),
@@ -689,18 +868,32 @@ fn prefill_residual<B: Backend + ?Sized>(
             head_size,
             p.seq_len,
             kv_dim,
+            p.attn_logit_softcap,
         );
 
-        backend.matmul_batch(&mut xb2, &xb, &w.wo[layer], n);
-        backend.add(&mut x, &xb2);
+        backend.matmul_batch(&mut xb2, &ao, &w.wo[layer], n);
+        if sandwich {
+            backend.rmsnorm_batch(&mut xb, &xb2, slice(&w.rms_attn_post, layer, dim), p.rms_eps, n);
+            backend.add(&mut x, &xb);
+        } else {
+            backend.add(&mut x, &xb2);
+        }
 
-        // --- Feed-forward (SwiGLU) -------------------------------------
+        // --- Feed-forward -----------------------------------------------
         backend.rmsnorm_batch(&mut xb, &x, slice(&w.rms_ffn_weight, layer, dim), p.rms_eps, n);
         backend.matmul_batch(&mut hb, &xb, &w.w1[layer], n);
         backend.matmul_batch(&mut hb2, &xb, &w.w3[layer], n);
-        backend.swiglu(&mut hb, &hb2);
+        match act {
+            FfnActivation::SwiGlu => backend.swiglu(&mut hb, &hb2),
+            FfnActivation::GeGlu => backend.geglu(&mut hb, &hb2),
+        }
         backend.matmul_batch(&mut xb, &hb, &w.w2[layer], n);
-        backend.add(&mut x, &xb);
+        if sandwich {
+            backend.rmsnorm_batch(&mut xb2, &xb, slice(&w.rms_ffn_post, layer, dim), p.rms_eps, n);
+            backend.add(&mut x, &xb2);
+        } else {
+            backend.add(&mut x, &xb);
+        }
         if let Some(cv) = control {
             for r in 0..n {
                 cv.apply_layer(layer, &mut x[r * dim..(r + 1) * dim]);
@@ -789,7 +982,7 @@ pub fn generate(
     steps: usize,
     on_piece: impl FnMut(&[u8]),
 ) -> usize {
-    let prompt_tokens = tokenizer.encode(prompt, true, false);
+    let prompt_tokens = tokenizer.encode(prompt, tokenizer.add_bos(), false);
     generate_tokens(model, state, backend, tokenizer, sampler, &prompt_tokens, steps, on_piece)
 }
 
@@ -837,7 +1030,7 @@ pub fn generate_tokens(
             sampler.sample(state.logits())
         };
         pos += 1;
-        if next == 1 {
+        if next == 1 || tokenizer.is_eog(next) {
             break; // BOS doubles as an end-of-sequence delimiter here.
         }
         on_piece(&tokenizer.decode(token, next));
@@ -888,7 +1081,7 @@ fn generate_prefilled(
     let mut next = sampler.sample(state.logits());
     loop {
         pos += 1;
-        if next == 1 {
+        if next == 1 || tokenizer.is_eog(next) {
             break; // BOS doubles as an end-of-sequence delimiter here.
         }
         on_piece(&tokenizer.decode(token, next));
@@ -908,6 +1101,150 @@ fn generate_prefilled(
 #[inline]
 fn slice(tensor: &[f32], layer: usize, stride: usize) -> &[f32] {
     &tensor[layer * stride..layer * stride + stride]
+}
+
+/// Add a bias vector to a single activation row in place (`out[i] += bias[i]`).
+#[inline]
+fn add_bias(out: &mut [f32], bias: &[f32]) {
+    for (o, &b) in out.iter_mut().zip(bias) {
+        *o += b;
+    }
+}
+
+/// Add a bias vector to every row of a `(rows, width)` batch in place.
+#[inline]
+fn add_bias_batch(out: &mut [f32], bias: &[f32], width: usize, rows: usize) {
+    for r in 0..rows {
+        add_bias(&mut out[r * width..r * width + width], bias);
+    }
+}
+
+/// Gemma2 tanh logit softcapping (`x = cap · tanh(x / cap)`); a no-op when
+/// `cap <= 0`, so non-Gemma archs pay nothing.
+#[inline]
+fn softcap(x: &mut [f32], cap: f32) {
+    if cap > 0.0 {
+        for v in x.iter_mut() {
+            *v = cap * (*v / cap).tanh();
+        }
+    }
+}
+
+/// Split a fused row-major weight (Phi-3's `attn_qkv` / gate+up) into parts with
+/// the given row counts, each sharing the source bytes (zero-copy for the usual
+/// borrowed-from-mmap case). `row_counts` must sum to the source's row count.
+fn split_rows<'a>(m: QMatrix<'a>, row_counts: &[usize]) -> Result<Vec<QMatrix<'a>>> {
+    let total: usize = row_counts.iter().sum();
+    if total != m.rows() {
+        return Err(Error::Format(format!(
+            "fused tensor has {} rows, split expects {total}",
+            m.rows()
+        )));
+    }
+    let cols = m.cols();
+    let mut out = Vec::with_capacity(row_counts.len());
+    // Per-part [lo, hi) row ranges from the cumulative counts.
+    let ranges = || {
+        let mut off = 0usize;
+        row_counts.iter().map(move |&rc| {
+            let r = (off, off + rc);
+            off += rc;
+            r
+        })
+    };
+    match m {
+        QMatrix::F32 { data, .. } => match data {
+            Cow::Borrowed(d) => {
+                for (lo, hi) in ranges() {
+                    out.push(QMatrix::f32(Cow::Borrowed(&d[lo * cols..hi * cols]), hi - lo, cols)?);
+                }
+            }
+            Cow::Owned(d) => {
+                for (lo, hi) in ranges() {
+                    out.push(QMatrix::f32(
+                        Cow::Owned(d[lo * cols..hi * cols].to_vec()),
+                        hi - lo,
+                        cols,
+                    )?);
+                }
+            }
+        },
+        QMatrix::Quant { ty, data, .. } => match data {
+            Cow::Borrowed(d) => {
+                for (lo, hi) in ranges() {
+                    let (b0, b1) = (ty.bytes_for(lo * cols), ty.bytes_for(hi * cols));
+                    out.push(QMatrix::quant(ty, Cow::Borrowed(&d[b0..b1]), hi - lo, cols)?);
+                }
+            }
+            Cow::Owned(d) => {
+                for (lo, hi) in ranges() {
+                    let (b0, b1) = (ty.bytes_for(lo * cols), ty.bytes_for(hi * cols));
+                    out.push(QMatrix::quant(ty, Cow::Owned(d[b0..b1].to_vec()), hi - lo, cols)?);
+                }
+            }
+        },
+    }
+    Ok(out)
+}
+
+/// For output dim `i` (within a stack of heads each `head_size` wide, the first
+/// `rot` dims rotary), the OLD index that the permuted NeoX→interleaved layout
+/// puts at NEW position `i`. After this permutation the NORM rope kernel
+/// (rotating pairs `2j,2j+1`) reproduces NeoX rope (rotating `j, j+rot/2`).
+#[inline]
+fn neox_src(i: usize, head_size: usize, rot: usize) -> usize {
+    let base = (i / head_size) * head_size;
+    let d = i % head_size;
+    if d >= rot {
+        base + d // unrotated trailing dims pass through
+    } else if d.is_multiple_of(2) {
+        base + d / 2
+    } else {
+        base + rot / 2 + d / 2
+    }
+}
+
+/// Permute the output rows of a Q/K projection from NeoX (half-split) RoPE layout
+/// to the interleaved layout the NORM rope kernel expects (the inverse of the
+/// permutation llama.cpp's GGUF converter bakes into Llama weights). Materializes
+/// an owned copy — q/k only, a fraction of the weights.
+fn permute_neox<'a>(m: QMatrix<'_>, head_size: usize, rot: usize) -> Result<QMatrix<'a>> {
+    let (rows, cols) = (m.rows(), m.cols());
+    match m {
+        QMatrix::F32 { data, .. } => {
+            let mut out = vec![0.0f32; rows * cols];
+            for new in 0..rows {
+                let old = neox_src(new, head_size, rot);
+                out[new * cols..new * cols + cols]
+                    .copy_from_slice(&data[old * cols..old * cols + cols]);
+            }
+            QMatrix::f32(Cow::Owned(out), rows, cols)
+        }
+        QMatrix::Quant { ty, data, .. } => {
+            let rb = ty.bytes_for(cols);
+            let mut out = vec![0u8; rows * rb];
+            for new in 0..rows {
+                let old = neox_src(new, head_size, rot);
+                out[new * rb..new * rb + rb].copy_from_slice(&data[old * rb..old * rb + rb]);
+            }
+            QMatrix::quant(ty, Cow::Owned(out), rows, cols)
+        }
+    }
+}
+
+/// Permute the per-layer Q/K bias vectors (flattened `(n_layers, width)`) the same
+/// NeoX→interleaved way as [`permute_neox`]. No-op on an empty (bias-less) vec.
+fn permute_neox_bias(bias: &mut [f32], n_layers: usize, width: usize, head_size: usize, rot: usize) {
+    if bias.is_empty() {
+        return;
+    }
+    for l in 0..n_layers {
+        let seg = &mut bias[l * width..(l + 1) * width];
+        let orig = seg.to_vec();
+        for (i, s) in seg.iter_mut().enumerate() {
+            *s = orig[neox_src(i, head_size, rot)];
+        }
+    }
 }
 
 /// Reinterpret `len` little-endian f32s starting at element offset `elem_off`.
