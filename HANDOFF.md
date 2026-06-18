@@ -68,23 +68,32 @@ roadmap this serves.
     buffers), so the whole prefill runs with no in-loop `synchronize`; the KV is
     copied to host once after the loop for the decode handoff: **~4,450 tok/s,
     ~4.4× behind**.
+  - **Per-op overhead cut:** disabled cudarc event tracking (single-stream, so
+    it's pure overhead) + non-zeroing alloc for the fully-overwritten GEMM scratch.
+    Real model ~unchanged (**~4,500**, it's compute-bound) but the small synthetic
+    4-layer proxy went **16.7k → 25k** — so this helps op-heavy small models.
   Correctness held throughout (parity + prefill/decode coherence, rel L2 ≤6e-4).
   CPU baseline is throttle-noisy under sustained load — compare CUDA-vs-llama.cpp.
 
-**Next session → close the remaining ~4.4×, in ROI order:**
-1. **Keep weights quantized on device** + dequant-in-kernel before the GEMM —
-   `weight_f16` host-dequants then streams f16 weight bytes (~2× the Q4_K bytes
-   llama.cpp streams). The lift: cuBLASLt wants dense input, so this needs a
-   custom dequant→GEMM kernel (or a dequant-into-f16-scratch pass that still
-   streams the packed Q4_K from VRAM). Biggest remaining lever.
-2. **Keep KV resident across prefill→decode** — a fused decode `forward_step`
-   (like the wgpu `DecodeState` path) with the KV cache living on device, so the
-   end-of-prefill KV round-trip to host disappears entirely.
-3. **Further attention tuning** (warp-level reductions; online-softmax flash for
-   long context) and larger GEMM batching / overlap.
+**KEY FINDING: real-model prefill is now compute-bound (~4.4× behind llama.cpp);
+further prefill gains are diminishing without beating cuBLASLt. The big untapped
+lever is DECODE.**
 
-Decode stays GEMV/bandwidth-bound at batch=1. `dot4I8Packed` (item 2) and the
-portable wgpu coopmat path are both exhausted.
+**Next session → CUDA fused decode (the user-facing win).** Decode (`tg128`)
+currently delegates to the CPU (`CudaBackend::forward_step` → `self.cpu`).
+llama.cpp does **419 tok/s** decode; ours is CPU-bound. Build a resident fused
+`forward_step` (mirror the wgpu `DecodeState`: KV cache + activations live on
+device across steps, one token at a time). At batch=1 the matmuls are **GEMV and
+bandwidth-bound** (each weight read once, no reuse) — so this is exactly where
+**quantized-on-device weights / `dot4I8Packed`** pay off (unlike compute-bound
+prefill). Reuse the M2a kernels (rmsnorm/rope/attention/swiglu/add) + a GEMV.
+Guard with decode coherence vs CPU; bench `tg128` vs `llama-bench`.
+
+Lower-ROI prefill leftovers: quantized-on-device weights for prefill (needs a
+custom dequant→GEMM, modest gain since prefill is compute-bound); keep KV
+resident across prefill→decode; warp-level/flash attention. `dot4I8Packed`
+(roadmap item 2) helps **decode**, not the k-quant prefill GEMMs; the portable
+wgpu coopmat path is exhausted.
 
 ---
 
