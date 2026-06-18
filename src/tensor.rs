@@ -78,6 +78,15 @@ impl<'a> QMatrix<'a> {
         }
     }
 
+    /// Stable identity of the backing bytes — the pointer the resident weight
+    /// caches (and LoRA pair lookups) key on.
+    pub fn data_ptr(&self) -> usize {
+        match self {
+            QMatrix::F32 { data, .. } => data.as_ptr() as usize,
+            QMatrix::Quant { data, .. } => data.as_ptr() as usize,
+        }
+    }
+
     /// Dequantize a single row into `out` (`out.len()` must equal `cols`).
     ///
     /// Used both for the embedding lookup and (per-row) by the matmul kernel.

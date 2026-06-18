@@ -2,12 +2,13 @@
 
 use std::borrow::Cow;
 
+use crate::arch::Arch;
 use crate::backend::Backend;
 use crate::config::{Config, RopeScaling, RopeTable};
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 use crate::quant::{dequantize, GgmlType};
-use crate::sampler::Sampler;
+use crate::sampler::SamplerChain;
 use crate::tensor::QMatrix;
 use crate::tokenizer::Tokenizer;
 
@@ -130,12 +131,13 @@ impl<'a> Model<'a> {
     /// the `llama` architecture (and anything sharing its tensor naming).
     ///
     /// RoPE base frequency and RMSNorm epsilon are read from the file (so
-    /// Llama-3 / Qwen2-style θ values are honoured). Partial rotary
-    /// (`rope.dimension_count != head_size`) and long-context RoPE scaling are
-    /// not yet handled.
+    /// Llama-3 / Qwen2-style θ values are honoured), as are partial rotary
+    /// (`rope.dimension_count < head_size`, trailing dims left unrotated) and
+    /// long-context RoPE scaling (`linear` / `llama3` / `yarn`).
     pub fn from_gguf(gguf: &Gguf<'a>) -> Result<Self> {
-        let arch = gguf.meta_str("general.architecture")?.to_owned();
-        let key = |k: &str| format!("{arch}.{k}");
+        let arch_str = gguf.meta_str("general.architecture")?.to_owned();
+        let names = Arch::from_name(&arch_str).tensor_names();
+        let key = |k: &str| format!("{arch_str}.{k}");
 
         let dim = gguf.meta_u64(&key("embedding_length"))? as usize;
         let n_layers = gguf.meta_u64(&key("block_count"))? as usize;
@@ -163,11 +165,11 @@ impl<'a> Model<'a> {
         }
 
         // Long-context RoPE frequency scaling (linear / llama3 / yarn), if any.
-        let rope_scaling = read_rope_scaling(gguf, &arch)?;
+        let rope_scaling = read_rope_scaling(gguf, &arch_str)?;
 
         // Vocabulary size = second (row) dimension of the embedding tensor.
         let tok_embd = gguf
-            .tensor("token_embd.weight")
+            .tensor(names.token_embd)
             .ok_or_else(|| Error::Format("GGUF missing token_embd.weight".into()))?;
         let vocab_size = *tok_embd
             .dims
@@ -175,7 +177,7 @@ impl<'a> Model<'a> {
             .ok_or_else(|| Error::Format("token_embd.weight is not 2-D".into()))?
             as usize;
 
-        let shared_weights = gguf.tensor("output.weight").is_none();
+        let shared_weights = gguf.tensor(names.output).is_none();
 
         let config = Config {
             dim,
@@ -208,11 +210,11 @@ impl<'a> Model<'a> {
                 .collect()
         };
 
-        let token_embedding_table = qmatrix_from_gguf(gguf, "token_embd.weight")?;
+        let token_embedding_table = qmatrix_from_gguf(gguf, names.token_embd)?;
         let wcls = if shared_weights {
-            qmatrix_from_gguf(gguf, "token_embd.weight")?
+            qmatrix_from_gguf(gguf, names.token_embd)?
         } else {
-            qmatrix_from_gguf(gguf, "output.weight")?
+            qmatrix_from_gguf(gguf, names.output)?
         };
 
         Ok(Model {
@@ -221,16 +223,16 @@ impl<'a> Model<'a> {
             weights: Weights {
                 token_embedding_table,
                 wcls,
-                rms_att_weight: Cow::Owned(concat("attn_norm.weight")?),
-                rms_ffn_weight: Cow::Owned(concat("ffn_norm.weight")?),
-                rms_final_weight: Cow::Owned(deq_tensor(gguf, "output_norm.weight")?),
-                wq: layers("attn_q.weight")?,
-                wk: layers("attn_k.weight")?,
-                wv: layers("attn_v.weight")?,
-                wo: layers("attn_output.weight")?,
-                w1: layers("ffn_gate.weight")?,
-                w2: layers("ffn_down.weight")?,
-                w3: layers("ffn_up.weight")?,
+                rms_att_weight: Cow::Owned(concat(names.attn_norm)?),
+                rms_ffn_weight: Cow::Owned(concat(names.ffn_norm)?),
+                rms_final_weight: Cow::Owned(deq_tensor(gguf, names.output_norm)?),
+                wq: layers(names.attn_q)?,
+                wk: layers(names.attn_k)?,
+                wv: layers(names.attn_v)?,
+                wo: layers(names.attn_output)?,
+                w1: layers(names.ffn_gate)?,
+                w2: layers(names.ffn_down)?,
+                w3: layers(names.ffn_up)?,
             },
         })
     }
@@ -289,7 +291,7 @@ fn f32_layers(big: &[f32], n_layers: usize, rows: usize, cols: usize) -> Result<
 ///
 /// F32 tensors get a zero-copy f32 view when aligned, otherwise fall back to a
 /// block-size-1 quantized view (correct, just slower).
-fn qmatrix_from_gguf<'a>(gguf: &Gguf<'a>, name: &str) -> Result<QMatrix<'a>> {
+pub(crate) fn qmatrix_from_gguf<'a>(gguf: &Gguf<'a>, name: &str) -> Result<QMatrix<'a>> {
     let info = gguf
         .tensor(name)
         .ok_or_else(|| Error::Format(format!("GGUF missing tensor '{name}'")))?;
@@ -319,6 +321,97 @@ fn deq_tensor(gguf: &Gguf, name: &str) -> Result<Vec<f32>> {
     dequantize(info.ggml_type, gguf.tensor_bytes(info)?, info.n_elements())
 }
 
+/// The transformer's key/value cache.
+///
+/// PHASE-0 INVARIANT: holds exactly **one** sequence; the layout is the flat
+/// `(n_layers, seq_len, kv_dim)` buffer. All slot/window arithmetic lives here
+/// and nowhere else, so Phase 4 (paged, multi-sequence KV — see
+/// `docs/Architecture/plans/`) can repage these internals or add a `seq_id`
+/// dimension without touching `forward`/`forward_prefill` or the `Backend`
+/// trait. Returned slices are the exact ranges the old inline `loff`/`kv_at`
+/// arithmetic produced.
+pub(crate) struct KvCache {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    seq_len: usize,
+    kv_dim: usize,
+}
+
+impl KvCache {
+    /// Allocate a zeroed cache for `n_layers` layers of `(seq_len, kv_dim)`.
+    fn new(n_layers: usize, seq_len: usize, kv_dim: usize) -> Self {
+        let cells = n_layers * seq_len * kv_dim;
+        KvCache {
+            k: vec![0.0; cells],
+            v: vec![0.0; cells],
+            seq_len,
+            kv_dim,
+        }
+    }
+
+    /// Flat base offset of layer `layer`'s `(seq_len, kv_dim)` block.
+    #[inline]
+    fn layer_base(&self, layer: usize) -> usize {
+        layer * self.seq_len * self.kv_dim
+    }
+
+    /// Layer `layer`'s full `(seq_len, kv_dim)` key window (what attention reads).
+    fn layer_k(&self, layer: usize) -> &[f32] {
+        let b = self.layer_base(layer);
+        &self.k[b..b + self.seq_len * self.kv_dim]
+    }
+
+    /// Layer `layer`'s full `(seq_len, kv_dim)` value window.
+    fn layer_v(&self, layer: usize) -> &[f32] {
+        let b = self.layer_base(layer);
+        &self.v[b..b + self.seq_len * self.kv_dim]
+    }
+
+    /// The single `kv_dim` key slot at `pos` (what the per-token K matmul writes).
+    fn k_slot_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
+        let b = self.layer_base(layer) + pos * self.kv_dim;
+        &mut self.k[b..b + self.kv_dim]
+    }
+
+    /// The single `kv_dim` value slot at `pos`.
+    fn v_slot_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
+        let b = self.layer_base(layer) + pos * self.kv_dim;
+        &mut self.v[b..b + self.kv_dim]
+    }
+
+    /// The contiguous `n`-row key span from `pos_base` (what prefill writes).
+    fn k_span_mut(&mut self, layer: usize, pos_base: usize, n: usize) -> &mut [f32] {
+        let b = self.layer_base(layer) + pos_base * self.kv_dim;
+        &mut self.k[b..b + n * self.kv_dim]
+    }
+
+    /// The contiguous `n`-row value span from `pos_base`.
+    fn v_span_mut(&mut self, layer: usize, pos_base: usize, n: usize) -> &mut [f32] {
+        let b = self.layer_base(layer) + pos_base * self.kv_dim;
+        &mut self.v[b..b + n * self.kv_dim]
+    }
+
+    /// The whole flat key buffer (a device-resident backend uploads it).
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    fn all_k(&self) -> &[f32] {
+        &self.k
+    }
+
+    /// The whole flat value buffer; see [`KvCache::all_k`].
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    fn all_v(&self) -> &[f32] {
+        &self.v
+    }
+
+    /// Write a resident prefill's computed K/V back into the host cache at flat
+    /// offset `loff` (the layer base).
+    #[cfg(feature = "cuda")]
+    fn store_at(&mut self, loff: usize, k: &[f32], v: &[f32]) {
+        self.k[loff..loff + k.len()].copy_from_slice(k);
+        self.v[loff..loff + v.len()].copy_from_slice(v);
+    }
+}
+
 /// Mutable scratch space reused across forward passes, including the KV cache.
 pub struct RunState {
     x: Vec<f32>,           // residual stream (dim)
@@ -329,15 +422,13 @@ pub struct RunState {
     q: Vec<f32>,           // query (dim)
     att: Vec<f32>,         // attention scores (n_heads * seq_len)
     logits: Vec<f32>,      // output logits (vocab_size)
-    key_cache: Vec<f32>,   // (n_layers, seq_len, kv_dim)
-    value_cache: Vec<f32>, // (n_layers, seq_len, kv_dim)
+    kv: KvCache, // single sequence; flat (n_layers, seq_len, kv_dim)
 }
 
 impl RunState {
     /// Allocate all scratch buffers for a given model configuration.
     pub fn new(c: &Config) -> Self {
         let kv_dim = c.kv_dim();
-        let cache = c.n_layers * c.seq_len * kv_dim;
         RunState {
             x: vec![0.0; c.dim],
             xb: vec![0.0; c.dim],
@@ -347,8 +438,7 @@ impl RunState {
             q: vec![0.0; c.dim],
             att: vec![0.0; c.n_heads * c.seq_len],
             logits: vec![0.0; c.vocab_size],
-            key_cache: vec![0.0; cache],
-            value_cache: vec![0.0; cache],
+            kv: KvCache::new(c.n_layers, c.seq_len, kv_dim),
         }
     }
 
@@ -366,13 +456,13 @@ impl RunState {
     /// mirrors the KV cache on a device (the GPU/CUDA fused decode path).
     #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn key_cache(&self) -> &[f32] {
-        &self.key_cache
+        self.kv.all_k()
     }
 
     /// The value cache `(n_layers, seq_len, kv_dim)`; see [`RunState::key_cache`].
     #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn value_cache(&self) -> &[f32] {
-        &self.value_cache
+        self.kv.all_v()
     }
 
     /// Write the K/V a resident fused prefill computed on-device into the host
@@ -381,8 +471,7 @@ impl RunState {
     /// cached keys/values. `k`/`v` are the layer's contiguous prompt rows.
     #[cfg(feature = "cuda")]
     pub(crate) fn store_prefill_kv(&mut self, loff: usize, k: &[f32], v: &[f32]) {
-        self.key_cache[loff..loff + k.len()].copy_from_slice(k);
-        self.value_cache[loff..loff + v.len()].copy_from_slice(v);
+        self.kv.store_at(loff, k, v);
     }
 }
 
@@ -415,24 +504,21 @@ pub fn forward(
             p.rms_eps,
         );
 
-        let loff = layer * p.seq_len * kv_dim;
-        let kv_at = loff + pos * kv_dim;
-
         backend.matmul(&mut state.q, &state.xb, &w.wq[layer]);
         backend.matmul(
-            &mut state.key_cache[kv_at..kv_at + kv_dim],
+            state.kv.k_slot_mut(layer, pos),
             &state.xb,
             &w.wk[layer],
         );
         backend.matmul(
-            &mut state.value_cache[kv_at..kv_at + kv_dim],
+            state.kv.v_slot_mut(layer, pos),
             &state.xb,
             &w.wv[layer],
         );
 
         backend.rope(
             &mut state.q,
-            &mut state.key_cache[kv_at..kv_at + kv_dim],
+            state.kv.k_slot_mut(layer, pos),
             pos,
             head_size,
             kv_dim,
@@ -443,8 +529,8 @@ pub fn forward(
         backend.attention(
             &mut state.xb,
             &state.q,
-            &state.key_cache[loff..loff + p.seq_len * kv_dim],
-            &state.value_cache[loff..loff + p.seq_len * kv_dim],
+            state.kv.layer_k(layer),
+            state.kv.layer_v(layer),
             &mut state.att,
             pos,
             p.n_heads,
@@ -495,6 +581,34 @@ pub fn forward_prefill<B: Backend + ?Sized>(
     tokens: &[usize],
     pos_base: usize,
 ) {
+    let dim = model.config.dim;
+    let n = tokens.len();
+    let x = prefill_residual(model, state, backend, tokens, pos_base);
+
+    // Only the final position predicts the next token, so norm + classify just
+    // that row (the classifier matmul is the widest — no need to run it n×).
+    let w = &model.weights;
+    let last = (n - 1) * dim;
+    let mut xb_last = vec![0.0f32; dim];
+    backend.rmsnorm(
+        &mut xb_last,
+        &x[last..last + dim],
+        &w.rms_final_weight,
+        model.config.rms_eps,
+    );
+    backend.matmul(&mut state.logits, &xb_last, &w.wcls);
+}
+
+/// Run the batched layer stack over `tokens` (writing their KV at `pos_base`) and
+/// return the row-major `(n, dim)` residual stream — the shared body of
+/// [`forward_prefill`] and [`forward_embed`].
+fn prefill_residual<B: Backend + ?Sized>(
+    model: &Model,
+    state: &mut RunState,
+    backend: &B,
+    tokens: &[usize],
+    pos_base: usize,
+) -> Vec<f32> {
     let p = &model.config;
     let w = &model.weights;
     let dim = p.dim;
@@ -503,8 +617,7 @@ pub fn forward_prefill<B: Backend + ?Sized>(
     let hidden = p.hidden_dim;
     let n = tokens.len();
 
-    // Row-major (n, *) scratch for the batch. Allocated here (prefill runs once
-    // per prompt) rather than living in the single-token RunState.
+    // Row-major (n, *) scratch for the batch.
     let mut x = vec![0.0f32; n * dim];
     let mut xb = vec![0.0f32; n * dim];
     let mut xb2 = vec![0.0f32; n * dim];
@@ -522,27 +635,13 @@ pub fn forward_prefill<B: Backend + ?Sized>(
         // --- Attention --------------------------------------------------
         backend.rmsnorm_batch(&mut xb, &x, slice(&w.rms_att_weight, layer, dim), p.rms_eps, n);
 
-        let loff = layer * p.seq_len * kv_dim;
-        let kv_start = loff + pos_base * kv_dim;
-        let kv_span = n * kv_dim;
-
         backend.matmul_batch(&mut q, &xb, &w.wq[layer], n);
-        backend.matmul_batch(
-            &mut state.key_cache[kv_start..kv_start + kv_span],
-            &xb,
-            &w.wk[layer],
-            n,
-        );
-        backend.matmul_batch(
-            &mut state.value_cache[kv_start..kv_start + kv_span],
-            &xb,
-            &w.wv[layer],
-            n,
-        );
+        backend.matmul_batch(state.kv.k_span_mut(layer, pos_base, n), &xb, &w.wk[layer], n);
+        backend.matmul_batch(state.kv.v_span_mut(layer, pos_base, n), &xb, &w.wv[layer], n);
 
         backend.rope_batch(
             &mut q,
-            &mut state.key_cache[kv_start..kv_start + kv_span],
+            state.kv.k_span_mut(layer, pos_base, n),
             pos_base,
             n,
             head_size,
@@ -555,8 +654,8 @@ pub fn forward_prefill<B: Backend + ?Sized>(
         backend.attention_batch(
             &mut xb,
             &q,
-            &state.key_cache[loff..loff + p.seq_len * kv_dim],
-            &state.value_cache[loff..loff + p.seq_len * kv_dim],
+            state.kv.layer_k(layer),
+            state.kv.layer_v(layer),
             &mut state.att,
             pos_base,
             n,
@@ -578,13 +677,70 @@ pub fn forward_prefill<B: Backend + ?Sized>(
         backend.matmul_batch(&mut xb, &hb, &w.w2[layer], n);
         backend.add(&mut x, &xb);
     }
+    x
+}
 
-    // Only the final position predicts the next token, so norm + classify just
-    // that row (the classifier matmul is the widest one — no need to run it n×).
-    let last = (n - 1) * dim;
-    let mut xb_last = vec![0.0f32; dim];
-    backend.rmsnorm(&mut xb_last, &x[last..last + dim], &w.rms_final_weight, p.rms_eps);
-    backend.matmul(&mut state.logits, &xb_last, &w.wcls);
+/// How to pool per-position hidden states into one embedding vector.
+#[derive(Clone, Copy, Debug)]
+pub enum Pooling {
+    /// Average over all positions.
+    Mean,
+    /// The last position's hidden state.
+    Last,
+    /// The first position's hidden state (`[CLS]`-style).
+    Cls,
+}
+
+/// Embedding forward pass: run the layer stack over `tokens`, final-RMSNorm every
+/// position, pool to one `dim`-vector, then optionally L2-normalize. Returns a
+/// vector of length `config.dim`. The classifier (`wcls`) is skipped — embeddings
+/// live in `n_embd = config.dim`. Uses the per-op batched ops, so any backend
+/// works without touching the resident decode path.
+pub fn forward_embed<B: Backend + ?Sized>(
+    model: &Model,
+    state: &mut RunState,
+    backend: &B,
+    tokens: &[usize],
+    pooling: Pooling,
+    normalize: bool,
+) -> Vec<f32> {
+    let p = &model.config;
+    let w = &model.weights;
+    let dim = p.dim;
+    let n = tokens.len();
+
+    let x = prefill_residual(model, state, backend, tokens, 0);
+    // Final RMSNorm every row (the classifier is skipped for embeddings).
+    let mut normed = vec![0.0f32; n * dim];
+    backend.rmsnorm_batch(&mut normed, &x, &w.rms_final_weight, p.rms_eps, n);
+
+    let mut emb = vec![0.0f32; dim];
+    match pooling {
+        Pooling::Mean => {
+            for r in 0..n {
+                for (e, &v) in emb.iter_mut().zip(&normed[r * dim..r * dim + dim]) {
+                    *e += v;
+                }
+            }
+            let inv = 1.0 / n as f32;
+            for e in emb.iter_mut() {
+                *e *= inv;
+            }
+        }
+        Pooling::Last => emb.copy_from_slice(&normed[(n - 1) * dim..n * dim]),
+        Pooling::Cls => emb.copy_from_slice(&normed[..dim]),
+    }
+
+    if normalize {
+        let norm = emb.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            let inv = 1.0 / norm;
+            for e in emb.iter_mut() {
+                *e *= inv;
+            }
+        }
+    }
+    emb
 }
 
 /// Autoregressively generate from `prompt`, streaming decoded bytes to
@@ -598,12 +754,29 @@ pub fn generate(
     state: &mut RunState,
     backend: &dyn Backend,
     tokenizer: &Tokenizer,
-    sampler: &mut Sampler,
+    sampler: &mut SamplerChain,
     prompt: &str,
+    steps: usize,
+    on_piece: impl FnMut(&[u8]),
+) -> usize {
+    let prompt_tokens = tokenizer.encode(prompt, true, false);
+    generate_tokens(model, state, backend, tokenizer, sampler, &prompt_tokens, steps, on_piece)
+}
+
+/// Autoregressively generate from already-encoded `prompt_tokens`, streaming
+/// decoded bytes to `on_piece`. The token-based core of [`generate`], for callers
+/// that control BOS / special-token encoding themselves (e.g. chat templates).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_tokens(
+    model: &Model,
+    state: &mut RunState,
+    backend: &dyn Backend,
+    tokenizer: &Tokenizer,
+    sampler: &mut SamplerChain,
+    prompt_tokens: &[usize],
     steps: usize,
     mut on_piece: impl FnMut(&[u8]),
 ) -> usize {
-    let prompt_tokens = tokenizer.encode(prompt, true, false);
     let steps = steps.min(model.config.seq_len);
     let n = prompt_tokens.len();
 
@@ -617,7 +790,7 @@ pub fn generate(
             backend,
             tokenizer,
             sampler,
-            &prompt_tokens,
+            prompt_tokens,
             steps,
             on_piece,
         );
@@ -626,28 +799,21 @@ pub fn generate(
     let mut token = prompt_tokens[0];
     let mut pos = 0;
     let mut generated = 0;
-
     while pos < steps {
         backend.forward_step(model, state, token, pos);
-
-        // While we still have prompt tokens to ingest, force the next token;
-        // otherwise sample it.
         let next = if pos < prompt_tokens.len() - 1 {
             prompt_tokens[pos + 1]
         } else {
-            sampler.sample(state.logits_mut())
+            sampler.sample(state.logits())
         };
         pos += 1;
-
         if next == 1 {
             break; // BOS doubles as an end-of-sequence delimiter here.
         }
-
         on_piece(&tokenizer.decode(token, next));
         token = next;
         generated += 1;
     }
-
     generated
 }
 
@@ -662,7 +828,7 @@ fn generate_prefilled(
     state: &mut RunState,
     backend: &dyn Backend,
     tokenizer: &Tokenizer,
-    sampler: &mut Sampler,
+    sampler: &mut SamplerChain,
     prompt_tokens: &[usize],
     steps: usize,
     mut on_piece: impl FnMut(&[u8]),
@@ -689,7 +855,7 @@ fn generate_prefilled(
     // then continue single-token decoding from position `n`.
     let mut token = prompt_tokens[n - 1];
     let mut pos = n - 1;
-    let mut next = sampler.sample(state.logits_mut());
+    let mut next = sampler.sample(state.logits());
     loop {
         pos += 1;
         if next == 1 {
@@ -702,7 +868,7 @@ fn generate_prefilled(
             break;
         }
         backend.forward_step(model, state, token, pos);
-        next = sampler.sample(state.logits_mut());
+        next = sampler.sample(state.logits());
     }
 
     generated
@@ -744,4 +910,26 @@ fn f32_slice(bytes: &[u8], elem_off: usize, len: usize) -> Result<&[f32]> {
     // SAFETY: bounds and alignment checked above; every bit pattern is a valid
     // f32; the crate is little-endian only (asserted at the crate root).
     Ok(unsafe { std::slice::from_raw_parts(region.as_ptr() as *const f32, len) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_cache_offsets_match_flat_layout() {
+        // 2 layers × 3 positions × kv_dim 4. Guards the extracted loff/slot math.
+        let mut kv = KvCache::new(2, 3, 4);
+        assert_eq!(kv.layer_base(0), 0);
+        assert_eq!(kv.layer_base(1), 12);
+        assert_eq!(kv.layer_k(1).len(), 12);
+        assert_eq!(kv.layer_v(0).len(), 12);
+        // pos 2 of layer 1 is rows 8..12 within that layer's window.
+        kv.k_slot_mut(1, 2).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&kv.layer_k(1)[8..12], [1.0, 2.0, 3.0, 4.0]);
+        // a 2-row span from pos 0 of layer 0 is the first 8 elements.
+        assert_eq!(kv.k_span_mut(0, 0, 2).len(), 8);
+        kv.v_slot_mut(0, 1).copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(&kv.layer_v(0)[4..8], [5.0, 6.0, 7.0, 8.0]);
+    }
 }

@@ -5,7 +5,7 @@
 //! tensor cores via cuBLASLt, gated behind the `cuda` cargo feature and built on
 //! the [`cudarc`] crate. The portable wgpu cooperative-matrix path was spiked
 //! and ruled out on this hardware (wgpu 29 wires only 8×8 f32, which the Vulkan
-//! driver doesn't expose; see `PERFORMANCE.md` item 3), so a cuBLASLt TF32 GEMM
+//! driver doesn't expose; see `PERFORMANCE.md` item 3), so a cuBLASLt f16 GEMM
 //! is the route to the prefill tensor-core win.
 //!
 //! ## Milestones
@@ -16,11 +16,15 @@
 //!   tensor cores ([`CudaBackend::gemm`]); the rest delegates to the CPU.
 //! - **M2** (done): on-device nvrtc kernels for the non-GEMM ops, so a fused,
 //!   resident prefill runs a whole layer without host round-trips. Cooperative
-//!   tiled attention. Decode (`forward_step`) stays on the CPU — at batch=1 it is
-//!   GEMV/bandwidth-bound, where tensor cores help little.
-//! - **f16 weights** (this change): weights cached as f16 and the GEMM runs as
+//!   tiled attention.
+//! - **f16 weights** (done): weights cached as f16 and the GEMM runs as
 //!   `Matmul<f16>` — half the weight bandwidth/VRAM of f32, and f16 tensor cores
 //!   beat TF32. Activations convert f32↔f16 on-device around each GEMM.
+//! - **Resident decode** (done): `forward_step` runs a resident single-token
+//!   decode — KV cache + activations stay on device across steps, batch-1 GEMVs
+//!   via the f16 GEMM + the nvrtc kernels, the prompt's host KV uploaded once.
+//!   At batch=1 decode is GEMV/bandwidth-bound, so f16 weight bandwidth (not
+//!   compute) is the limiter (~3.4× behind llama.cpp; see `PERFORMANCE.md`).
 //!
 //! ## Why dynamic loading can't just `?`-propagate a missing driver
 //!
@@ -800,7 +804,7 @@ impl Backend for CudaBackend {
         state.logits_mut().copy_from_slice(&logits_host);
     }
 
-    /// Resident fused prefill: the whole prompt runs on-device — TF32 GEMMs plus
+    /// Resident fused prefill: the whole prompt runs on-device — f16 GEMMs plus
     /// the [`KERNEL_SRC`] kernels — with `x`/`xb`/`q`/`hb` and the per-layer KV
     /// kept resident, so a layer executes with no host round-trips. Only the
     /// token embeddings go up and the final logits come down (plus the prompt's
@@ -937,8 +941,8 @@ mod tests {
             .collect()
     }
 
-    /// Assert two slices match within a TF32-GEMM tolerance: tensor-core TF32
-    /// keeps ~10 mantissa bits (≈2⁻¹¹ relative) and accumulates in f32, so error
+    /// Assert two slices match within an f16-GEMM tolerance: f16 tensor cores
+    /// keep ~10 mantissa bits (≈2⁻¹¹ relative) and accumulate in f32, so error
     /// grows with the reduction length `ic`. Generous enough for that, tight
     /// enough that a wrong layout (transpose / m·n·k swap) — which yields wholly
     /// different values — fails loudly.
@@ -1197,7 +1201,6 @@ mod tests {
     #[test]
     #[ignore = "needs the real GGUF + a CUDA device; run with --release --features cuda -- --ignored --nocapture"]
     fn bench_decode_real_tinyllama() {
-        use std::time::Instant;
         let Some(b) = cuda() else { return };
         let path = std::env::var("RUSTY_LLAMA_GGUF")
             .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string());
@@ -1224,32 +1227,22 @@ mod tests {
             }
         };
 
-        // Warm up: build the resident decode state + cache weights on device.
-        {
-            let mut s = crate::RunState::new(&model.config);
-            backend_warmup(&b, &model, &mut s);
-        }
-        let t = Instant::now();
-        decode(&b);
-        let cuda = t.elapsed();
+        // llama-bench protocol: one untimed warmup (builds the resident decode
+        // state + weight cache on device), then `-r` timed reps as mean ± stddev.
+        let reps = crate::bench_util::bench_reps();
+        let (cuda_tps, cuda_sd) =
+            crate::bench_util::bench_stat(steps, reps, std::time::Duration::from_secs(6), || decode(&b));
 
         let cpu_backend = CpuBackend::new();
-        let t = Instant::now();
-        decode(&cpu_backend);
-        let cpu = t.elapsed();
+        let (cpu_tps, _) =
+            crate::bench_util::bench_stat(steps, 1, std::time::Duration::ZERO, || decode(&cpu_backend));
 
         eprintln!(
-            "real decode {steps} steps: cuda={cuda:?} ({:.0} tok/s) cpu={cpu:?} ({:.0} tok/s) \
-             -> cuda {:.1}x cpu",
-            steps as f64 / cuda.as_secs_f64(),
-            steps as f64 / cpu.as_secs_f64(),
-            cpu.as_secs_f64() / cuda.as_secs_f64(),
+            "real decode tg{steps} (r={reps}): cuda {cuda_tps:.0} ± {cuda_sd:.0} tok/s  \
+             cpu {cpu_tps:.0} tok/s  -> cuda {:.1}x cpu  \
+             (compare: llama-bench -m <gguf> -ngl 99 -n {steps} -r {reps})",
+            cuda_tps / cpu_tps,
         );
-    }
-
-    /// One decode step to warm the resident state + weight cache before timing.
-    fn backend_warmup(b: &CudaBackend, model: &crate::Model, s: &mut crate::RunState) {
-        b.forward_step(model, s, 1, 0);
     }
 
     /// Prefill throughput: CUDA (cuBLASLt f16) vs CPU on the same shape the wgpu
@@ -1315,7 +1308,6 @@ mod tests {
     #[test]
     #[ignore = "needs the real GGUF + a CUDA device; run with --release --features cuda -- --ignored --nocapture"]
     fn bench_prefill_real_tinyllama() {
-        use std::time::Instant;
         let Some(b) = cuda() else { return };
 
         let path = std::env::var("RUSTY_LLAMA_GGUF")
@@ -1346,23 +1338,21 @@ mod tests {
             backend.forward_prefill(&model, &mut s, &tokens, 0);
         };
 
-        // Warm up: dequantize + upload weights to device, make them resident.
-        prefill(&b);
-        let t = Instant::now();
-        prefill(&b);
-        let cuda = t.elapsed();
+        // llama-bench protocol: one untimed warmup (dequant + upload weights,
+        // make them resident), then `-r` timed reps as mean ± stddev.
+        let reps = crate::bench_util::bench_reps();
+        let (cuda_tps, cuda_sd) =
+            crate::bench_util::bench_stat(n, reps, std::time::Duration::from_secs(6), || prefill(&b));
 
         let cpu_backend = CpuBackend::new();
-        let t = Instant::now();
-        prefill(&cpu_backend);
-        let cpu = t.elapsed();
+        let (cpu_tps, _) =
+            crate::bench_util::bench_stat(n, 1, std::time::Duration::ZERO, || prefill(&cpu_backend));
 
         eprintln!(
-            "real prefill {n} tok: cuda={cuda:?} ({:.0} tok/s) cpu={cpu:?} ({:.0} tok/s) \
-             -> cuda {:.1}x cpu",
-            n as f64 / cuda.as_secs_f64(),
-            n as f64 / cpu.as_secs_f64(),
-            cpu.as_secs_f64() / cuda.as_secs_f64(),
+            "real prefill pp{n} (r={reps}): cuda {cuda_tps:.0} ± {cuda_sd:.0} tok/s  \
+             cpu {cpu_tps:.0} tok/s  -> cuda {:.1}x cpu  \
+             (compare: llama-bench -m <gguf> -ngl 99 -p {n} -r {reps})",
+            cuda_tps / cpu_tps,
         );
     }
 

@@ -70,6 +70,14 @@ pub trait Backend: Send + Sync {
     /// length `n_heads * seq_len`; its contents are unspecified after the call
     /// (the CPU backend leaves the softmaxed scores there, the GPU backend does
     /// not — callers must not rely on either).
+    ///
+    /// SINGLE-SEQUENCE INVARIANT: `key_cache`/`value_cache` are exactly one
+    /// sequence's `(seq_len, kv_dim)` window and the attended range is the
+    /// implicit causal `0..=pos`. Phase 4 (paged, multi-sequence KV, behind a
+    /// `paged-kv` feature) introduces a per-`seq_id`
+    /// `attention_seq(&KvView, &CausalMask, …)`, after which this method becomes
+    /// its single-sequence, full-causal-mask special case. See
+    /// `docs/Architecture/plans/`.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
@@ -157,6 +165,9 @@ pub trait Backend: Send + Sync {
     /// absolute position `pos_base + r`) attends to cached keys `0..=pos_base+r`.
     /// `q`/`out` are `(rows, n_heads*head_size)`; `att` is single-row scratch of
     /// length `n_heads * seq_len`, reused across rows by the default impl.
+    ///
+    /// Same single-sequence invariant as [`Backend::attention`]; Phase 4 adds the
+    /// paged, per-`seq_id` form.
     #[allow(clippy::too_many_arguments)]
     fn attention_batch(
         &self,
