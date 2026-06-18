@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 
 use rusty_llama::dummy::{dummy_tokenizer, synthetic_checkpoint};
-use rusty_llama::{forward, generate, Checkpoint, Config, CpuBackend, RunState, Sampler};
+use rusty_llama::{
+    forward, forward_embed, generate, Checkpoint, Config, CpuBackend, Pooling, RunState,
+    SamplerChain,
+};
 
 /// A small but non-trivial config (grouped-query attention: 4 q heads, 2 kv).
 fn test_config() -> Config {
@@ -76,7 +79,7 @@ fn greedy_generation_is_reproducible() {
 
     let run = || {
         let mut state = RunState::new(&config);
-        let mut sampler = Sampler::new(config.vocab_size, 0.0, 0.9, 42); // greedy
+        let mut sampler = SamplerChain::new(config.vocab_size, 0.0, 0.9, 42); // greedy
         let mut out = Vec::new();
         let n = generate(
             &model,
@@ -113,5 +116,76 @@ fn truncated_checkpoint_errors_cleanly() {
 
     let cp = Checkpoint::open(&path).unwrap();
     assert!(cp.model().is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn embed_mean_equals_mean_of_prefix_last() {
+    // Mean-pool over the full sequence == average of the per-prefix Last-pool,
+    // because causal attention makes position k's hidden depend only on 0..=k.
+    let config = test_config();
+    let (cp, path) = mapped_checkpoint(&config, "embed_mean");
+    let model = cp.model().unwrap();
+    let backend = CpuBackend::new();
+    let dim = config.dim;
+    let tokens = [1usize, 5, 3, 7];
+
+    let mut s = RunState::new(&config);
+    let full = forward_embed(&model, &mut s, &backend, &tokens, Pooling::Mean, false);
+    assert_eq!(full.len(), dim);
+
+    let mut manual = vec![0.0f32; dim];
+    for k in 1..=tokens.len() {
+        let mut sk = RunState::new(&config);
+        let last = forward_embed(&model, &mut sk, &backend, &tokens[..k], Pooling::Last, false);
+        for (m, &v) in manual.iter_mut().zip(&last) {
+            *m += v;
+        }
+    }
+    for m in manual.iter_mut() {
+        *m /= tokens.len() as f32;
+    }
+    for (a, b) in full.iter().zip(&manual) {
+        assert!((a - b).abs() < 1e-4, "mean-pool mismatch: {a} vs {b}");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn embed_l2_normalizes() {
+    let config = test_config();
+    let (cp, path) = mapped_checkpoint(&config, "embed_l2");
+    let model = cp.model().unwrap();
+    let backend = CpuBackend::new();
+    let tokens = [1usize, 2, 3];
+
+    let mut s = RunState::new(&config);
+    let normed = forward_embed(&model, &mut s, &backend, &tokens, Pooling::Mean, true);
+    let norm: f32 = normed.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-4, "L2 embedding must be unit-norm, got {norm}");
+
+    let mut s2 = RunState::new(&config);
+    let raw = forward_embed(&model, &mut s2, &backend, &tokens, Pooling::Mean, false);
+    assert_ne!(raw, normed, "normalize must change the vector");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn embed_pooling_variants_differ() {
+    let config = test_config();
+    let (cp, path) = mapped_checkpoint(&config, "embed_pool");
+    let model = cp.model().unwrap();
+    let backend = CpuBackend::new();
+    let tokens = [1usize, 4, 2, 6];
+    let pool = |p| {
+        let mut s = RunState::new(&config);
+        forward_embed(&model, &mut s, &backend, &tokens, p, false)
+    };
+    let mean = pool(Pooling::Mean);
+    let last = pool(Pooling::Last);
+    let cls = pool(Pooling::Cls);
+    assert_ne!(mean, last);
+    assert_ne!(mean, cls);
+    assert_ne!(last, cls);
     let _ = std::fs::remove_file(path);
 }

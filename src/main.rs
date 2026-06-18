@@ -16,7 +16,8 @@ use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_llama::{
-    generate, Backend, Checkpoint, CpuBackend, Gguf, Model, RunState, Sampler, Tokenizer,
+    forward_embed, generate_tokens, Backend, ChatTemplate, Checkpoint, CpuBackend, Gguf, LoraAdapter,
+    LoraBackend, Message, Model, Pooling, Role, RunState, SamplerChain, SamplerConfig, Tokenizer,
 };
 
 const USAGE: &str = "\
@@ -30,6 +31,20 @@ Options:
   -n <int>      number of steps to run    (default: 256)
   -i <text>     prompt                    (default: \"\")
   --backend <b> compute backend: cpu|gpu|cuda  (default: cpu; gpu/cuda need their cargo feature)
+  --top-k <int>           top-k sampling, 0 = off   (default: 0)
+  --min-p <float>         min-p sampling, 0 = off   (default: 0.0)
+  --repeat-penalty <f>    repetition penalty, 1=off (default: 1.0)
+  --repeat-last-n <int>   penalty window            (default: 64)
+  --frequency-penalty <f> frequency penalty         (default: 0.0)
+  --presence-penalty <f>  presence penalty          (default: 0.0)
+  --embedding             output an embedding vector instead of text
+  --pooling <mode>        embedding pooling: mean|last|cls (default: mean)
+  --embd-normalize <n>    embedding norm: 2 = L2, -1 = none     (default: 2)
+  --chat                  treat -i as one user turn via the chat template
+  --system <text>         system message for --chat
+  --chat-template <name>  chatml|llama3|qwen2 (default: auto-detect)
+  --lora <path>           apply a LoRA adapter GGUF
+  --lora-scale <float>    LoRA strength multiplier         (default: 1.0)
   -h            show this help";
 
 struct Args {
@@ -41,6 +56,20 @@ struct Args {
     steps: usize,
     prompt: String,
     backend: String,
+    top_k: usize,
+    min_p: f32,
+    repeat_penalty: f32,
+    repeat_last_n: usize,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    embedding: bool,
+    pooling: String,
+    embd_normalize: i32,
+    chat: bool,
+    system: String,
+    chat_template: String,
+    lora: String,
+    lora_scale: f32,
 }
 
 fn main() -> ExitCode {
@@ -55,7 +84,6 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
-
     let checkpoint = Checkpoint::open(&args.checkpoint)
         .map_err(|e| format!("failed to open checkpoint '{}': {e}", args.checkpoint))?;
 
@@ -65,35 +93,186 @@ fn run() -> Result<(), Box<dyn Error>> {
         let model = Model::from_gguf(&gguf)?;
         let tokenizer = Tokenizer::from_gguf(&gguf)
             .map_err(|e| format!("failed to read GGUF tokenizer: {e}"))?;
-        run_generation(&model, &tokenizer, &args)
+        let template = resolve_chat_template(&args, Some(&gguf))?;
+        run_loaded(&model, &tokenizer, &args, template)
     } else {
         let model = checkpoint.model()?;
         let tokenizer = Tokenizer::load(&args.tokenizer, model.config.vocab_size)
             .map_err(|e| format!("failed to load tokenizer '{}': {e}", args.tokenizer))?;
-        run_generation(&model, &tokenizer, &args)
+        let template = resolve_chat_template(&args, None)?;
+        run_loaded(&model, &tokenizer, &args, template)
     }
 }
 
-fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
+/// Dispatch a loaded model to the selected mode.
+fn run_loaded(
+    model: &Model,
+    tokenizer: &Tokenizer,
+    args: &Args,
+    template: Option<ChatTemplate>,
+) -> Result<(), Box<dyn Error>> {
+    if args.embedding {
+        run_embedding(model, tokenizer, args)
+    } else if args.chat {
+        run_chat(model, tokenizer, args, template)
+    } else {
+        run_generation(model, tokenizer, args)
+    }
+}
+
+/// Resolve the chat template for `--chat`: explicit `--chat-template` wins, else
+/// detect from the GGUF / arch. `Ok(None)` when not in chat mode.
+fn resolve_chat_template(
+    args: &Args,
+    gguf: Option<&Gguf>,
+) -> Result<Option<ChatTemplate>, Box<dyn Error>> {
+    if !args.chat {
+        return Ok(None);
+    }
+    if !args.chat_template.is_empty() {
+        return ChatTemplate::from_name(&args.chat_template).map(Some).ok_or_else(|| {
+            format!("unknown --chat-template '{}' (chatml|llama3|qwen2)", args.chat_template).into()
+        });
+    }
+    if let Some(g) = gguf {
+        let arch = g.meta_str("general.architecture").unwrap_or_default();
+        if let Some(t) = ChatTemplate::detect(g, arch) {
+            return Ok(Some(t));
+        }
+    }
+    Err("could not detect a chat template; pass --chat-template chatml|llama3|qwen2".into())
+}
+
+fn run_embedding(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
     let backend = make_backend(&args.backend)?;
     let mut state = RunState::new(&model.config);
-    let mut sampler = Sampler::new(
-        model.config.vocab_size,
-        args.temperature,
-        args.topp,
-        args.seed,
+    let tokens = tokenizer.encode(&args.prompt, true, false);
+    if tokens.is_empty() {
+        return Err("embedding mode needs a non-empty prompt (-i)".into());
+    }
+    if tokens.len() > model.config.seq_len {
+        return Err(format!(
+            "prompt of {} tokens exceeds context length {}",
+            tokens.len(),
+            model.config.seq_len
+        )
+        .into());
+    }
+    let pooling = match args.pooling.as_str() {
+        "mean" => Pooling::Mean,
+        "last" => Pooling::Last,
+        "cls" => Pooling::Cls,
+        other => return Err(format!("unknown --pooling '{other}' (mean|last|cls)").into()),
+    };
+    let emb = forward_embed(
+        model,
+        &mut state,
+        backend.as_ref(),
+        &tokens,
+        pooling,
+        args.embd_normalize != -1,
     );
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for v in &emb {
+        writeln!(out, "{v}")?;
+    }
+    Ok(())
+}
+
+fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
+    let tokens = tokenizer.encode(&args.prompt, true, false);
+    stream_generation(model, tokenizer, args, &tokens)
+}
+
+fn run_chat(
+    model: &Model,
+    tokenizer: &Tokenizer,
+    args: &Args,
+    template: Option<ChatTemplate>,
+) -> Result<(), Box<dyn Error>> {
+    let template = template.ok_or("chat mode needs a template (see --chat-template)")?;
+    let mut msgs = Vec::new();
+    if !args.system.is_empty() {
+        msgs.push(Message {
+            role: Role::System,
+            content: args.system.clone(),
+        });
+    }
+    msgs.push(Message {
+        role: Role::User,
+        content: args.prompt.clone(),
+    });
+    let prompt = template.render(&msgs, true);
+    // llama-3 emits its own <|begin_of_text|>; others rely on the tokenizer BOS.
+    let tokens = tokenizer.encode(&prompt, !template.emits_bos(), false);
+    stream_generation(model, tokenizer, args, &tokens)
+}
+
+/// Shared decode loop: build the sampler, stream `generate_tokens`, report timing.
+fn stream_generation(
+    model: &Model,
+    tokenizer: &Tokenizer,
+    args: &Args,
+    prompt_tokens: &[usize],
+) -> Result<(), Box<dyn Error>> {
+    if prompt_tokens.is_empty() {
+        return Err("nothing to generate from (empty prompt)".into());
+    }
+    let backend = make_backend(&args.backend)?;
+
+    // Optional LoRA adapter: load its GGUF, build it against this model, and wrap
+    // the backend. Binding an adapter falls back to the per-op path (LoRA applies
+    // on every backend; the fused resident decode is bypassed).
+    let lora_cp = if args.lora.is_empty() {
+        None
+    } else {
+        Some(
+            Checkpoint::open(&args.lora)
+                .map_err(|e| format!("failed to open LoRA '{}': {e}", args.lora))?,
+        )
+    };
+    let lora_gguf = match &lora_cp {
+        Some(cp) => Some(Gguf::parse(cp.bytes())?),
+        None => None,
+    };
+    let lora_adapter = match &lora_gguf {
+        Some(g) => Some(LoraAdapter::from_gguf(g, model, args.lora_scale)?),
+        None => None,
+    };
+    let lora_backend = lora_adapter
+        .as_ref()
+        .map(|a| LoraBackend::new(backend.as_ref(), a));
+    let active: &dyn Backend = match &lora_backend {
+        Some(lb) => lb,
+        None => backend.as_ref(),
+    };
+
+    let mut state = RunState::new(&model.config);
+    let sampler_cfg = SamplerConfig {
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.topp,
+        min_p: args.min_p,
+        min_keep: 1,
+        repeat_penalty: args.repeat_penalty,
+        repeat_last_n: args.repeat_last_n,
+        frequency_penalty: args.frequency_penalty,
+        presence_penalty: args.presence_penalty,
+        seed: args.seed,
+    };
+    let mut sampler = SamplerChain::from_config(&sampler_cfg, model.config.vocab_size);
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let start = Instant::now();
-    let generated = generate(
+    let generated = generate_tokens(
         model,
         &mut state,
-        backend.as_ref(),
+        active,
         tokenizer,
         &mut sampler,
-        &args.prompt,
+        prompt_tokens,
         args.steps,
         |bytes| {
             let _ = out.write_all(bytes);
@@ -101,7 +280,6 @@ fn run_generation(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(
         },
     );
     let _ = writeln!(out);
-
     let secs = start.elapsed().as_secs_f64();
     if generated > 0 && secs > 0.0 {
         eprintln!("\n[{generated} tokens, {:.1} tok/s]", generated as f64 / secs);
@@ -172,12 +350,36 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         steps: 256,
         prompt: String::new(),
         backend: "cpu".to_string(),
+        top_k: 0,
+        min_p: 0.0,
+        repeat_penalty: 1.0,
+        repeat_last_n: 64,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        embedding: false,
+        pooling: "mean".to_string(),
+        embd_normalize: 2,
+        chat: false,
+        system: String::new(),
+        chat_template: String::new(),
+        lora: String::new(),
+        lora_scale: 1.0,
     };
 
     let rest: Vec<String> = raw.collect();
     let mut i = 0;
     while i < rest.len() {
         let flag = rest[i].as_str();
+        if flag == "--embedding" {
+            args.embedding = true;
+            i += 1;
+            continue;
+        }
+        if flag == "--chat" {
+            args.chat = true;
+            i += 1;
+            continue;
+        }
         let value = || -> Result<&String, Box<dyn Error>> {
             rest.get(i + 1)
                 .ok_or_else(|| format!("missing value for '{flag}'").into())
@@ -190,6 +392,18 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "-n" => args.steps = value()?.parse()?,
             "-i" => args.prompt = value()?.clone(),
             "--backend" => args.backend = value()?.clone(),
+            "--top-k" => args.top_k = value()?.parse()?,
+            "--min-p" => args.min_p = value()?.parse()?,
+            "--repeat-penalty" => args.repeat_penalty = value()?.parse()?,
+            "--repeat-last-n" => args.repeat_last_n = value()?.parse()?,
+            "--frequency-penalty" => args.frequency_penalty = value()?.parse()?,
+            "--presence-penalty" => args.presence_penalty = value()?.parse()?,
+            "--pooling" => args.pooling = value()?.clone(),
+            "--embd-normalize" => args.embd_normalize = value()?.parse()?,
+            "--system" => args.system = value()?.clone(),
+            "--chat-template" => args.chat_template = value()?.clone(),
+            "--lora" => args.lora = value()?.clone(),
+            "--lora-scale" => args.lora_scale = value()?.parse()?,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);

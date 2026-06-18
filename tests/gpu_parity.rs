@@ -9,7 +9,7 @@
 use rusty_llama::dummy::synthetic_gguf_typed;
 use rusty_llama::{
     forward, forward_prefill, generate, Backend, Config, CpuBackend, GgmlType, Gguf, GpuBackend,
-    Model, RunState, Sampler, Tokenizer,
+    Model, RunState, SamplerChain, Tokenizer,
 };
 
 /// dim/hidden are multiples of 32 so the same config serializes as Q8_0 too.
@@ -168,7 +168,7 @@ fn greedy_stream_matches_cpu() {
 
         let run = |backend: &dyn Backend| -> Vec<u8> {
             let mut st = RunState::new(&model.config);
-            let mut sm = Sampler::new(c.vocab_size, 0.0, 0.9, 1); // greedy
+            let mut sm = SamplerChain::new(c.vocab_size, 0.0, 0.9, 1); // greedy
             let mut out = Vec::new();
             generate(&model, &mut st, backend, &tk, &mut sm, "", 12, |b| {
                 out.extend_from_slice(b)

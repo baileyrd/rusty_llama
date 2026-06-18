@@ -6,7 +6,7 @@ use rusty_llama::dummy::{
 };
 use rusty_llama::quant::dequantize;
 use rusty_llama::{
-    forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RopeScaling, RunState, Sampler,
+    forward, generate, Config, CpuBackend, GgmlType, Gguf, Model, RopeScaling, RunState, SamplerChain,
     Tokenizer,
 };
 
@@ -92,7 +92,7 @@ fn gpt2_tokenizer_loads_from_gguf() {
     assert!(s.logits().iter().all(|v| v.is_finite()));
 
     // The full generation loop works with byte-level BPE decode.
-    let mut sampler = Sampler::new(c.vocab_size, 0.0, 0.9, 1);
+    let mut sampler = SamplerChain::new(c.vocab_size, 0.0, 0.9, 1);
     let mut st = RunState::new(&model.config);
     let n = generate(&model, &mut st, &backend, &tk, &mut sampler, "hi", 4, |_| {});
     assert!(n <= c.seq_len);
@@ -257,7 +257,7 @@ fn gguf_forward_is_finite_deterministic_and_generates() {
     let tk = Tokenizer::from_gguf(&gguf).unwrap();
     let run = || {
         let mut st = RunState::new(&model.config);
-        let mut sm = Sampler::new(c.vocab_size, 0.0, 0.9, 1);
+        let mut sm = SamplerChain::new(c.vocab_size, 0.0, 0.9, 1);
         let mut out = Vec::new();
         generate(&model, &mut st, &backend, &tk, &mut sm, "", 5, |b| {
             out.extend_from_slice(b)

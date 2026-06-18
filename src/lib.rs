@@ -20,7 +20,10 @@
 #[cfg(target_endian = "big")]
 compile_error!("rusty_llama currently assumes a little-endian target");
 
+pub mod arch;
+pub mod adapter;
 pub mod backend;
+pub mod chat;
 pub mod config;
 pub mod dummy;
 pub mod error;
@@ -34,7 +37,11 @@ pub mod tokenizer;
 
 mod loader;
 
+#[cfg(test)]
+mod bench_util;
+
 pub use backend::{Backend, CpuBackend};
+pub use arch::Arch;
 #[cfg(feature = "cuda")]
 pub use backend::CudaBackend;
 #[cfg(feature = "gpu")]
@@ -43,8 +50,13 @@ pub use config::{Config, RopeScaling, RopeTable};
 pub use error::{Error, Result};
 pub use gguf::Gguf;
 pub use loader::Checkpoint;
-pub use model::{forward, forward_prefill, generate, Model, RunState, Weights};
+pub use chat::{ChatTemplate, Message, Role};
+pub use adapter::{LoraAdapter, LoraBackend};
+pub use model::{
+    forward, forward_embed, forward_prefill, generate, generate_tokens, Model, Pooling, RunState,
+    Weights,
+};
 pub use quant::GgmlType;
-pub use sampler::Sampler;
+pub use sampler::{SamplerChain, SamplerConfig};
 pub use tensor::QMatrix;
 pub use tokenizer::Tokenizer;

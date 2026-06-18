@@ -12,6 +12,13 @@ and the prioritized list of work it points to. Measured 2026-06-16.
   CPU builds. `pp512` = prefill throughput, `tg128` = single-token decode.
 - **rusty_llama:** release build; decode measured as a 128-token greedy run with
   a 1-token prompt (decode-dominated), so it lines up with `tg128`.
+- **Benchmark protocol (roadmap #0.3):** the in-crate throughput benches follow
+  `llama-bench`'s protocol — one untimed warmup, then `-r` timed repetitions
+  (default 5, override with `RUSTY_LLAMA_BENCH_R`) reported as **mean ± stddev**
+  tok/s; tokenize/sampling are excluded (token ids are fed in directly). Run them
+  with `cargo test --release --features cuda --lib -- --ignored --nocapture bench_decode_real_tinyllama bench_prefill_real_tinyllama`
+  (`RUSTY_LLAMA_GGUF` overrides the model path), and compare against
+  `llama-bench -m <gguf> -ngl 99 -p 512 -n 128 -r 5`.
 
 ## Results
 
@@ -35,11 +42,12 @@ separable from the CLI but is far below llama.cpp regardless).
 
 ## Why the gaps
 
-- **CPU (~2×):** our integer fast path is **AVX-512 VNNI only** (`vpdpbusd`),
-  which is dormant on this Core Ultra and on most consumer CPUs that lack
-  AVX-512. We have **no AVX2 integer path** — just the VNNI kernels plus an
-  autovectorized scalar loop. llama.cpp's AVX2 quant kernels (`vpmaddubsw` +
-  `vpmaddwd`) and threading are simply better-tuned on this class of hardware.
+- **CPU (~1.5×):** we now have a hand-written **AVX2 integer path**
+  (`vpmaddubsw` + `vpmaddwd`) alongside the **AVX-512 VNNI** kernels (`vpdpbusd`,
+  dormant on this Core Ultra and on consumer CPUs lacking AVX-512), dispatched
+  VNNI → AVX2 → scalar (roadmap #1, done). The residual gap is that llama.cpp's
+  AVX2 quant kernels and threading are still better-tuned on this class of
+  hardware.
 - **GPU (~8× decode, ~24× prefill):** the decisive factor is **tensor cores**.
   llama.cpp's Vulkan backend reports `matrix cores: NV_coopmat2` and its CUDA
   backend uses native `mma`; both exploit the RTX 5070 Ti's tensor cores (plus
