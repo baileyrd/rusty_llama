@@ -89,18 +89,33 @@ roadmap this serves.
 GEMV (each weight read once → bandwidth-bound); we stream **f16** weights
 (~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B), ≈3.5× — which ≈ the gap.
 
-**Next session → quantized-on-device weights for decode (the high-ROI lever).**
-Store the matmul weights **packed (Q4_K/Q6_K/Q8_0) in VRAM** and dequant-in-kernel
-inside a custom **GEMV** (decode is n=1, so a custom dequant→GEMV is tractable and
-doesn't need to beat cuBLASLt's GEMM — it just needs to stream the packed bytes).
-Or use `dot4I8Packed` (int8) — roadmap item 2's kernels exist on the wgpu side for
-reference. This is where it pays off (decode bandwidth-bound; prefill is
-compute-bound so it barely helps there). Then re-bench `tg128`.
+- **Dequant-in-kernel decode GEMV (Q4_K/Q6_K) — TRIED, measured SLOWER, NOT
+  merged** (closed PR #23, branch `feat/cuda-decode-quant`). A custom GEMV
+  streaming the *packed* bytes + dequant-in-kernel was bit-exact but **~1.6×
+  slower than f16** (~78 vs ~121 tok/s): a naive one-block-per-row kernel's
+  poorly-coalesced byte loads + per-element dequant don't beat cuBLASLt's tuned
+  f16 GEMV. **Don't re-attempt the naive version.** Capturing the bandwidth win
+  needs a **warp-cooperative, coalesced** dequant GEMV (cf. llama.cpp `mmvq`) —
+  a serious kernel-tuning effort, uncertain payoff. (Same lesson as the wgpu
+  Stage-2 DP4A k-quant result above.)
 
-Lower-ROI leftovers: keep KV resident across prefill→decode (drop the one-time
-host upload); a dedicated GEMV kernel vs cuBLASLt at n=1; warp-level/flash
-attention; prefill is near the cuBLASLt wall (~4.4×). The portable wgpu coopmat
-path is exhausted.
+## ⏸️ Paused at a strong checkpoint (CUDA backend merged through decode)
+
+`main` has the full CUDA tensor-core backend (PRs #20–#22 merged): prefill
+**~4,450 tok/s (~4.4× behind llama.cpp**, at the cuBLASLt compute wall) and a
+resident decode **~123 tok/s (2.4× CPU, ~3.4× behind)**. The high-ROI levers are
+spent — what remains needs out-tuning cuBLASLt or hand-writing warp-cooperative
+kernels (tuned dequant GEMV, flash attention): real effort, diminishing returns.
+
+**Future directions, if resuming:**
+1. **Breadth (roadmap #5) — likely higher ROI now**: more architectures
+   (Qwen/Gemma/Phi/MoE), richer samplers (min-p, repetition penalty), KV-cache
+   quant, server/batching. Capability over raw speed.
+2. **Tuned warp-cooperative dequant GEMV** for decode (the only way the ~3.5×
+   weight-bandwidth edge beats f16).
+3. Keep KV resident across prefill→decode (drop the one-time host upload);
+   flash attention. `dot4I8Packed` and the portable wgpu coopmat path are
+   exhausted.
 
 ---
 
