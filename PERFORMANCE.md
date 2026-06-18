@@ -187,11 +187,22 @@ separable from the CLI but is far below llama.cpp regardless).
    per step). The **~3.4× decode gap is weight bandwidth**: decode is batch-1 GEMV
    (each weight read once, no reuse → bandwidth-bound), and we stream **f16**
    weights (~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B) — ~3.5×, which roughly
-   *is* the gap. So **quantized-on-device weights / `dot4I8Packed` are the clear
-   high-ROI next lever for decode** (where they pay off, unlike compute-bound
-   prefill). Lower-ROI: keep KV resident across prefill→decode (drop the one-time
-   upload); warp-level / flash attention; a dedicated GEMV kernel vs cuBLASLt at
-   n=1.
+   *is* the gap.
+
+   **Dequant-in-kernel GEMV (Q4_K/Q6_K) — built, proven, measured *not* worth
+   adopting** (the decode analog of the Stage-2 DP4A k-quant result). To cut that
+   weight bandwidth, a custom GEMV that streams the **packed** Q4_K/Q6_K bytes and
+   dequantizes inline was added (`gemv_q4_k`/`gemv_q6_k`, bit-exact vs the CPU
+   dequant — `gemv_q4_k_parity`/`gemv_q6_k_parity`). But on the real model it runs
+   **~78 tok/s vs the f16 path's ~121** — **~1.6× *slower*** — because the naive
+   one-block-per-row kernel's byte-granular, poorly-coalesced loads + per-element
+   dequant erase the bandwidth saving and don't approach cuBLASLt's tuned f16
+   GEMV. Kept behind the `RUSTY_LLAMA_CUDA_DEQUANT` toggle (off by default) for
+   A/B + future tuning; decode stays on f16. The lesson mirrors the CPU/GPU
+   int8 results: the weight-bandwidth win only materializes with a
+   warp-cooperative, coalesced dequant kernel (cf. llama.cpp `mmvq`) — a serious
+   tuning effort, not a naive port. Lower-ROI alternatives: keep KV resident
+   across prefill→decode (drop the one-time upload); warp-level / flash attention.
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),

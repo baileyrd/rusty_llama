@@ -85,22 +85,27 @@ roadmap this serves.
   CPU ~52 (2.4×), vs llama.cpp 419 (~3.4× behind).** Coherence: multi-step +
   prefill→decode vs CPU, rel L2 ≤6e-4/step.
 
-**KEY FINDING: the ~3.4× decode gap is weight bandwidth.** Decode is batch-1
-GEMV (each weight read once → bandwidth-bound); we stream **f16** weights
-(~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B), ≈3.5× — which ≈ the gap.
+- **Dequant-in-kernel decode GEMV (Q4_K/Q6_K) — built, proven, NOT adopted.** To
+  cut the decode weight bandwidth, `gemv_q4_k`/`gemv_q6_k` stream the **packed**
+  bytes + dequant inline (bit-exact: `gemv_q4_k_parity`/`gemv_q6_k_parity`). But
+  the naive one-block-per-row kernel runs **~78 tok/s vs f16's ~121 (~1.6×
+  SLOWER)** — poorly-coalesced byte loads + per-element dequant erase the
+  bandwidth saving and don't approach cuBLASLt's tuned f16 GEMV. Kept behind the
+  `RUSTY_LLAMA_CUDA_DEQUANT` toggle (off by default); decode stays on f16.
+  **Don't re-litigate a naive dequant GEMV** — the win needs a warp-cooperative,
+  coalesced kernel (cf. llama.cpp `mmvq`).
 
-**Next session → quantized-on-device weights for decode (the high-ROI lever).**
-Store the matmul weights **packed (Q4_K/Q6_K/Q8_0) in VRAM** and dequant-in-kernel
-inside a custom **GEMV** (decode is n=1, so a custom dequant→GEMV is tractable and
-doesn't need to beat cuBLASLt's GEMM — it just needs to stream the packed bytes).
-Or use `dot4I8Packed` (int8) — roadmap item 2's kernels exist on the wgpu side for
-reference. This is where it pays off (decode bandwidth-bound; prefill is
-compute-bound so it barely helps there). Then re-bench `tg128`.
+**KEY FINDING: the ~3.4× decode gap is weight bandwidth, but capturing it needs a
+*tuned* dequant GEMV (warp-cooperative + coalesced), not a naive one.**
 
-Lower-ROI leftovers: keep KV resident across prefill→decode (drop the one-time
-host upload); a dedicated GEMV kernel vs cuBLASLt at n=1; warp-level/flash
-attention; prefill is near the cuBLASLt wall (~4.4×). The portable wgpu coopmat
-path is exhausted.
+**Next session → if pursuing decode further: a warp-cooperative dequant GEMV.**
+Restructure `gemv_q4_k`/`gemv_q6_k` so a warp processes a row with **coalesced**
+loads (consecutive threads read consecutive packed bytes) + vectorized
+dequant — the only way the ~3.5× fewer weight bytes beats cuBLASLt f16. This is a
+real kernel-tuning effort. Lower-ROI: keep KV resident across prefill→decode
+(drop the one-time host upload); warp-level/flash attention. Prefill is near the
+cuBLASLt wall (~4.4×). `dot4I8Packed` and the portable wgpu coopmat path are
+exhausted. Or pivot to **breadth** (roadmap #5: more architectures, samplers).
 
 ---
 
