@@ -140,26 +140,30 @@ separable from the CLI but is far below llama.cpp regardless).
 
    | Path | Prefill (pp512) | vs llama.cpp |
    | --- | ---: | --- |
-   | rusty_llama — CUDA, naive attention | 744 tok/s | ~26× behind |
-   | rusty_llama — **CUDA, tiled attention** | **~2,700 tok/s** | **~7.3× behind** |
+   | rusty_llama — CUDA, naive attention + f32 weights | 744 tok/s | ~26× behind |
+   | rusty_llama — CUDA, tiled attention + f32 weights | ~2,700 tok/s | ~7.3× behind |
+   | rusty_llama — **CUDA, tiled attention + f16 weights** | **~3,560 tok/s** | **~5.5× behind** |
    | llama.cpp — CUDA (`llama-bench`, fresh) | **19,637 tok/s** | — |
 
-   The first cut was ~26× behind llama.cpp; replacing the naive
+   Two changes closed most of the gap. (1) Replacing the naive
    one-thread-per-(row,head) attention with a **cooperative block-per-(row,head)
    kernel** (threads split the key dot-products and the output head-dims; scores +
-   softmax reduction in shared memory, no global scratch) took real-model prefill
-   **744 → ~2,700 tok/s (3.6×)** and the synthetic 4-layer proxy past 10k tok/s —
-   attention really was the dominant cost. Now **~7.3× behind llama.cpp**, with
-   correctness held (per-op parity + prefill/decode coherence, rel L2 ~3e-4). The
-   CPU prefill baseline here is unreliable (laptop thermal throttling under the
-   sustained GPU+dequant load), so CUDA-vs-llama.cpp is the meaningful comparison.
+   softmax reduction in shared memory, no global scratch): **744 → ~2,700 tok/s**,
+   and the synthetic 4-layer proxy past 10k — attention was the dominant cost. (2)
+   Caching weights as **f16** instead of f32 and running the GEMM as `Matmul<f16>`
+   (activations narrowed f32↔f16 on-device via inline-PTX `cvt` kernels — no
+   `cuda_fp16.h`): half the weight bandwidth + VRAM and faster f16 tensor cores,
+   **~2,700 → ~3,560 tok/s**. Now **~5.5× behind llama.cpp**, correctness held
+   (per-op parity + prefill/decode coherence, rel L2 ≤6e-4). The CPU prefill
+   baseline here is unreliable (laptop thermal throttling under sustained
+   GPU+dequant load), so CUDA-vs-llama.cpp is the meaningful comparison.
 
-   Remaining gap, in ROI order: (a) weights are dequantized to **f32** on device
-   (~4.4 GB, ~7× the Q4_K weight bandwidth llama.cpp streams) — keep them
-   **quantized on device** + dequant-in-kernel, or store f16; (b) the fused path
-   downloads each layer's K/V to host with a per-layer `synchronize` for the
-   decode handoff — batch it / keep KV resident across prefill→decode; (c) further
-   attention tuning (warp-level, online-softmax flash for long context). Decode
+   Remaining gap, in ROI order: (a) the fused path still downloads each layer's
+   K/V to host with a per-layer `synchronize` for the decode handoff — batch it /
+   keep KV resident across prefill→decode; (b) keep weights **quantized on device**
+   + dequant-in-kernel (vs the current host dequant→f16, which still streams f16
+   weight bytes — llama.cpp streams Q4_K, ~3.5× less); (c) further attention
+   tuning (warp-level, online-softmax flash for long context). Decode
    itself stays on the CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.

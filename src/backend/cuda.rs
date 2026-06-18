@@ -13,11 +13,14 @@
 //! - **M0** (done): device + cuBLASLt handle init with a graceful no-CUDA
 //!   fallback, ops delegated to the [`CpuBackend`].
 //! - **M1** (done): the `forward_prefill` matmuls + classifier run on cuBLASLt
-//!   **TF32 tensor cores** ([`CudaBackend::gemm`]); the rest delegates to the CPU.
-//! - **M2** (this file): on-device kernels for the non-GEMM ops (nvrtc, pure f32)
-//!   so a fused, resident prefill runs a whole layer without host round-trips.
-//!   Decode (`forward_step`) stays on the CPU — at batch=1 it is
+//!   tensor cores ([`CudaBackend::gemm`]); the rest delegates to the CPU.
+//! - **M2** (done): on-device nvrtc kernels for the non-GEMM ops, so a fused,
+//!   resident prefill runs a whole layer without host round-trips. Cooperative
+//!   tiled attention. Decode (`forward_step`) stays on the CPU — at batch=1 it is
 //!   GEMV/bandwidth-bound, where tensor cores help little.
+//! - **f16 weights** (this change): weights cached as f16 and the GEMM runs as
+//!   `Matmul<f16>` — half the weight bandwidth/VRAM of f32, and f16 tensor cores
+//!   beat TF32. Activations convert f32↔f16 on-device around each GEMM.
 //!
 //! ## Why dynamic loading can't just `?`-propagate a missing driver
 //!
@@ -36,21 +39,41 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
+use half::f16;
 
 use crate::backend::{Backend, CpuBackend};
 use crate::model::{Model, RunState};
 use crate::quant::dequantize;
 use crate::tensor::QMatrix;
 
-/// On-device kernels for the non-GEMM primitives, compiled once at startup via
-/// nvrtc (no build-time `nvcc`, and — being pure f32 — no `cuda_fp16.h`, so
-/// nvrtc needs no toolkit include path). Everything is f32: the GEMMs run on
-/// **TF32 tensor cores** (cuBLASLt `Matmul<f32>` → `CUBLAS_COMPUTE_32F_FAST_TF32`),
-/// which take f32 in/out, so no conversion kernels are needed. Each kernel
-/// mirrors the corresponding [`CpuBackend`] op exactly (parity-tested). These run
-/// resident inside the fused prefill (M2b) so a whole layer executes without host
-/// round-trips.
+/// On-device kernels for the non-GEMM primitives + f32↔f16 conversion, compiled
+/// once at startup via nvrtc (no build-time `nvcc`). Activations are kept in f32;
+/// the GEMMs run on cuBLASLt **f16 tensor cores** (`Matmul<f16>`), so the
+/// `cvt_*` kernels narrow activations to f16 before each GEMM and widen the
+/// result back — bridged with **inline PTX** (`cvt.rn.f16.f32` / `cvt.f32.f16`)
+/// over `unsigned short` buffers, so nvrtc needs neither `cuda_fp16.h` nor a
+/// toolkit include path. Each compute kernel mirrors the corresponding
+/// [`CpuBackend`] op exactly (parity-tested); they run resident inside the fused
+/// prefill so a whole layer executes without host round-trips.
 const KERNEL_SRC: &str = r#"
+// f32 -> f16 (stored as u16), round-to-nearest, via inline PTX (no cuda_fp16.h).
+extern "C" __global__ void cvt_f32_f16(unsigned short* out, const float* in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned short h;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(in[i]));
+        out[i] = h;
+    }
+}
+// f16 (u16) -> f32 via inline PTX.
+extern "C" __global__ void cvt_f16_f32(float* out, const unsigned short* in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(v) : "h"(in[i]));
+        out[i] = v;
+    }
+}
 extern "C" __global__ void add_kernel(float* out, const float* x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] += x[i];
@@ -179,6 +202,8 @@ extern "C" __global__ void attention_kernel(float* out, const float* q,
 
 /// Compiled handles for the [`KERNEL_SRC`] kernels.
 struct Kernels {
+    cvt_f32_f16: CudaFunction,
+    cvt_f16_f32: CudaFunction,
     add: CudaFunction,
     swiglu: CudaFunction,
     rmsnorm: CudaFunction,
@@ -197,6 +222,8 @@ impl Kernels {
                 .map_err(|e| format!("missing kernel '{name}': {e:?}"))
         };
         Ok(Kernels {
+            cvt_f32_f16: f("cvt_f32_f16")?,
+            cvt_f16_f32: f("cvt_f16_f32")?,
             add: f("add_kernel")?,
             swiglu: f("swiglu_kernel")?,
             rmsnorm: f("rmsnorm_kernel")?,
@@ -209,11 +236,12 @@ impl Kernels {
 /// CUDA backend: a resident device context, stream, and cuBLASLt handle.
 ///
 /// The matmuls (the `forward_prefill` GEMMs and the classifier) run on cuBLASLt
-/// **TF32 tensor cores** (`Matmul<f32>`); the remaining elementwise/attention
-/// ops delegate to an internal [`CpuBackend`] (M1) or run as on-device kernels
-/// inside the fused prefill (M2). Dequantized f32 weights are uploaded once and
-/// cached, keyed on the source weight's data pointer (stable across the run,
-/// since weights are borrowed from the model) — mirroring the wgpu backend.
+/// **f16 tensor cores** (`Matmul<f16>`, f32 accumulate); the remaining
+/// elementwise/attention ops delegate to an internal [`CpuBackend`] (M1) or run
+/// as on-device kernels inside the fused prefill (M2). Weights are dequantized to
+/// **f16** on the host, uploaded once, and cached, keyed on the source weight's
+/// data pointer (stable across the run, since weights are borrowed from the
+/// model) — half the bytes/VRAM of f32, mirroring the wgpu backend's caching.
 pub struct CudaBackend {
     // `ctx` is held only to keep the CUDA context alive for the lifetime of the
     // backend (the stream / handle / slices reference it); it is never read
@@ -223,8 +251,8 @@ pub struct CudaBackend {
     stream: Arc<CudaStream>,
     blas: CudaBlasLT,
     kernels: Kernels,
-    /// f32 device weights, keyed by source data pointer (see [`Self::weight_f32`]).
-    weights: Mutex<HashMap<usize, Arc<CudaSlice<f32>>>>,
+    /// f16 device weights, keyed by source data pointer (see [`Self::weight_f16`]).
+    weights: Mutex<HashMap<usize, Arc<CudaSlice<f16>>>>,
     cpu: CpuBackend,
     device_name: String,
 }
@@ -267,10 +295,11 @@ impl CudaBackend {
         &self.device_name
     }
 
-    /// The f32 device copy of weight matrix `w` (row-major `rows`×`cols`),
+    /// The f16 device copy of weight matrix `w` (row-major `rows`×`cols`),
     /// uploaded once and cached by source data pointer. Quantized weights are
-    /// dequantized to f32 on the host first.
-    fn weight_f32(&self, w: &QMatrix) -> Arc<CudaSlice<f32>> {
+    /// dequantized to f32 on the host, then narrowed to f16 — half the
+    /// bytes/VRAM of f32 and what the `Matmul<f16>` GEMM consumes.
+    fn weight_f16(&self, w: &QMatrix) -> Arc<CudaSlice<f16>> {
         let key = match w {
             QMatrix::F32 { data, .. } => data.as_ptr() as usize,
             QMatrix::Quant { data, .. } => data.as_ptr() as usize,
@@ -286,19 +315,20 @@ impl CudaBackend {
                 Cow::Owned(dequantize(*ty, data, rows * cols).expect("weight dequantization"))
             }
         };
+        let f16_data: Vec<f16> = f32_data.iter().map(|&v| f16::from_f32(v)).collect();
         let dev = self
             .stream
-            .clone_htod(f32_data.as_ref())
-            .expect("upload f32 weight to device");
+            .clone_htod(&f16_data)
+            .expect("upload f16 weight to device");
 
         let arc = Arc::new(dev);
         self.weights.lock().unwrap().insert(key, arc.clone());
         arc
     }
 
-    /// `out(rows × oc) = x(rows × ic) · Wᵀ` on cuBLASLt TF32 tensor cores
-    /// (`Matmul<f32>` → f32 in/out, TF32 compute). `x`/`out` are row-major host
-    /// slices; the resident-device variant is [`Self::gemm_dev`].
+    /// `out(rows × oc) = x(rows × ic) · Wᵀ` on cuBLASLt f16 tensor cores.
+    /// `x`/`out` are row-major host slices; the resident-device variant is
+    /// [`Self::gemm_dev`].
     fn gemm(&self, out: &mut [f32], x: &[f32], w: &QMatrix, rows: usize) {
         let oc = w.rows();
         let x_dev = self.stream.clone_htod(x).expect("upload activation");
@@ -314,17 +344,25 @@ impl CudaBackend {
 
     /// Resident-device GEMM: `c(rows × oc) = x(rows × ic) · Wᵀ`, all device
     /// buffers, no host round-trip (the building block for the fused prefill).
+    /// Weights are f16; the f32 activation is narrowed to f16, run through
+    /// `Matmul<f16>` (f32 accumulate), and the f16 result widened back to `c`.
     ///
     /// cuBLASLt is column-major, so we compute the transpose `cᵀ = W · xᵀ` by
     /// feeding our row-major `W` and `x` buffers directly with `transa = true`
     /// (dimensions swapped: `m = oc`, `n = rows`, `k = ic`). Derivation
-    /// cross-checked against cudarc's `test_matmul_*`, guarded by the per-op
+    /// cross-checked against cudarc's `test_matmul_half`, guarded by the per-op
     /// parity test against the CPU backend.
     fn gemm_dev(&self, c: &mut CudaSlice<f32>, x: &CudaSlice<f32>, w: &QMatrix, rows: usize) {
         let (oc, ic) = (w.rows(), w.cols());
         debug_assert_eq!(x.len(), rows * ic);
         debug_assert_eq!(c.len(), rows * oc);
-        let w_dev = self.weight_f32(w);
+        let w_dev = self.weight_f16(w);
+
+        // Narrow the activation to f16, run the f16 GEMM, widen back into `c`.
+        let mut x16 = self.stream.alloc_zeros::<f16>(rows * ic).expect("alloc x16");
+        self.dev_cvt_to_f16(&mut x16, x, rows * ic);
+        let mut c16 = self.stream.alloc_zeros::<f16>(rows * oc).expect("alloc c16");
+
         let cfg = MatmulConfig {
             transa: true,
             transb: false,
@@ -347,9 +385,10 @@ impl CudaBackend {
         // values would be the only way to trip the documented memory hazard.
         unsafe {
             self.blas
-                .matmul(cfg, w_dev.as_ref(), x, c, None, None)
-                .expect("cuBLASLt TF32 matmul");
+                .matmul(cfg, w_dev.as_ref(), &x16, &mut c16, None, None)
+                .expect("cuBLASLt f16 matmul");
         }
+        self.dev_cvt_to_f32(c, &c16, rows * oc);
     }
 
     // --- On-device primitives -------------------------------------------
@@ -357,6 +396,22 @@ impl CudaBackend {
     // These run [`KERNEL_SRC`] kernels on resident device buffers (no host
     // round-trips). They are the building blocks of the fused prefill (M2b) and
     // are each parity-tested against the matching `CpuBackend` op.
+
+    /// Narrow `src` (f32) into `dst` (f16) elementwise.
+    fn dev_cvt_to_f16(&self, dst: &mut CudaSlice<f16>, src: &CudaSlice<f32>, n: usize) {
+        let n_i = n as i32;
+        let mut b = self.stream.launch_builder(&self.kernels.cvt_f32_f16);
+        b.arg(dst).arg(src).arg(&n_i);
+        unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("launch cvt_f32_f16");
+    }
+
+    /// Widen `src` (f16) into `dst` (f32) elementwise.
+    fn dev_cvt_to_f32(&self, dst: &mut CudaSlice<f32>, src: &CudaSlice<f16>, n: usize) {
+        let n_i = n as i32;
+        let mut b = self.stream.launch_builder(&self.kernels.cvt_f16_f32);
+        b.arg(dst).arg(src).arg(&n_i);
+        unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("launch cvt_f16_f32");
+    }
 
     /// `out[i] += x[i]` over the whole buffer.
     fn dev_add(&self, out: &mut CudaSlice<f32>, x: &CudaSlice<f32>, n: usize) {
@@ -936,9 +991,8 @@ mod tests {
     /// TinyLlama-1.1B Q4_K_M GGUF (22 layers, dim 2048) — the north-star shape,
     /// not the 4-layer synthetic proxy. Set `RUSTY_LLAMA_GGUF` to override the
     /// path (default: the repo-root TinyLlama). Compare the CUDA tok/s against
-    /// `llamacpp_bench/lc/llama-bench.exe -m <gguf> -ngl 99` (pp512). NOTE: the
-    /// weights are cached as **f32** on-device (~4.4 GB for this model — the cost
-    /// of the TF32 path); if it OOMs, that motivates f16 weights.
+    /// `llamacpp_bench/lc/llama-bench.exe -m <gguf> -ngl 99` (pp512). Weights are
+    /// cached as **f16** on-device (~2.2 GB for this model).
     #[test]
     #[ignore = "needs the real GGUF + a CUDA device; run with --release --features cuda -- --ignored --nocapture"]
     fn bench_prefill_real_tinyllama() {
@@ -1012,6 +1066,25 @@ mod tests {
         (0..head_size / 2)
             .map(|j| (theta as f64).powf(-2.0 * j as f64 / head_size as f64) as f32)
             .collect()
+    }
+
+    /// Round-trip f32 → f16 → f32 through the inline-PTX conversion kernels.
+    /// Confirms the `asm("cvt...")` actually compiles + runs (not skipped).
+    #[test]
+    #[ignore = "requires a CUDA device; run with --features cuda -- --ignored --nocapture"]
+    fn dev_cvt_roundtrip() {
+        let Some(b) = cuda() else { return };
+        let n = 100usize;
+        let x = noise(n, 18);
+        let xd = b.stream.clone_htod(&x).unwrap();
+        let mut x16 = b.stream.alloc_zeros::<f16>(n).unwrap();
+        b.dev_cvt_to_f16(&mut x16, &xd, n);
+        let mut backd = b.stream.alloc_zeros::<f32>(n).unwrap();
+        b.dev_cvt_to_f32(&mut backd, &x16, n);
+        b.stream.synchronize().unwrap();
+        let got = b.stream.clone_dtoh(&backd).unwrap();
+        // f16 has ~3 decimal digits; values are in [-0.5, 0.5).
+        close_approx(&got, &x, 1e-3, 1e-2);
     }
 
     #[test]
