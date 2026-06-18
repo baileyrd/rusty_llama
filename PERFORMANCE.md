@@ -157,19 +157,27 @@ separable from the CLI but is far below llama.cpp regardless).
    cores: **~2,700 → ~3,560**. (3) **Batching the per-layer KV download** — each
    layer keeps its own resident device K/V so the whole prefill runs with no
    in-loop `synchronize`; the KV is copied to host once at the end for the decode
-   handoff: **~3,560 → ~4,450**. Now **~4.4× behind llama.cpp**, correctness held
-   throughout (per-op parity + prefill/decode coherence, rel L2 ≤6e-4). The CPU
-   prefill baseline here is unreliable (laptop thermal throttling under sustained
-   GPU load), so CUDA-vs-llama.cpp is the meaningful comparison.
+   handoff: **~3,560 → ~4,450**. A further per-op overhead cut (disable cudarc's
+   single-stream-unnecessary event tracking; skip the memset on fully-overwritten
+   GEMM scratch) left the real model ~unchanged (**~4,500 tok/s**) but lifted the
+   small synthetic 4-layer proxy **16.7k → 25k** — i.e. **real-model prefill is now
+   compute-bound** (per-op overhead is a small fraction of the big GEMMs), while
+   op-heavy small models still gained. Now **~4.4× behind llama.cpp**, correctness
+   held throughout (per-op parity + prefill/decode coherence, rel L2 ≤6e-4). The
+   CPU prefill baseline here is unreliable (laptop thermal throttling under
+   sustained GPU load), so CUDA-vs-llama.cpp is the meaningful comparison.
 
-   Remaining gap, in ROI order: (a) keep weights **quantized on device** +
-   dequant-in-kernel — the host dequant→f16 cache still streams f16 weight bytes,
-   ~2× the Q4_K bytes llama.cpp streams (a bigger lift: cuBLASLt wants dense input,
-   so it needs a custom dequant→GEMM); (b) keep KV resident across prefill→decode
-   (a fused decode `forward_step`, like the wgpu path) to drop the end-of-prefill
-   KV round-trip entirely; (c) further attention tuning (warp-level reductions,
-   online-softmax flash for long context). Decode
-   itself stays on the CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
+   The residual ~4.4× on real-model prefill is now in **GEMM/kernel compute
+   efficiency** (cuBLASLt + our nvrtc kernels vs llama.cpp's tuned, fused kernels),
+   not overhead — further prefill gains are diminishing without beating cuBLASLt.
+   **The bigger untapped lever is decode** (`tg128`): we don't use CUDA for it at
+   all yet — `forward_step` delegates to the CPU. llama.cpp does **419 tok/s**
+   decode; a CUDA fused decode (resident KV, GEMV) is where quantized-on-device
+   weights would actually pay off, since batch-1 GEMV is **bandwidth-bound** (each
+   weight read once, no reuse) — unlike compute-bound prefill. Other remaining
+   prefill ideas (lower ROI): keep weights **quantized on device** + dequant-in-
+   kernel (needs a custom dequant→GEMM since cuBLASLt wants dense input); keep KV
+   resident across prefill→decode; warp-level / flash attention.
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),

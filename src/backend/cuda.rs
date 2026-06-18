@@ -271,6 +271,12 @@ impl CudaBackend {
         }
 
         let ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
+        // SAFETY: this backend runs everything on a single stream
+        // (`default_stream`), so device slices never cross streams — the
+        // multi-stream synchronization that event tracking provides is pure
+        // overhead here (2 events per alloc + per-launch bookkeeping). Disable it
+        // before any slice is allocated (incl. the cuBLASLt workspace below).
+        unsafe { ctx.disable_event_tracking() };
         let stream = ctx.default_stream();
         let blas =
             CudaBlasLT::new(stream.clone()).map_err(|e| format!("cuBLASLt init failed: {e:?}"))?;
@@ -359,9 +365,13 @@ impl CudaBackend {
         let w_dev = self.weight_f16(w);
 
         // Narrow the activation to f16, run the f16 GEMM, widen back into `c`.
-        let mut x16 = self.stream.alloc_zeros::<f16>(rows * ic).expect("alloc x16");
+        // `x16` is fully written by the cvt kernel and `c16` by the GEMM
+        // (beta = 0, so C is not read), so neither needs zeroing — skip the
+        // memset with an uninitialized alloc.
+        // SAFETY: both buffers are written in full before they are read.
+        let mut x16 = unsafe { self.stream.alloc::<f16>(rows * ic) }.expect("alloc x16");
         self.dev_cvt_to_f16(&mut x16, x, rows * ic);
-        let mut c16 = self.stream.alloc_zeros::<f16>(rows * oc).expect("alloc c16");
+        let mut c16 = unsafe { self.stream.alloc::<f16>(rows * oc) }.expect("alloc c16");
 
         let cfg = MatmulConfig {
             transa: true,
