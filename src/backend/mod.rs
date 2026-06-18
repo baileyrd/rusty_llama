@@ -202,4 +202,23 @@ pub trait Backend: Send + Sync {
     /// collapsing the host↔device round-trips. The result must match the per-op
     /// path. `state` carries the (per-backend) KV cache across steps.
     fn forward_step(&self, model: &Model, state: &mut RunState, token: usize, pos: usize);
+
+    /// Prefill `tokens` (token `i` at absolute position `pos_base + i`), leaving
+    /// the final position's next-token logits in `state` (read via
+    /// [`RunState::logits`](crate::model::RunState::logits)).
+    ///
+    /// The default mirrors the per-op [`crate::model::forward_prefill`]. A backend
+    /// whose per-op dispatch is round-trip-bound (the GPUs) may override this to
+    /// run the whole prefill with activations + KV resident on device; the result
+    /// must match the default, and it must leave `state`'s KV cache populated for
+    /// the prompt rows so subsequent [`Backend::forward_step`] decode is correct.
+    fn forward_prefill(
+        &self,
+        model: &Model,
+        state: &mut RunState,
+        tokens: &[usize],
+        pos_base: usize,
+    ) {
+        crate::model::forward_prefill(model, state, self, tokens, pos_base);
+    }
 }

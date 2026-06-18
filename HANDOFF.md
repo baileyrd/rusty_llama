@@ -43,25 +43,26 @@ roadmap this serves.
     coherence (rel L2 ~3e-4). **Per-op prefill ~2800 tok/s** (256 tok, dim 1024
     ×4L) vs wgpu 533, CPU noisy.
   - **M2a:** five nvrtc kernels (add/swiglu/rmsnorm/rope/attention) in `KERNEL_SRC`
-    + `dev_*` launchers, each parity-verified vs the CPU op (maxdiff ≤ 3e-7). They
-    are `#[allow(dead_code)]` until M2b wires them.
+    + `dev_*` launchers, each parity-verified vs the CPU op (maxdiff ≤ 3e-7).
+  - **M2b:** `Backend::forward_prefill` (defaulted to the free fn; `generate`
+    dispatches through it) overridden on `CudaBackend` with a **resident fused
+    prefill** — embeddings up once, `x`/`xb`/`q`/`hb` + per-layer KV resident,
+    TF32 GEMMs + the `dev_*` kernels, logits down. The prompt's K/V are copied
+    back to host `state` (`RunState::store_prefill_kv`) so CPU decode is correct;
+    guarded by `prefill_then_decode_coherent` (rel L2 ~3e-4). Handles `pos_base==0`
+    (delegates otherwise). **Fused prefill ~3300 tok/s** (256 tok, dim 1024 ×4L)
+    vs ~2800 per-op TF32, 533 wgpu.
 
-**Next session → M2b: resident fused `forward_prefill`.** Add a
-`forward_prefill(&self, model, state, tokens, pos_base)` method to the `Backend`
-trait (default impl just calls the existing free fn `crate::model::forward_prefill`),
-and switch callers (`generate`, the prefill tests/CLI) to `backend.forward_prefill(..)`.
-Override it on `CudaBackend` to run the whole prefill **resident**: upload token
-embeddings once → `x` device buffer; per layer keep `xb/q/hb/hb2` + the KV cache
-on device, using `gemm_dev` (TF32) for the seven matmuls and the M2a `dev_*`
-kernels for rmsnorm/rope/attention/swiglu/add; only download the final logits.
-**KV-handoff gotcha:** decode (`forward_step`) is delegated to the CPU and reads
-the *host* `state.key_cache`/`value_cache`, so the fused prefill must copy the
-device KV (rows `pos_base..pos_base+n` per layer) back into host `state` at the
-end — otherwise generation after the prompt is wrong. The `prefill_coherent_with_cpu`
-test only checks prefill logits; **add a `generate`-level coherence test** (prompt
-+ a few decoded tokens, CUDA vs CPU) to guard the handoff. Then re-bench real
-TinyLlama Q4_K_M vs `llama-bench`. `dot4I8Packed` (item 2) and the portable wgpu
-coopmat path are both exhausted.
+**Next session → measure on the real model + tighten residency.** (1) Re-bench
+the **real TinyLlama-1.1B Q4_K_M** prefill via the CLI / a dedicated harness vs
+`llama-bench -ngl 99`; the synthetic 4-layer number understates the win on 22
+layers. (2) The fused prefill still downloads each layer's K/V with a per-layer
+`synchronize` (for the decode handoff) — batch those (keep per-layer device KV,
+one download at the end) to recover the serialization cost. (3) Optionally keep
+the KV resident across prefill→decode (a fused decode `forward_step`, like the
+wgpu path) instead of round-tripping to host. Decode stays GEMV/bandwidth-bound
+at batch=1. `dot4I8Packed` (item 2) and the portable wgpu coopmat path are both
+exhausted.
 
 ---
 

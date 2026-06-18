@@ -325,7 +325,6 @@ impl CudaBackend {
     // are each parity-tested against the matching `CpuBackend` op.
 
     /// `out[i] += x[i]` over the whole buffer.
-    #[allow(dead_code)] // wired into the fused prefill in M2b
     fn dev_add(&self, out: &mut CudaSlice<f32>, x: &CudaSlice<f32>, n: usize) {
         let n_i = n as i32;
         let mut b = self.stream.launch_builder(&self.kernels.add);
@@ -334,7 +333,6 @@ impl CudaBackend {
     }
 
     /// `hb[i] = silu(hb[i]) * hb2[i]` over the whole buffer.
-    #[allow(dead_code)] // wired into the fused prefill in M2b
     fn dev_swiglu(&self, hb: &mut CudaSlice<f32>, hb2: &CudaSlice<f32>, n: usize) {
         let n_i = n as i32;
         let mut b = self.stream.launch_builder(&self.kernels.swiglu);
@@ -343,7 +341,6 @@ impl CudaBackend {
     }
 
     /// Per-row RMSNorm of `x` (`rows` × `dim`) into `out` against shared `w`.
-    #[allow(dead_code)] // wired into the fused prefill in M2b
     fn dev_rmsnorm(
         &self,
         out: &mut CudaSlice<f32>,
@@ -367,7 +364,7 @@ impl CudaBackend {
 
     /// Batched RoPE: `q` (`rows`×`q_dim`) and `k` (`rows`×`kv_dim`) rotated in
     /// place; row `r` at absolute position `pos_base + r`.
-    #[allow(clippy::too_many_arguments, dead_code)] // wired into the fused prefill in M2b
+    #[allow(clippy::too_many_arguments)]
     fn dev_rope(
         &self,
         q: &mut CudaSlice<f32>,
@@ -410,7 +407,7 @@ impl CudaBackend {
 
     /// Batched causal GQA: query row `r` (at `pos_base + r`) over cached keys
     /// `0..=pos_base+r`. `att` is scratch of `rows*n_heads*seq_len`.
-    #[allow(clippy::too_many_arguments, dead_code)] // wired into the fused prefill in M2b
+    #[allow(clippy::too_many_arguments)]
     fn dev_attention(
         &self,
         out: &mut CudaSlice<f32>,
@@ -515,6 +512,101 @@ impl Backend for CudaBackend {
 
     fn forward_step(&self, model: &Model, state: &mut RunState, token: usize, pos: usize) {
         self.cpu.forward_step(model, state, token, pos);
+    }
+
+    /// Resident fused prefill: the whole prompt runs on-device — TF32 GEMMs plus
+    /// the [`KERNEL_SRC`] kernels — with `x`/`xb`/`q`/`hb` and the per-layer KV
+    /// kept resident, so a layer executes with no host round-trips. Only the
+    /// token embeddings go up and the final logits come down (plus the prompt's
+    /// K/V, copied back to host `state` for subsequent CPU decode).
+    ///
+    /// Handles the from-scratch case (`pos_base == 0`, how `generate` prefills a
+    /// prompt); for a non-zero base the prior KV lives on the host, so it
+    /// delegates to the per-op default.
+    fn forward_prefill(
+        &self,
+        model: &Model,
+        state: &mut RunState,
+        tokens: &[usize],
+        pos_base: usize,
+    ) {
+        if pos_base != 0 {
+            crate::model::forward_prefill(model, state, self, tokens, pos_base);
+            return;
+        }
+
+        let p = &model.config;
+        let w = &model.weights;
+        let (dim, kv_dim, head_size, hidden) = (p.dim, p.kv_dim(), p.head_size(), p.hidden_dim);
+        let (n_heads, kv_mul, eps) = (p.n_heads, p.n_heads / p.n_kv_heads, p.rms_eps);
+        let n = tokens.len();
+        let st = &self.stream;
+
+        // Seed x with the (dequantized) token embeddings; one upload.
+        let mut x_host = vec![0.0f32; n * dim];
+        for (r, &tok) in tokens.iter().enumerate() {
+            w.token_embedding_table
+                .dequant_row(tok, &mut x_host[r * dim..r * dim + dim]);
+        }
+        let mut x = st.clone_htod(&x_host).expect("upload embeddings");
+
+        // Resident scratch. The per-layer KV (`keyc`/`valuec`) holds rows 0..n
+        // (pos_base == 0); `att`'s row stride is therefore n, not seq_len.
+        let mut xb = st.alloc_zeros::<f32>(n * dim).expect("alloc xb");
+        let mut xb2 = st.alloc_zeros::<f32>(n * dim).expect("alloc xb2");
+        let mut q = st.alloc_zeros::<f32>(n * dim).expect("alloc q");
+        let mut hb = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb");
+        let mut hb2 = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb2");
+        let mut att = st.alloc_zeros::<f32>(n * n_heads * n).expect("alloc att");
+        let mut keyc = st.alloc_zeros::<f32>(n * kv_dim).expect("alloc keyc");
+        let mut valuec = st.alloc_zeros::<f32>(n * kv_dim).expect("alloc valuec");
+        let inv = st
+            .clone_htod(&model.rope.inv_freq)
+            .expect("upload inv_freq");
+        let (n_freqs, mscale) = (model.rope.inv_freq.len(), model.rope.mscale);
+
+        for layer in 0..p.n_layers {
+            // --- Attention ---
+            let w_att = st
+                .clone_htod(&w.rms_att_weight[layer * dim..layer * dim + dim])
+                .expect("upload rms_att");
+            self.dev_rmsnorm(&mut xb, &x, &w_att, n, dim, eps);
+            self.gemm_dev(&mut q, &xb, &w.wq[layer], n);
+            self.gemm_dev(&mut keyc, &xb, &w.wk[layer], n);
+            self.gemm_dev(&mut valuec, &xb, &w.wv[layer], n);
+            self.dev_rope(&mut q, &mut keyc, &inv, n, 0, head_size, kv_dim, dim, n_freqs, mscale);
+            self.dev_attention(
+                &mut xb, &q, &keyc, &valuec, &mut att, n, 0, n_heads, kv_mul, head_size, n, kv_dim,
+            );
+            self.gemm_dev(&mut xb2, &xb, &w.wo[layer], n);
+            self.dev_add(&mut x, &xb2, n * dim);
+
+            // --- Feed-forward (SwiGLU) ---
+            let w_ffn = st
+                .clone_htod(&w.rms_ffn_weight[layer * dim..layer * dim + dim])
+                .expect("upload rms_ffn");
+            self.dev_rmsnorm(&mut xb, &x, &w_ffn, n, dim, eps);
+            self.gemm_dev(&mut hb, &xb, &w.w1[layer], n);
+            self.gemm_dev(&mut hb2, &xb, &w.w3[layer], n);
+            self.dev_swiglu(&mut hb, &hb2, n * hidden);
+            self.gemm_dev(&mut xb, &hb, &w.w2[layer], n);
+            self.dev_add(&mut x, &xb, n * dim);
+
+            // Hand this layer's prompt K/V back to the host cache for decode.
+            // `clone_dtoh` of pageable memory completes synchronously, so the
+            // next layer may safely overwrite keyc/valuec afterward.
+            let k_host: Vec<f32> = st.clone_dtoh(&keyc).expect("download K");
+            let v_host: Vec<f32> = st.clone_dtoh(&valuec).expect("download V");
+            state.store_prefill_kv(layer * p.seq_len * kv_dim, &k_host, &v_host);
+        }
+
+        // Final RMSNorm of the last position + classifier, via the host path.
+        let x_host: Vec<f32> = st.clone_dtoh(&x).expect("download residual");
+        let last = (n - 1) * dim;
+        let mut xb_last = vec![0.0f32; dim];
+        self.cpu
+            .rmsnorm(&mut xb_last, &x_host[last..last + dim], &w.rms_final_weight, eps);
+        self.gemm(state.logits_mut(), &xb_last, &w.wcls, 1);
     }
 }
 
@@ -658,9 +750,11 @@ mod tests {
         let model = crate::Model::from_gguf(&gguf).unwrap();
         let tokens: Vec<usize> = (0..16).map(|i| (i * 7) % c.vocab_size).collect();
 
+        // Dispatch through the trait method: CUDA runs its resident fused
+        // prefill, CPU uses the default (per-op free fn).
         let logits = |backend: &dyn Backend| {
             let mut s = crate::RunState::new(&model.config);
-            crate::forward_prefill(&model, &mut s, backend, &tokens, 0);
+            backend.forward_prefill(&model, &mut s, &tokens, 0);
             s.logits().to_vec()
         };
         let cuda_logits = logits(&b);
@@ -687,6 +781,62 @@ mod tests {
 
         assert_eq!(ca, pa, "top token diverged (cuda {ca} vs cpu {pa})");
         assert!(rel < 0.1, "logit vectors diverged: relative L2 error {rel}");
+    }
+
+    /// Guards the device→host KV handoff: after the fused prefill, a decode step
+    /// (which runs on the CPU and reads the *host* KV cache) must match the
+    /// all-CPU path. If the fused prefill failed to write `state`'s KV correctly,
+    /// the post-prompt decode logits diverge here even though prefill logits
+    /// (above) wouldn't.
+    #[test]
+    #[ignore = "requires a CUDA device; run with --features cuda -- --ignored --nocapture"]
+    fn prefill_then_decode_coherent() {
+        let Some(b) = cuda() else { return };
+        let c = crate::Config {
+            dim: 256,
+            hidden_dim: 512,
+            n_layers: 4,
+            n_heads: 8,
+            n_kv_heads: 8,
+            vocab_size: 512,
+            seq_len: 64,
+            shared_weights: true,
+            ..Default::default()
+        };
+        let bytes = crate::dummy::synthetic_gguf_typed(&c, GgmlType::F32);
+        let gguf = crate::Gguf::parse(&bytes).unwrap();
+        let model = crate::Model::from_gguf(&gguf).unwrap();
+        let tokens: Vec<usize> = (0..12).map(|i| (i * 7) % c.vocab_size).collect();
+        let n = tokens.len();
+
+        // Prefill the prompt, then decode one token at position n. For CUDA the
+        // prefill is fused (writes host KV via the handoff); decode is CPU.
+        let run = |backend: &dyn Backend| {
+            let mut s = crate::RunState::new(&model.config);
+            backend.forward_prefill(&model, &mut s, &tokens, 0);
+            backend.forward_step(&model, &mut s, tokens[0], n);
+            s.logits().to_vec()
+        };
+        let cuda = run(&b);
+        let cpu = run(&CpuBackend::new());
+
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, x| a.1.partial_cmp(x.1).unwrap())
+                .unwrap()
+                .0
+        };
+        let num: f32 = cuda.iter().zip(&cpu).map(|(a, b)| (a - b) * (a - b)).sum();
+        let den: f32 = cpu.iter().map(|v| v * v).sum();
+        let rel = (num / den).sqrt();
+        eprintln!(
+            "prefill+decode coherence: argmax cuda={} cpu={}, relative L2 error {rel:.4}",
+            argmax(&cuda),
+            argmax(&cpu)
+        );
+        assert_eq!(argmax(&cuda), argmax(&cpu), "decode top token diverged");
+        assert!(rel < 0.1, "decode logits diverged: relative L2 error {rel}");
     }
 
     /// Prefill throughput: CUDA (cuBLASLt f16) vs CPU on the same shape the wgpu
@@ -718,7 +868,7 @@ mod tests {
 
         let prefill = |backend: &dyn Backend| {
             let mut s = crate::RunState::new(&model.config);
-            crate::forward_prefill(&model, &mut s, backend, &tokens, 0);
+            backend.forward_prefill(&model, &mut s, &tokens, 0);
         };
 
         prefill(&b); // warm up: dequant + upload weights, make them resident

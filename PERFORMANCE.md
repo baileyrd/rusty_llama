@@ -125,13 +125,22 @@ separable from the CLI but is far below llama.cpp regardless).
    CUDA prefill (~18.5k on the real Q4_K_M), because this is synthetic f32 and the
    per-op path still round-trips activations to the host per matmul.
 
-   **M2a** adds the on-device primitives to remove those round-trips: five nvrtc
-   kernels (add, swiglu, rmsnorm, rope, attention), each parity-verified against
-   the CPU op (maxdiff ≤ 3e-7). **M2b (next)** assembles them + the TF32 GEMMs
-   into a resident fused `forward_prefill` (activations + KV cache stay on
-   device, only embeddings up / logits down), then re-benches the real TinyLlama
-   Q4_K_M vs `llama-bench`. Decode stays on the CPU/existing paths (batch=1 is
-   GEMV/bandwidth-bound).
+   **M2a + M2b done — resident fused prefill.** Five nvrtc kernels (add, swiglu,
+   rmsnorm, rope, attention), each parity-verified vs the CPU op (maxdiff ≤ 3e-7),
+   are assembled with the TF32 GEMMs into a `Backend::forward_prefill` override
+   (`generate` dispatches through it): a prompt runs entirely on-device — `x`/`xb`/
+   `q`/`hb` + the per-layer KV stay resident, only the token embeddings go up and
+   the final logits come down. The prompt's K/V are copied back to the host KV
+   cache so subsequent CPU decode is correct (guarded by a prefill→decode
+   coherence test, rel L2 ~3e-4). **Fused prefill: ~3300 tok/s** on the synthetic
+   shape (256 tok, dim 1024 × 4L) — up from ~2800 (per-op TF32) and 533 (wgpu).
+
+   Remaining headroom: the fused path still downloads each layer's K/V to host
+   with a per-layer sync (for the decode handoff) — batching those would help,
+   and the real win is on deep models (TinyLlama's 22 layers ≫ the 4-layer
+   synthetic). **Next:** re-bench the real TinyLlama Q4_K_M vs `llama-bench` and
+   keep KV resident across prefill→decode. Decode itself stays on the
+   CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),
