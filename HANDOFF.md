@@ -75,25 +75,32 @@ roadmap this serves.
   Correctness held throughout (parity + prefill/decode coherence, rel L2 ≤6e-4).
   CPU baseline is throttle-noisy under sustained load — compare CUDA-vs-llama.cpp.
 
-**KEY FINDING: real-model prefill is now compute-bound (~4.4× behind llama.cpp);
-further prefill gains are diminishing without beating cuBLASLt. The big untapped
-lever is DECODE.**
+- **CUDA fused decode DONE.** `CudaBackend::forward_step` now runs a resident
+  single-token decode (mirrors the wgpu `DecodeState`): a lazily-built
+  `DecodeCuda` holds the per-layer KV cache + activation scratch + RMSNorm
+  weights on device; a `kv_filled` counter uploads the prompt's host KV once on
+  the first step; each step does embedding→layers (batch-1 GEMVs via `gemm_dev`
+  + the M2 kernels; K/V appended to row `pos` via `slice_mut`/`memcpy_dtod`)→
+  classifier→logits download. **Real TinyLlama Q4_K_M tg128: CUDA ~123 tok/s vs
+  CPU ~52 (2.4×), vs llama.cpp 419 (~3.4× behind).** Coherence: multi-step +
+  prefill→decode vs CPU, rel L2 ≤6e-4/step.
 
-**Next session → CUDA fused decode (the user-facing win).** Decode (`tg128`)
-currently delegates to the CPU (`CudaBackend::forward_step` → `self.cpu`).
-llama.cpp does **419 tok/s** decode; ours is CPU-bound. Build a resident fused
-`forward_step` (mirror the wgpu `DecodeState`: KV cache + activations live on
-device across steps, one token at a time). At batch=1 the matmuls are **GEMV and
-bandwidth-bound** (each weight read once, no reuse) — so this is exactly where
-**quantized-on-device weights / `dot4I8Packed`** pay off (unlike compute-bound
-prefill). Reuse the M2a kernels (rmsnorm/rope/attention/swiglu/add) + a GEMV.
-Guard with decode coherence vs CPU; bench `tg128` vs `llama-bench`.
+**KEY FINDING: the ~3.4× decode gap is weight bandwidth.** Decode is batch-1
+GEMV (each weight read once → bandwidth-bound); we stream **f16** weights
+(~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B), ≈3.5× — which ≈ the gap.
 
-Lower-ROI prefill leftovers: quantized-on-device weights for prefill (needs a
-custom dequant→GEMM, modest gain since prefill is compute-bound); keep KV
-resident across prefill→decode; warp-level/flash attention. `dot4I8Packed`
-(roadmap item 2) helps **decode**, not the k-quant prefill GEMMs; the portable
-wgpu coopmat path is exhausted.
+**Next session → quantized-on-device weights for decode (the high-ROI lever).**
+Store the matmul weights **packed (Q4_K/Q6_K/Q8_0) in VRAM** and dequant-in-kernel
+inside a custom **GEMV** (decode is n=1, so a custom dequant→GEMV is tractable and
+doesn't need to beat cuBLASLt's GEMM — it just needs to stream the packed bytes).
+Or use `dot4I8Packed` (int8) — roadmap item 2's kernels exist on the wgpu side for
+reference. This is where it pays off (decode bandwidth-bound; prefill is
+compute-bound so it barely helps there). Then re-bench `tg128`.
+
+Lower-ROI leftovers: keep KV resident across prefill→decode (drop the one-time
+host upload); a dedicated GEMV kernel vs cuBLASLt at n=1; warp-level/flash
+attention; prefill is near the cuBLASLt wall (~4.4×). The portable wgpu coopmat
+path is exhausted.
 
 ---
 

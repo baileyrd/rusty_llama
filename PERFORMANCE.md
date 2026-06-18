@@ -170,14 +170,28 @@ separable from the CLI but is far below llama.cpp regardless).
    The residual ~4.4× on real-model prefill is now in **GEMM/kernel compute
    efficiency** (cuBLASLt + our nvrtc kernels vs llama.cpp's tuned, fused kernels),
    not overhead — further prefill gains are diminishing without beating cuBLASLt.
-   **The bigger untapped lever is decode** (`tg128`): we don't use CUDA for it at
-   all yet — `forward_step` delegates to the CPU. llama.cpp does **419 tok/s**
-   decode; a CUDA fused decode (resident KV, GEMV) is where quantized-on-device
-   weights would actually pay off, since batch-1 GEMV is **bandwidth-bound** (each
-   weight read once, no reuse) — unlike compute-bound prefill. Other remaining
-   prefill ideas (lower ROI): keep weights **quantized on device** + dequant-in-
-   kernel (needs a custom dequant→GEMM since cuBLASLt wants dense input); keep KV
-   resident across prefill→decode; warp-level / flash attention.
+
+   **Decode (`tg128`) — CUDA fused decode now live.** `CudaBackend::forward_step`
+   was CPU-delegated; it now runs a **resident single-token decode** (KV cache +
+   activations stay on device across steps, batch-1 GEMVs via the f16 GEMM + the
+   M2 kernels, the prompt's host KV uploaded once on the first step). Measured on
+   the real TinyLlama-1.1B Q4_K_M:
+
+   | Path | Decode (tg128) | |
+   | --- | ---: | --- |
+   | rusty_llama — CPU | ~52 tok/s | — |
+   | rusty_llama — **CUDA (resident, f16)** | **~123 tok/s** | 2.4× CPU |
+   | llama.cpp — CUDA (`llama-bench`) | **419 tok/s** | ~3.4× ahead |
+
+   Correctness: multi-step decode + prefill→decode coherence vs CPU (rel L2 ≤6e-4
+   per step). The **~3.4× decode gap is weight bandwidth**: decode is batch-1 GEMV
+   (each weight read once, no reuse → bandwidth-bound), and we stream **f16**
+   weights (~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B) — ~3.5×, which roughly
+   *is* the gap. So **quantized-on-device weights / `dot4I8Packed` are the clear
+   high-ROI next lever for decode** (where they pay off, unlike compute-bound
+   prefill). Lower-ROI: keep KV resident across prefill→decode (drop the one-time
+   upload); warp-level / flash attention; a dedicated GEMV kernel vs cuBLASLt at
+   n=1.
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),
