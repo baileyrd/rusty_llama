@@ -10,7 +10,6 @@ readme = "README.md"
 [dependencies]
 cudarc = { version = "0.19", optional = true, default-features = false }
 fancy-regex = "0.18.0"
-half = { version = "2", optional = true }
 memmap2 = "0.9"
 pollster = { version = "0.4.0", optional = true }
 rayon = "1"
@@ -34,10 +33,9 @@ gpu = ["dep:wgpu", "dep:pollster"]
 # with the installed 13.3 runtime; `f16` pulls the half crate for the f16 GEMM.
 cuda = [
     "dep:cudarc",
-    "dep:half",
     "cudarc/std",
     "cudarc/cuda-13020",
     "cudarc/dynamic-loading",
     "cudarc/cublaslt",
-    "cudarc/f16",
+    "cudarc/nvrtc",
 ]

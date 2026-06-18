@@ -110,22 +110,28 @@ separable from the CLI but is far below llama.cpp regardless).
    machine needs the **NVIDIA-only CUDA backend** (`mma` / cuBLASLt).
    `dot4I8Packed` (item 2) is also exhausted.
 
-   **CUDA backend (cudarc + cuBLASLt) — M0 + M1 done, prefill tensor cores
-   live.** A third `Backend` impl (`src/backend/cuda.rs`, behind the `cuda` cargo
-   feature; cudarc `dynamic-loading` so it needs no CUDA libs/nvcc at build time
-   and fails gracefully on a CUDA-less host). The `forward_prefill` matmuls +
-   classifier run on **cuBLASLt f16 tensor cores** (f16 weights cached on-device,
-   f32 accumulate); the other ops still delegate to the CPU. Per-op parity vs the
-   CPU oracle (maxdiff ~5e-3) and an end-to-end prefill coherence check (relative
-   L2 error ~6e-4, top token matches) confirm the column-major `x·Wᵀ` layout.
-   **Measured prefill (synthetic, 256 tok, dim 1024 × 4L, same shape for all
-   three):** CPU ~70 · **wgpu f32 GEMV 533 · CUDA f16 1304 tok/s** — CUDA is
-   **~2.45× wgpu** and **~18× CPU**. Still far under llama.cpp's CUDA prefill
-   (~18.5k on the real Q4_K_M model), because (a) this is synthetic f32, and (b)
-   M1 still round-trips activations to the host per matmul. **Next: M2** — move
-   the elementwise/attention ops onto CUDA and keep activations resident to kill
-   the per-op copies; then re-bench the real TinyLlama Q4_K_M vs `llama-bench`.
-   Decode stays on the CPU/existing paths (batch=1 is GEMV/bandwidth-bound).
+   **CUDA backend (cudarc + cuBLASLt) — M0/M1 done, M2a kernels landed.** A third
+   `Backend` impl (`src/backend/cuda.rs`, behind the `cuda` cargo feature; cudarc
+   `dynamic-loading` so it needs no CUDA libs/nvcc at build time and fails
+   gracefully on a CUDA-less host). The `forward_prefill` matmuls + classifier run
+   on **cuBLASLt TF32 tensor cores** (`Matmul<f32>` → `CUBLAS_COMPUTE_32F_FAST_TF32`;
+   dequantized f32 weights cached on-device). Pure f32 throughout — no f16, so no
+   `cuda_fp16.h`/header dependency, and the per-call host f16 conversion that
+   throttled the first cut is gone. Per-op parity vs the CPU oracle (maxdiff
+   ~6e-3) + prefill coherence (relative L2 ~3e-4, top token matches) confirm the
+   column-major `x·Wᵀ` layout. **Measured prefill (synthetic, 256 tok, dim 1024 ×
+   4L, same shape for all three): CPU ~70–280 · wgpu f32 GEMV 533 · CUDA TF32
+   ~2800 tok/s** (CPU baseline is single-shot and noisy). Still under llama.cpp's
+   CUDA prefill (~18.5k on the real Q4_K_M), because this is synthetic f32 and the
+   per-op path still round-trips activations to the host per matmul.
+
+   **M2a** adds the on-device primitives to remove those round-trips: five nvrtc
+   kernels (add, swiglu, rmsnorm, rope, attention), each parity-verified against
+   the CPU op (maxdiff ≤ 3e-7). **M2b (next)** assembles them + the TF32 GEMMs
+   into a resident fused `forward_prefill` (activations + KV cache stay on
+   device, only embeddings up / logits down), then re-benches the real TinyLlama
+   Q4_K_M vs `llama-bench`. Decode stays on the CPU/existing paths (batch=1 is
+   GEMV/bandwidth-bound).
 4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
    GEMM**.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),

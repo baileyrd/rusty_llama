@@ -33,25 +33,35 @@ roadmap this serves.
   Ti (device detected + htod/dtoh round-trip). `cargo test`/`clippy --all-targets`
   clean with and without `--features cuda`.
 
-- **Roadmap #3 — CUDA backend M1 DONE: prefill tensor cores live.**
-  `CudaBackend::matmul`/`matmul_batch` now run on **cuBLASLt f16** (f16 weights
-  cached on-device keyed by data pointer, f32 accumulate); other ops still
-  delegate to CPU. The column-major `out(n,oc)=x(n,ic)·Wᵀ` layout is `transa=true,
-  m=oc, n=rows, k=ic, lda=ldb=ic, ldc=oc, matmul(cfg, a=W, b=X, c=out)` — verified
-  by per-op parity (maxdiff ~5e-3) + e2e prefill coherence (rel L2 ~6e-4, top
-  token matches). **Measured prefill (256 tok, dim 1024 × 4L): CPU ~70 · wgpu 533
-  · CUDA 1304 tok/s** (~2.45× wgpu, ~18× CPU). Benches/tests are ignored
-  (`bench_prefill_cuda_vs_cpu`, `*_parity`, `prefill_coherent_with_cpu`).
+- **Roadmap #3 — CUDA backend M1 DONE + M2a DONE.**
+  - **M1:** `CudaBackend::matmul`/`matmul_batch` run on **cuBLASLt TF32 tensor
+    cores** (`Matmul<f32>`; dequantized f32 weights cached on-device by data
+    pointer). Pure f32 — switched off f16 to drop the `cuda_fp16.h` dependency and
+    the per-call host f16 conversion. Layout `out(n,oc)=x(n,ic)·Wᵀ` =
+    `transa=true, m=oc, n=rows, k=ic, lda=ldb=ic, ldc=oc, matmul(cfg, a=W, b=X,
+    c=out)` (in [`CudaBackend::gemm_dev`]) — verified by per-op parity + prefill
+    coherence (rel L2 ~3e-4). **Per-op prefill ~2800 tok/s** (256 tok, dim 1024
+    ×4L) vs wgpu 533, CPU noisy.
+  - **M2a:** five nvrtc kernels (add/swiglu/rmsnorm/rope/attention) in `KERNEL_SRC`
+    + `dev_*` launchers, each parity-verified vs the CPU op (maxdiff ≤ 3e-7). They
+    are `#[allow(dead_code)]` until M2b wires them.
 
-**Next session → M2: kill the per-op host↔device copies.** M1 is honest but
-leaves throughput on the table — every prefill matmul re-uploads its activation
-tile and reads the result back. Move the elementwise/attention ops
-(rmsnorm/rope/attention/swiglu/add) onto CUDA (cudarc kernels via nvrtc/PTX, or
-hand `.cu`) and keep the activation/KV buffers **resident** across a prefill, so
-a layer runs without host round-trips — mirror the wgpu fused-prefill approach.
-Then **re-bench the real TinyLlama Q4_K_M vs `llama-bench`** (the north-star
-number). Decode stays on CPU/existing paths (batch=1 GEMV is bandwidth-bound).
-`dot4I8Packed` (item 2) and the portable wgpu coopmat path are both exhausted.
+**Next session → M2b: resident fused `forward_prefill`.** Add a
+`forward_prefill(&self, model, state, tokens, pos_base)` method to the `Backend`
+trait (default impl just calls the existing free fn `crate::model::forward_prefill`),
+and switch callers (`generate`, the prefill tests/CLI) to `backend.forward_prefill(..)`.
+Override it on `CudaBackend` to run the whole prefill **resident**: upload token
+embeddings once → `x` device buffer; per layer keep `xb/q/hb/hb2` + the KV cache
+on device, using `gemm_dev` (TF32) for the seven matmuls and the M2a `dev_*`
+kernels for rmsnorm/rope/attention/swiglu/add; only download the final logits.
+**KV-handoff gotcha:** decode (`forward_step`) is delegated to the CPU and reads
+the *host* `state.key_cache`/`value_cache`, so the fused prefill must copy the
+device KV (rows `pos_base..pos_base+n` per layer) back into host `state` at the
+end — otherwise generation after the prompt is wrong. The `prefill_coherent_with_cpu`
+test only checks prefill logits; **add a `generate`-level coherence test** (prompt
++ a few decoded tokens, CUDA vs CPU) to guard the handoff. Then re-bench real
+TinyLlama Q4_K_M vs `llama-bench`. `dot4I8Packed` (item 2) and the portable wgpu
+coopmat path are both exhausted.
 
 ---
 
