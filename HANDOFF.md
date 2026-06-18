@@ -64,18 +64,22 @@ roadmap this serves.
   - **f16 weights + `Matmul<f16>`** (host dequant→f16 cache; activations narrowed
     f32↔f16 on-device via inline-PTX `cvt` kernels — no `cuda_fp16.h`; half the
     weight bytes/VRAM + faster f16 tensor cores): **~3,560 tok/s, ~5.5× behind**.
+  - **Batched KV download:** each layer keeps its own resident device K/V (Vec of
+    buffers), so the whole prefill runs with no in-loop `synchronize`; the KV is
+    copied to host once after the loop for the decode handoff: **~4,450 tok/s,
+    ~4.4× behind**.
   Correctness held throughout (parity + prefill/decode coherence, rel L2 ≤6e-4).
   CPU baseline is throttle-noisy under sustained load — compare CUDA-vs-llama.cpp.
 
-**Next session → close the remaining ~5.5×, in ROI order:**
-1. **Batch the per-layer KV download.** The fused prefill downloads each layer's
-   K/V to host with a per-layer `synchronize` (for the decode handoff) — keep
-   per-layer device KV and do one download at the end, or keep KV resident across
-   prefill→decode (a fused decode `forward_step`, like the wgpu path).
-2. **Keep weights quantized on device** + dequant-in-kernel before the GEMM —
-   currently `weight_f16` host-dequants then streams f16 weight bytes; llama.cpp
-   streams Q4_K (~3.5× fewer weight bytes). The hard part is a custom dequant→GEMM
-   (cuBLASLt wants dense), so this is a bigger lift than f16 was.
+**Next session → close the remaining ~4.4×, in ROI order:**
+1. **Keep weights quantized on device** + dequant-in-kernel before the GEMM —
+   `weight_f16` host-dequants then streams f16 weight bytes (~2× the Q4_K bytes
+   llama.cpp streams). The lift: cuBLASLt wants dense input, so this needs a
+   custom dequant→GEMM kernel (or a dequant-into-f16-scratch pass that still
+   streams the packed Q4_K from VRAM). Biggest remaining lever.
+2. **Keep KV resident across prefill→decode** — a fused decode `forward_step`
+   (like the wgpu `DecodeState` path) with the KV cache living on device, so the
+   end-of-prefill KV round-trip to host disappears entirely.
 3. **Further attention tuning** (warp-level reductions; online-softmax flash for
    long context) and larger GEMM batching / overlap.
 

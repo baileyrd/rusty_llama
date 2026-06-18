@@ -645,15 +645,21 @@ impl Backend for CudaBackend {
         }
         let mut x = st.clone_htod(&x_host).expect("upload embeddings");
 
-        // Resident scratch. The per-layer KV (`keyc`/`valuec`) holds rows 0..n
-        // (pos_base == 0); `att`'s row stride is therefore n, not seq_len.
+        // Resident scratch. Each layer keeps its own K/V buffer (rows 0..n, since
+        // pos_base == 0) so the whole prefill runs with NO in-loop synchronize —
+        // they are downloaded to the host once after the loop for the decode
+        // handoff. `att`'s row stride is therefore n, not seq_len.
         let mut xb = st.alloc_zeros::<f32>(n * dim).expect("alloc xb");
         let mut xb2 = st.alloc_zeros::<f32>(n * dim).expect("alloc xb2");
         let mut q = st.alloc_zeros::<f32>(n * dim).expect("alloc q");
         let mut hb = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb");
         let mut hb2 = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb2");
-        let mut keyc = st.alloc_zeros::<f32>(n * kv_dim).expect("alloc keyc");
-        let mut valuec = st.alloc_zeros::<f32>(n * kv_dim).expect("alloc valuec");
+        let mut key_dev: Vec<CudaSlice<f32>> = (0..p.n_layers)
+            .map(|_| st.alloc_zeros::<f32>(n * kv_dim).expect("alloc key"))
+            .collect();
+        let mut value_dev: Vec<CudaSlice<f32>> = (0..p.n_layers)
+            .map(|_| st.alloc_zeros::<f32>(n * kv_dim).expect("alloc value"))
+            .collect();
         let inv = st
             .clone_htod(&model.rope.inv_freq)
             .expect("upload inv_freq");
@@ -666,11 +672,14 @@ impl Backend for CudaBackend {
                 .expect("upload rms_att");
             self.dev_rmsnorm(&mut xb, &x, &w_att, n, dim, eps);
             self.gemm_dev(&mut q, &xb, &w.wq[layer], n);
-            self.gemm_dev(&mut keyc, &xb, &w.wk[layer], n);
-            self.gemm_dev(&mut valuec, &xb, &w.wv[layer], n);
-            self.dev_rope(&mut q, &mut keyc, &inv, n, 0, head_size, kv_dim, dim, n_freqs, mscale);
+            self.gemm_dev(&mut key_dev[layer], &xb, &w.wk[layer], n);
+            self.gemm_dev(&mut value_dev[layer], &xb, &w.wv[layer], n);
+            self.dev_rope(
+                &mut q, &mut key_dev[layer], &inv, n, 0, head_size, kv_dim, dim, n_freqs, mscale,
+            );
             self.dev_attention(
-                &mut xb, &q, &keyc, &valuec, n, 0, n_heads, kv_mul, head_size, n, kv_dim,
+                &mut xb, &q, &key_dev[layer], &value_dev[layer], n, 0, n_heads, kv_mul, head_size,
+                n, kv_dim,
             );
             self.gemm_dev(&mut xb2, &xb, &w.wo[layer], n);
             self.dev_add(&mut x, &xb2, n * dim);
@@ -685,12 +694,14 @@ impl Backend for CudaBackend {
             self.dev_swiglu(&mut hb, &hb2, n * hidden);
             self.gemm_dev(&mut xb, &hb, &w.w2[layer], n);
             self.dev_add(&mut x, &xb, n * dim);
+        }
 
-            // Hand this layer's prompt K/V back to the host cache for decode.
-            // `clone_dtoh` of pageable memory completes synchronously, so the
-            // next layer may safely overwrite keyc/valuec afterward.
-            let k_host: Vec<f32> = st.clone_dtoh(&keyc).expect("download K");
-            let v_host: Vec<f32> = st.clone_dtoh(&valuec).expect("download V");
+        // Hand the prompt's K/V back to the host cache for decode — one batch of
+        // downloads after the whole prefill (no per-layer sync). `clone_dtoh` of
+        // pageable host memory completes synchronously.
+        for layer in 0..p.n_layers {
+            let k_host: Vec<f32> = st.clone_dtoh(&key_dev[layer]).expect("download K");
+            let v_host: Vec<f32> = st.clone_dtoh(&value_dev[layer]).expect("download V");
             state.store_prefill_kv(layer * p.seq_len * kv_dim, &k_host, &v_host);
         }
 
