@@ -207,8 +207,17 @@ cool machine; numbers below are reasoned, not all freshly benched.
   `rope_precompute_bit_identical_to_per_head` asserts `to_bits` equality across
   shapes/positions/mscale/partial-rotary). Interleaved A/B: **decode 52 → 53.5 t/s
   (~3%)**, 4/4 rounds. `RUSTY_LLAMA_NO_ROPE_PRECOMPUTE` toggles it.
-- [ ] **L6. Tune the packed dp4a decode GEMV** (rows/block, coalescing) to chip
-  the residual CUDA decode ~1.31×.
+- [✗] **L6. Decode GEMV tuning — SPIKED, RULED OUT (not the bottleneck).** Swept
+  `NWARPS` (rows/block) 2→4→8→16; the GEMV is already coalesced (lane *l* reads
+  word *l* = one 128-B transaction/warp). Microbench moved a few % for *some*
+  shapes but **regressed others** (e.g. 5632×2048 prefers NWARPS=2), and on the
+  real graphed **tg128 it did not help: NWARPS=8 = 283 vs NWARPS=2 = 289 t/s**.
+  Diagnosis: the graphed decode runs at **~180 GB/s (~27% of peak)** not because
+  the GEMV is slow but because decode is **~150 tiny kernels/token** that
+  individually under-saturate bandwidth — it's *overhead/launch-ramp-bound*, not
+  GEMV-internal-bound. The real lever is **kernel FUSION** (fuse q/k/v + gate/up
+  into single launches — the GPU analog of L3's `matmul_shared` — and fuse
+  rmsnorm+quantize), a separate, bigger item. GEMV micro-tuning can't move it.
 
 **Treadmill-class / large / higher-risk:**
 - [ ] **L7. CUDA int8 tensor-core MMQ** (CUDA prefill ~3×). No cudarc int8 GEMM →
@@ -219,8 +228,13 @@ cool machine; numbers below are reasoned, not all freshly benched.
   hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
 - [ ] **L10. wgpu megakernel** (collapse the ~300 serial compute passes/step) for
   the non-NVIDIA path (wgpu ~8× behind, overhead-bound not tensor-core-bound).
+- [ ] **L11. CUDA decode kernel fusion** (NEW — the real decode lever, found while
+  ruling out L6). Decode is ~150 tiny kernels/token at ~27% of peak bandwidth →
+  *launch/ramp-bound*. Fuse q/k/v + gate/up GEMVs into single launches (GPU analog
+  of L3) and fuse rmsnorm+quantize_q8k. Parity-verifiable; medium effort, bounded.
 
-Order: **L3 (+7%) and L5 (+~3%) DONE, bit-exact (~9% decode combined); L1 + L4 ruled
-out** (occupancy regression; LTO/PGO disrupt the SIMD kernels). Remaining bounded:
-**L2 (CPU threading, needs a cool machine)** and L6 (CUDA decode GEMV tuning), then
-the treadmill (L7-L10) only if worth it.
+Order: **L3 (+7%) and L5 (+~3%) DONE, bit-exact (~9% decode combined); L1 + L4 + L6
+ruled out** (occupancy/LTO/PGO regressions; decode GEMV already optimal — it's
+fusion-bound, not GEMV-bound). Remaining bounded: **L11 (decode kernel fusion, the
+real GPU-decode lever)** and L2 (CPU threading, needs a cool machine), then the
+treadmill (L7-L10) only if worth it.
