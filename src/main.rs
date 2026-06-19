@@ -17,8 +17,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_llama::{
     forward_embed, generate_tokens, AdapterBackend, Backend, ChatTemplate, Checkpoint, ControlVector,
-    CpuBackend, Gguf, LoraAdapter, Message, Model, Pooling, Role, RunState, SamplerChain,
-    SamplerConfig, Tokenizer,
+    CpuBackend, Gguf, GrammarStage, LoraAdapter, Message, Model, Pooling, Role, RunState,
+    SamplerChain, SamplerConfig, Tokenizer,
 };
 
 const USAGE: &str = "\
@@ -51,6 +51,8 @@ Options:
   --serve                 run an OpenAI-compatible HTTP server (needs --features server)
   --host <addr>           server bind address       (default: 127.0.0.1)
   --port <int>            server port               (default: 8080)
+  --grammar <gbnf>        constrain output to a GBNF grammar (inline)
+  --grammar-file <path>   constrain output to a GBNF grammar (from a file)
   -h            show this help";
 
 struct Args {
@@ -81,6 +83,8 @@ struct Args {
     serve: bool,
     host: String,
     port: u16,
+    grammar: String,
+    grammar_file: String,
 }
 
 fn main() -> ExitCode {
@@ -167,6 +171,20 @@ fn resolve_chat_template(
         }
     }
     Err("could not detect a chat template; pass --chat-template (chatml|llama3|qwen2|gemma|phi3)".into())
+}
+
+/// The GBNF grammar source for constrained decoding: `--grammar-file` (read from
+/// disk) wins, else inline `--grammar`, else `None`.
+fn resolve_grammar(args: &Args) -> Result<Option<String>, Box<dyn Error>> {
+    if !args.grammar_file.is_empty() {
+        return std::fs::read_to_string(&args.grammar_file).map(Some).map_err(|e| {
+            format!("failed to read grammar file '{}': {e}", args.grammar_file).into()
+        });
+    }
+    if !args.grammar.is_empty() {
+        return Ok(Some(args.grammar.clone()));
+    }
+    Ok(None)
 }
 
 fn run_embedding(model: &Model, tokenizer: &Tokenizer, args: &Args) -> Result<(), Box<dyn Error>> {
@@ -311,6 +329,11 @@ fn stream_generation(
         seed: args.seed,
     };
     let mut sampler = SamplerChain::from_config(&sampler_cfg, model.config.vocab_size);
+    if let Some(src) = resolve_grammar(args)? {
+        let stage = GrammarStage::from_source(&src, tokenizer)
+            .map_err(|e| format!("grammar error: {e}"))?;
+        sampler.prepend(Box::new(stage));
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -418,6 +441,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         serve: false,
         host: "127.0.0.1".to_string(),
         port: 8080,
+        grammar: String::new(),
+        grammar_file: String::new(),
     };
 
     let rest: Vec<String> = raw.collect();
@@ -467,6 +492,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--control-vector-scale" => args.control_vector_scale = value()?.parse()?,
             "--host" => args.host = value()?.clone(),
             "--port" => args.port = value()?.parse()?,
+            "--grammar" => args.grammar = value()?.clone(),
+            "--grammar-file" => args.grammar_file = value()?.clone(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);

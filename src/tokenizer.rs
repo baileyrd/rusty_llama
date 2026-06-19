@@ -102,11 +102,31 @@ impl Tokenizer {
         eos == Some(token) || eot == Some(token)
     }
 
+    /// The end-of-generation token ids (EOS + EOT, when present) — the tokens a
+    /// grammar constraint allows once it is in an accepting state.
+    pub fn eog_ids(&self) -> Vec<u32> {
+        let (eos, eot) = match self {
+            Tokenizer::Spm(t) => (t.eos, t.eot),
+            Tokenizer::Bpe(t) => (t.eos, t.eot),
+        };
+        [eos, eot].into_iter().flatten().map(|i| i as u32).collect()
+    }
+
     /// Decode `token` (preceded by `prev_token`) into the bytes to emit.
     pub fn decode(&self, prev_token: usize, token: usize) -> Vec<u8> {
         match self {
             Tokenizer::Spm(t) => t.decode(prev_token, token),
             Tokenizer::Bpe(t) => t.decode(token),
+        }
+    }
+
+    /// The output bytes token `id` contributes mid-sequence, independent of the
+    /// preceding token (no BOS space-strip) — the canonical "piece" used to test
+    /// a candidate against a grammar. `usize::MAX` is a non-BOS `prev`.
+    pub fn token_piece(&self, id: usize) -> Vec<u8> {
+        match self {
+            Tokenizer::Spm(t) => t.decode(usize::MAX, id),
+            Tokenizer::Bpe(t) => t.decode(id),
         }
     }
 

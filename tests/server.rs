@@ -89,4 +89,15 @@ fn server_serves_openai_endpoints() {
         let v: serde_json::Value = serde_json::from_str(json).expect("valid concurrent JSON");
         assert!(v["choices"][0]["text"].is_string());
     }
+
+    // Grammar-constrained output must be exactly one of the alternatives.
+    let resp = post(
+        &addr,
+        "/v1/completions",
+        r#"{"prompt":"Answer:","max_tokens":6,"temperature":0,"grammar":"root ::= \"yes\" | \"no\""}"#,
+    );
+    let json = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let v: serde_json::Value = serde_json::from_str(json).expect("valid grammar JSON");
+    let text = v["choices"][0]["text"].as_str().unwrap_or("");
+    assert!(text == "yes" || text == "no", "grammar-constrained output: {text:?}");
 }
