@@ -71,6 +71,15 @@ fn shared_act_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("RUSTY_LLAMA_NO_SHARED_ACT").is_none())
 }
 
+/// Whether RoPE precomputes the per-pair cos/sin once per call (default on).
+/// Opt out with `RUSTY_LLAMA_NO_ROPE_PRECOMPUTE` to A/B against the per-head
+/// recompute.
+fn rope_precompute_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTY_LLAMA_NO_ROPE_PRECOMPUTE").is_none())
+}
+
 /// A stateless f32 CPU backend.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuBackend;
@@ -309,12 +318,32 @@ impl Backend for CpuBackend {
         // rotate q only. Pairs whose index is past `inv_freq.len()` (partial
         // rotary) pass through unchanged.
         let dim = q.len();
+        let npairs = inv_freq.len();
+        // The (cos, sin)·mscale for each rotated pair depend only on the pair
+        // index, `pos` and `mscale` — identical across all heads. Precompute them
+        // ONCE (stack-allocated) instead of recomputing the transcendentals per
+        // head (~n_heads× redundant). Bit-identical: the same
+        // `pos as f32 * inv_freq[pair]` expression, just hoisted. A model with
+        // more pairs than the (generous) buffer falls back to the inline compute.
+        const MAX_ROPE_PAIRS: usize = 256;
+        let mut trig = [(0.0f32, 0.0f32); MAX_ROPE_PAIRS];
+        let table = npairs <= MAX_ROPE_PAIRS && rope_precompute_enabled();
+        if table {
+            for (t, &f) in trig[..npairs].iter_mut().zip(inv_freq) {
+                let val = pos as f32 * f;
+                *t = (val.cos() * mscale, val.sin() * mscale);
+            }
+        }
         let mut i = 0;
         while i < dim {
             let pair = (i % head_size) / 2;
-            if pair < inv_freq.len() {
-                let val = pos as f32 * inv_freq[pair];
-                let (fcr, fci) = (val.cos() * mscale, val.sin() * mscale);
+            if pair < npairs {
+                let (fcr, fci) = if table {
+                    trig[pair]
+                } else {
+                    let val = pos as f32 * inv_freq[pair];
+                    (val.cos() * mscale, val.sin() * mscale)
+                };
 
                 let (q0, q1) = (q[i], q[i + 1]);
                 q[i] = q0 * fcr - q1 * fci;
@@ -835,6 +864,58 @@ mod tests {
         // Untouched tail.
         approx(q[2], 7.0);
         approx(q[3], 9.0);
+    }
+
+    #[test]
+    fn rope_precompute_bit_identical_to_per_head() {
+        // Reference = the per-head recompute (pre-precompute path): identical
+        // `pos as f32 * inv_freq[pair]` then cos/sin·mscale, recomputed per pair.
+        let reference =
+            |q: &mut [f32], k: &mut [f32], pos: usize, hs: usize, kvd: usize, inv: &[f32], ms: f32| {
+                let dim = q.len();
+                let mut i = 0;
+                while i < dim {
+                    let pair = (i % hs) / 2;
+                    if pair < inv.len() {
+                        let val = pos as f32 * inv[pair];
+                        let (fcr, fci) = (val.cos() * ms, val.sin() * ms);
+                        let (q0, q1) = (q[i], q[i + 1]);
+                        q[i] = q0 * fcr - q1 * fci;
+                        q[i + 1] = q0 * fci + q1 * fcr;
+                        if i < kvd {
+                            let (k0, k1) = (k[i], k[i + 1]);
+                            k[i] = k0 * fcr - k1 * fci;
+                            k[i + 1] = k0 * fci + k1 * fcr;
+                        }
+                    }
+                    i += 2;
+                }
+            };
+        let b = CpuBackend::new();
+        // (head_size, kv_heads, n_heads, rotary_pairs) — full and partial rotary.
+        let shapes = [(64usize, 2usize, 32usize, 32usize), (128, 4, 32, 64), (64, 1, 8, 16)];
+        for (hs, kvh, nh, pairs) in shapes {
+            let (dim, kvd) = (nh * hs, kvh * hs);
+            let inv: Vec<f32> = (0..pairs)
+                .map(|j| (10000f32).powf(-2.0 * j as f32 / hs as f32))
+                .collect();
+            for &ms in &[1.0f32, 1.37] {
+                for &pos in &[0usize, 1, 7, 100, 2047] {
+                    let q0: Vec<f32> = (0..dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+                    let k0: Vec<f32> = (0..kvd).map(|i| ((i % 11) as f32 - 5.0) * 0.07).collect();
+                    let (mut qa, mut ka) = (q0.clone(), k0.clone());
+                    let (mut qb, mut kb) = (q0, k0);
+                    b.rope(&mut qa, &mut ka, pos, hs, kvd, &inv, ms);
+                    reference(&mut qb, &mut kb, pos, hs, kvd, &inv, ms);
+                    for (x, y) in qa.iter().zip(&qb) {
+                        assert_eq!(x.to_bits(), y.to_bits(), "q hs={hs} ms={ms} pos={pos}");
+                    }
+                    for (x, y) in ka.iter().zip(&kb) {
+                        assert_eq!(x.to_bits(), y.to_bits(), "k hs={hs} ms={ms} pos={pos}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -199,9 +199,14 @@ cool machine; numbers below are reasoned, not all freshly benched.
   `codegen-units=1` + `target-cpu=native` already nail them); whole-program LTO and
   profile-guided inlining/block-layout are tuned for *branchy* code and disrupt the
   hand-tuned numeric kernels. The build is already well-tuned — nothing to reclaim here.
-- [ ] **L5. CPU RoPE cos/sin recompute.** `CpuBackend::rope` recomputes cos/sin
-  per head (~32× redundant); precompute the `head_size/2` values per position.
-  Small (~1-2%), bit-exact.
+- [x] **L5. CPU RoPE cos/sin recompute — DONE (+~3% decode).** `CpuBackend::rope`
+  recomputed cos/sin per head (the pair's `(cos, sin)·mscale` only depend on the
+  pair index, `pos`, `mscale` — identical across all `n_heads`). Now precomputed
+  once per call into a stack buffer and reused. **Bit-exact** (same
+  `pos as f32 * inv_freq[pair]` expression, just hoisted;
+  `rope_precompute_bit_identical_to_per_head` asserts `to_bits` equality across
+  shapes/positions/mscale/partial-rotary). Interleaved A/B: **decode 52 → 53.5 t/s
+  (~3%)**, 4/4 rounds. `RUSTY_LLAMA_NO_ROPE_PRECOMPUTE` toggles it.
 - [ ] **L6. Tune the packed dp4a decode GEMV** (rows/block, coalescing) to chip
   the residual CUDA decode ~1.31×.
 
@@ -215,7 +220,7 @@ cool machine; numbers below are reasoned, not all freshly benched.
 - [ ] **L10. wgpu megakernel** (collapse the ~300 serial compute passes/step) for
   the non-NVIDIA path (wgpu ~8× behind, overhead-bound not tensor-core-bound).
 
-Order: **L3 DONE (+7% decode, bit-exact); L1 + L4 ruled out** (occupancy regression;
-LTO/PGO disrupt the SIMD kernels). Remaining bounded: **L2 (CPU threading, needs a
-cool machine)** and L5/L6 (small, bit-exact CPU tweaks), then the treadmill (L7-L10)
-only if worth it.
+Order: **L3 (+7%) and L5 (+~3%) DONE, bit-exact (~9% decode combined); L1 + L4 ruled
+out** (occupancy regression; LTO/PGO disrupt the SIMD kernels). Remaining bounded:
+**L2 (CPU threading, needs a cool machine)** and L6 (CUDA decode GEMV tuning), then
+the treadmill (L7-L10) only if worth it.
