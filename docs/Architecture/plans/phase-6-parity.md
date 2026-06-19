@@ -157,7 +157,14 @@ fold f16-narrowing into rmsnorm/swiglu (removes ~310 cvt passes/prefill); cache
 the ~7 cuBLASLt plans. Then attempt the int8 path (on-device q8k activation +
 cuBLASLt IMMA `CUDA_R_8I`/`COMPUTE_32I`, or the existing packed-weight dp4a
 kernels) for the GEMMs.
-- **Target:** 3.4× → ~1.5–2×.
+- **Target:** 3.4× → ~1.5–2× (full int8 MMQ + conversions).
+- **Measured (conversion-kill DONE, 2026-06-19):** sharing the per-norm f16
+  narrow across q/k/v and w1/w3 (3 narrows/layer → 1 each; ~66 fewer cvt
+  passes + allocs/prefill) lifts real-model `pp512` **4671 → ~5230 tok/s
+  (~1.12×)**, above the bench noise floor, coherence held (rel L2 ≤6e-4). So the
+  cvt passes were *not* fully hidden behind the GEMMs. The remaining 3.0× to
+  llama.cpp is the **f16-cuBLAS-vs-int8-MMQ** structural gap (the big lever, not
+  yet attempted — needs IMMA/MMQ int8 kernels).
 - **Acceptance:** per-op parity + prefill coherence; before/after
   `bench_prefill_real_tinyllama` and `llama-bench -ngl 99 -p 512`.
 

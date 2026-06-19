@@ -639,20 +639,28 @@ impl CudaBackend {
     /// cross-checked against cudarc's `test_matmul_half`, guarded by the per-op
     /// parity test against the CPU backend.
     fn gemm_dev(&self, c: &mut CudaSlice<f32>, x: &CudaSlice<f32>, w: &QMatrix, rows: usize) {
-        let (oc, ic) = (w.rows(), w.cols());
+        let ic = w.cols();
         debug_assert_eq!(x.len(), rows * ic);
-        debug_assert_eq!(c.len(), rows * oc);
-        let w_dev = self.weight_f16(w);
-
-        // Narrow the activation to f16, run the f16 GEMM, widen back into `c`.
-        // `x16` is fully written by the cvt kernel and `c16` by the GEMM
-        // (beta = 0, so C is not read), so neither needs zeroing — skip the
-        // memset with an uninitialized alloc.
-        // SAFETY: both buffers are written in full before they are read.
+        // Narrow the activation to f16 once, then run the f16 GEMM. `x16` is
+        // fully written by the cvt kernel before the GEMM reads it.
+        // SAFETY: written in full before read.
         let mut x16 = unsafe { self.stream.alloc::<f16>(rows * ic) }.expect("alloc x16");
         self.dev_cvt_to_f16(&mut x16, x, rows * ic);
-        let mut c16 = unsafe { self.stream.alloc::<f16>(rows * oc) }.expect("alloc c16");
+        self.gemm_dev_f16(c, &x16, w, rows);
+    }
 
+    /// [`Self::gemm_dev`] with the activation ALREADY narrowed to f16. Lets the
+    /// fused prefill narrow a *shared* activation once and feed it to the sibling
+    /// GEMMs (q/k/v from one norm; w1/w3 from one norm) instead of re-narrowing
+    /// the same activation per GEMM — removing ~3 cvt passes + allocs per layer.
+    fn gemm_dev_f16(&self, c: &mut CudaSlice<f32>, x16: &CudaSlice<f16>, w: &QMatrix, rows: usize) {
+        let (oc, ic) = (w.rows(), w.cols());
+        debug_assert_eq!(x16.len(), rows * ic);
+        debug_assert_eq!(c.len(), rows * oc);
+        let w_dev = self.weight_f16(w);
+        // `c16` is fully written by the GEMM (beta = 0, C not read), so skip the
+        // memset. SAFETY: written in full before read.
+        let mut c16 = unsafe { self.stream.alloc::<f16>(rows * oc) }.expect("alloc c16");
         let cfg = MatmulConfig {
             transa: true,
             transb: false,
@@ -671,11 +679,10 @@ impl CudaBackend {
             stride_bias: None,
             batch_size: None,
         };
-        // SAFETY: dimensions/leading-dims match the buffer shapes above; bad
-        // values would be the only way to trip the documented memory hazard.
+        // SAFETY: dimensions/leading-dims match the buffer shapes above.
         unsafe {
             self.blas
-                .matmul(cfg, w_dev.as_ref(), &x16, &mut c16, None, None)
+                .matmul(cfg, w_dev.as_ref(), x16, &mut c16, None, None)
                 .expect("cuBLASLt f16 matmul");
         }
         self.dev_cvt_to_f32(c, &c16, rows * oc);
@@ -1259,13 +1266,18 @@ impl Backend for CudaBackend {
         let mut q = st.alloc_zeros::<f32>(n * dim).expect("alloc q");
         let mut hb = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb");
         let mut hb2 = st.alloc_zeros::<f32>(n * hidden).expect("alloc hb2");
+        // Shared f16 narrowing of each norm's activation: q/k/v reuse one narrow,
+        // w1/w3 another, instead of `gemm_dev` re-narrowing the same activation
+        // per GEMM. SAFETY: fully written by `dev_cvt_to_f16` before each read.
+        let mut xb16 = unsafe { st.alloc::<f16>(n * dim) }.expect("alloc xb16");
 
         for layer in 0..p.n_layers {
             // --- Attention ---
             self.dev_rmsnorm(&mut xb, &x, &d.rms_att[layer], n, dim, eps);
-            self.gemm_dev(&mut q, &xb, &w.wq[layer], n);
-            self.gemm_dev(&mut d.key[layer], &xb, &w.wk[layer], n);
-            self.gemm_dev(&mut d.value[layer], &xb, &w.wv[layer], n);
+            self.dev_cvt_to_f16(&mut xb16, &xb, n * dim);
+            self.gemm_dev_f16(&mut q, &xb16, &w.wq[layer], n);
+            self.gemm_dev_f16(&mut d.key[layer], &xb16, &w.wk[layer], n);
+            self.gemm_dev_f16(&mut d.value[layer], &xb16, &w.wv[layer], n);
             self.dev_rope(
                 &mut q, &mut d.key[layer], &d.inv, n, 0, head_size, kv_dim, dim, n_freqs, mscale,
             );
@@ -1278,8 +1290,9 @@ impl Backend for CudaBackend {
 
             // --- Feed-forward (SwiGLU) ---
             self.dev_rmsnorm(&mut xb, &x, &d.rms_ffn[layer], n, dim, eps);
-            self.gemm_dev(&mut hb, &xb, &w.w1[layer], n);
-            self.gemm_dev(&mut hb2, &xb, &w.w3[layer], n);
+            self.dev_cvt_to_f16(&mut xb16, &xb, n * dim);
+            self.gemm_dev_f16(&mut hb, &xb16, &w.w1[layer], n);
+            self.gemm_dev_f16(&mut hb2, &xb16, &w.w3[layer], n);
             self.dev_swiglu(&mut hb, &hb2, n * hidden);
             self.gemm_dev(&mut xb, &hb, &w.w2[layer], n);
             self.dev_add(&mut x, &xb, n * dim);
