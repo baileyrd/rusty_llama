@@ -174,11 +174,16 @@ cool machine; numbers below are reasoned, not all freshly benched.
   prefill review flagged is **not** a prefill bottleneck (the GEMMs are). Reverted.
   (A warp-per-key variant would coalesce without the shared cost, but the same
   occupancy/parallelism argument says the upside is small; not pursued.)
-- [ ] **L2. CPU threading.** rayon does a fork-join **per op** (~154/token); the
-  285H's 8 LP-E cores are far slower than the 6 P-cores, so oversubscription
-  likely hurts via work-stealing imbalance. Try a persistent/pinned pool or
-  P-core-only; helps CPU decode (the 33 vs ~49 GB/s gap) + prefill broadly.
-  UNVERIFIED (thermal killed the probe) — needs a cool-machine measurement.
+- [✗] **L2. CPU threading — TESTED, RULED OUT (default already optimal).** The 285H
+  is 6 P + 8 E + 2 LP-E = 16 cores (no HT); rayon defaults to 16 threads. Zero-code
+  `RAYON_NUM_THREADS` sweep on the real model (cool machine), **pp512 / tg128**:
+  6 → 141/48, 8 → 152/48, 10 → 164/50, 12 → 173/51, **16 → 205/53**. Monotonic —
+  *more threads is strictly better* for both prefill (compute-bound) and decode
+  (more in-flight requests → more DDR5 bandwidth). The "LP-E cores hurt, go
+  P-core-only" hypothesis is **false**: every core contributes, and 16 ran
+  last/hottest in the sweep yet still won. Nothing to change. (Pinning would need a
+  new affinity dep for ~0 gain — 16 threads on 16 cores is already 1:1, ±0-1 jitter.
+  The decode 33-vs-49 GB/s gap is access-pattern/prefetch, i.e. L9, not threading.)
 - [x] **L3. Redundant activation re-quant — DONE (+7% decode).** q/k/v share the
   attention-norm'd input, gate/up share the ffn-norm'd input, yet each `matmul`
   re-quantized it. Added `Backend::matmul_shared` (default = per-weight; CPU
@@ -240,9 +245,10 @@ cool machine; numbers below are reasoned, not all freshly benched.
   gate/up fusion (both already saturate → ~0) and rmsnorm+quantize (one block would
   serialize the quantize → likely regression); neither pursued.
 
-Order: **L3 (+7%), L5 (+~3%) CPU-decode and L11 q/k/v (+~1.5%) CUDA-decode DONE,
-all bit-exact; L1 + L4 + L6 ruled out** (occupancy/LTO/PGO regressions; decode GEMV
-already optimal). Remaining bounded: **L2 (CPU threading, needs a cool machine)**;
-then the treadmill (L7-L10) only if worth it. CUDA decode is now graph + fused and
-near its structural limit for this kernel set — further gains need L7 (int8 MMQ) or
-deeper fusion.
+Order: **DONE (bit-exact): L3 (+7%), L5 (+~3%) CPU-decode, L11 q/k/v (+~1.5%)
+CUDA-decode. RULED OUT: L1, L2, L4, L6** (occupancy/LTO/PGO regressions; decode GEMV
+already optimal; all 16 cores already optimal). **The bounded levers are exhausted.**
+CPU decode is bandwidth-bound and CUDA decode is graph + fused near its structural
+limit; remaining gains need the **treadmill** — L7 (CUDA int8 MMQ), L8 (TC flash
+attn), L9 (CPU micro-kernel, the 33→49 GB/s access-pattern gap), L10 (wgpu) — all
+large/higher-risk.
