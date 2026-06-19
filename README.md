@@ -181,7 +181,7 @@ and that greedy generation reproduces.
 - [x] Architecture breadth beyond Llama: **Qwen2** (QKV bias), **Phi-3** (fused qkv / gate-up), **Gemma 2** (GeGLU, sandwich norms, logit softcap, explicit head-dim) via an `Arch` registry seam — greedy output validated against `llama-cli`
 - [x] NeoX vs NORM RoPE handled by a load-time Q/K permute (one rope kernel); built-in chat templates (chatml / llama-3 / qwen2 / gemma / phi-3) + EOS/turn-end stop
 - [x] CUDA packed-weight DP4A decode GEMV — Q4_K/Q6_K weights stay packed, `__dp4a` against an on-device Q8_K activation: **2.4× decode** (86 → 207 tok/s on TinyLlama Q4_K_M), default-on
-- [x] OpenAI-compatible HTTP server (`--serve`, `server` feature): `/v1/chat/completions` + `/v1/completions`, streaming SSE, any backend — single-sequence (continuous batching + paged KV are the next step)
+- [x] OpenAI-compatible HTTP server (`--serve`, `server` feature): `/v1/chat/completions` + `/v1/completions`, streaming SSE, any backend, with a **continuous-batching scheduler** (`RUSTY_LLAMA_BATCH`) that batches concurrent requests' decode (paged KV for memory efficiency is the next step)
 
 See [`BACKLOG.md`](BACKLOG.md) for the history of these items.
 

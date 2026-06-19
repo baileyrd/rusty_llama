@@ -56,8 +56,8 @@ pub use loader::Checkpoint;
 pub use chat::{ChatTemplate, Message, Role};
 pub use adapter::{AdapterBackend, ControlVector, LoraAdapter};
 pub use model::{
-    forward, forward_embed, forward_prefill, generate, generate_tokens, Model, Pooling, RunState,
-    Weights,
+    forward, forward_embed, forward_prefill, generate, generate_tokens, Batch, Model, Pooling,
+    RunState, Weights,
 };
 pub use quant::GgmlType;
 pub use sampler::{SamplerChain, SamplerConfig};

@@ -13,6 +13,7 @@
 //! `GET /v1/models`, `GET /health`. Streaming (`"stream": true`) emits
 //! Server-Sent Events; otherwise a single JSON body. Works with any backend.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -27,7 +28,7 @@ use crate::backend::make_backend;
 use crate::chat::{ChatTemplate, Message, Role};
 use crate::gguf::Gguf;
 use crate::loader::Checkpoint;
-use crate::model::{generate_tokens, Model, RunState};
+use crate::model::{forward_prefill, Batch, Model, RunState};
 use crate::sampler::{SamplerChain, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 
@@ -228,8 +229,73 @@ pub fn serve(
     Ok(())
 }
 
+/// Max concurrent sequences the scheduler batches. Override with
+/// `RUSTY_LLAMA_BATCH` (clamped to >= 1).
+fn batch_cap() -> usize {
+    std::env::var("RUSTY_LLAMA_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1)
+}
+
+/// An in-flight sequence occupying a decode slot.
+struct Slot {
+    reply: Sender<Event>,
+    sampler: SamplerChain,
+    prev: usize,      // previous token (decode renders `cur` as decode(prev, cur))
+    cur: usize,       // current token: emit it, then feed it at `pos`
+    pos: usize,       // position to feed `cur` at
+    emitted: usize,   // generated tokens emitted so far
+    max_new: usize,   // cap on `emitted`
+    prompt_len: usize,
+    pending: Vec<u8>, // UTF-8 carry across tokens
+}
+
+impl Slot {
+    /// Whether this slot should stop: an end-of-generation token, the token
+    /// budget reached, or the KV/context full.
+    fn is_done(&self, tokenizer: &Tokenizer, seq_len: usize) -> bool {
+        self.cur == 1
+            || tokenizer.is_eog(self.cur)
+            || self.emitted >= self.max_new
+            || self.pos >= seq_len
+    }
+
+    /// Emit `cur`'s text (UTF-8-buffered so SSE never splits a code point).
+    fn emit(&mut self, tokenizer: &Tokenizer) {
+        self.pending
+            .extend_from_slice(&tokenizer.decode(self.prev, self.cur));
+        let valid = match std::str::from_utf8(&self.pending) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid > 0 {
+            let s = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+            let _ = self.reply.send(Event::Token(s));
+            self.pending.drain(..valid);
+        }
+        self.emitted += 1;
+    }
+
+    /// Flush any carry and report completion.
+    fn finish(self) {
+        if !self.pending.is_empty() {
+            let _ = self
+                .reply
+                .send(Event::Token(String::from_utf8_lossy(&self.pending).into_owned()));
+        }
+        let _ = self.reply.send(Event::Done {
+            prompt: self.prompt_len,
+            completion: self.emitted,
+        });
+    }
+}
+
 /// The generation thread: loads everything (kept resident on this stack) and
-/// processes one [`Job`] at a time. Load failures are reported via `ready`.
+/// runs a **continuous-batching scheduler** — admit queued prompts into free
+/// slots (prefill each), then batch-decode all active slots one step at a time,
+/// streaming and evicting as sequences finish. Load failures go via `ready`.
 fn worker(
     model_path: &str,
     backend_name: &str,
@@ -255,23 +321,81 @@ fn worker(
     let tokenizer = bail!(Tokenizer::from_gguf(&gguf), "load tokenizer");
     let backend = bail!(make_backend(backend_name), "init backend");
     let template = resolve_template(&gguf, template_override);
-
     let _ = ready.send(Ok(()));
 
-    while let Ok(job) = jobs.recv() {
-        run_job(&model, &tokenizer, backend.as_ref(), template, job);
+    let cap = batch_cap();
+    let vocab = model.config.vocab_size;
+    let seq_len = model.config.seq_len;
+    let mut batch = Batch::new(&model.config, cap);
+    let mut states: Vec<RunState> = (0..cap).map(|_| RunState::new(&model.config)).collect();
+    let mut slots: Vec<Option<Slot>> = (0..cap).map(|_| None).collect();
+    let mut queue: VecDeque<Job> = VecDeque::new();
+
+    loop {
+        let active_now = slots.iter().filter(|s| s.is_some()).count();
+        // Block for work only when fully idle; otherwise drain without blocking.
+        if active_now == 0 && queue.is_empty() {
+            match jobs.recv() {
+                Ok(j) => queue.push_back(j),
+                Err(_) => return, // all senders dropped — shut down
+            }
+        }
+        while let Ok(j) = jobs.try_recv() {
+            queue.push_back(j);
+        }
+
+        // Admit queued prompts into free slots (serial prefill, per-op path so
+        // the host KV the batched decode reads is consistent on every backend).
+        for i in 0..cap {
+            if slots[i].is_none() {
+                if let Some(job) = queue.pop_front() {
+                    slots[i] = admit(&model, &tokenizer, backend.as_ref(), template, &mut states[i], job);
+                }
+            }
+        }
+
+        // Phase A: emit each live slot's current token, or evict finished slots.
+        let mut active: Vec<usize> = Vec::new();
+        for (i, slot_opt) in slots.iter_mut().enumerate() {
+            if slot_opt.is_none() {
+                continue;
+            }
+            if slot_opt.as_ref().unwrap().is_done(&tokenizer, seq_len) {
+                slot_opt.take().unwrap().finish();
+            } else {
+                slot_opt.as_mut().unwrap().emit(&tokenizer);
+                active.push(i);
+            }
+        }
+
+        // Phase B: one batched decode step over the active slots → next token each.
+        if !active.is_empty() {
+            let tokens: Vec<usize> = active.iter().map(|&i| slots[i].as_ref().unwrap().cur).collect();
+            let positions: Vec<usize> = active.iter().map(|&i| slots[i].as_ref().unwrap().pos).collect();
+            let logits = batch.decode_step(&model, backend.as_ref(), &mut states, &active, &tokens, &positions);
+            for (r, &i) in active.iter().enumerate() {
+                let slot = slots[i].as_mut().unwrap();
+                let next = slot.sampler.sample(&logits[r * vocab..(r + 1) * vocab]);
+                slot.prev = slot.cur;
+                slot.cur = next;
+                slot.pos += 1;
+            }
+        }
     }
 }
 
-/// Render + tokenize the prompt, run [`generate_tokens`], and stream the
-/// generated (not prompt-echo) pieces back as UTF-8-complete [`Event::Token`]s.
-fn run_job(
+/// Render + tokenize a job's prompt, prefill it into `state`, and return the
+/// occupied [`Slot`] ready to decode — or `None` after sending the client an
+/// error. Uses the free `forward_prefill` (per-op path) so the host KV matches
+/// what the batched decode reads on every backend.
+fn admit(
     model: &Model,
     tokenizer: &Tokenizer,
     backend: &dyn crate::Backend,
     template: Option<ChatTemplate>,
+    state: &mut RunState,
     job: Job,
-) {
+) -> Option<Slot> {
     let prompt = match &job.kind {
         JobKind::Chat(msgs) => {
             let Some(t) = template else {
@@ -279,17 +403,16 @@ fn run_job(
                     "this model has no chat template; use /v1/completions or pass --chat-template"
                         .into(),
                 ));
-                return;
+                return None;
             };
             let rendered = t.render(msgs, true);
             tokenizer.encode(&rendered, tokenizer.add_bos() && !t.emits_bos(), false)
         }
         JobKind::Completion(text) => tokenizer.encode(text, tokenizer.add_bos(), false),
     };
-
     if prompt.is_empty() {
         let _ = job.reply.send(Event::Error("empty prompt".into()));
-        return;
+        return None;
     }
     let prompt_len = prompt.len();
     if prompt_len >= model.config.seq_len {
@@ -297,53 +420,22 @@ fn run_job(
             "prompt of {prompt_len} tokens exceeds context length {}",
             model.config.seq_len
         )));
-        return;
+        return None;
     }
-    let steps = (prompt_len + job.max_tokens).min(model.config.seq_len);
-
-    let mut state = RunState::new(&model.config);
+    forward_prefill(model, state, backend, &prompt, 0);
     let mut sampler = SamplerChain::from_config(&job.sampler, model.config.vocab_size);
-
-    // generate_tokens streams BOTH the prompt-echo transitions (the first
-    // prompt_len-1 pieces) and the generated pieces; skip the echo. Buffer bytes
-    // until they form valid UTF-8 so SSE/JSON never carry a split code point.
-    let mut skip = prompt_len - 1;
-    let mut completion = 0usize;
-    let mut pending: Vec<u8> = Vec::new();
-    let reply = job.reply.clone();
-    generate_tokens(
-        model,
-        &mut state,
-        backend,
-        tokenizer,
-        &mut sampler,
-        &prompt,
-        steps,
-        |bytes| {
-            if skip > 0 {
-                skip -= 1;
-                return;
-            }
-            completion += 1;
-            pending.extend_from_slice(bytes);
-            let valid = match std::str::from_utf8(&pending) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if valid > 0 {
-                let s = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                let _ = reply.send(Event::Token(s));
-                pending.drain(..valid);
-            }
-        },
-    );
-    if !pending.is_empty() {
-        let _ = job.reply.send(Event::Token(String::from_utf8_lossy(&pending).into_owned()));
-    }
-    let _ = job.reply.send(Event::Done {
-        prompt: prompt_len,
-        completion,
-    });
+    let cur = sampler.sample(state.logits());
+    Some(Slot {
+        reply: job.reply,
+        sampler,
+        prev: *prompt.last().unwrap(),
+        cur,
+        pos: prompt_len,
+        emitted: 0,
+        max_new: job.max_tokens,
+        prompt_len,
+        pending: Vec::new(),
+    })
 }
 
 fn resolve_template(gguf: &Gguf, override_name: Option<&str>) -> Option<ChatTemplate> {

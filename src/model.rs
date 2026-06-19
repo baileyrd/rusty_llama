@@ -588,6 +588,168 @@ impl RunState {
 
 }
 
+/// Continuous-batching decode scratch: batched activation buffers reused across
+/// steps for up to `cap` concurrent sequences. The per-sequence KV lives in each
+/// slot's own [`RunState`] (so admitting a prompt can reuse [`forward_prefill`]);
+/// one [`Batch::decode_step`] runs a single batched forward over the active slots
+/// — the matmuls batch (N batch-1 GEMVs become one N-row GEMM, the throughput
+/// win), while rope, the KV write, and attention loop per slot (each at its own
+/// position, against its own cache).
+pub struct Batch {
+    cap: usize,
+    x: Vec<f32>,
+    xb: Vec<f32>,
+    xb2: Vec<f32>,
+    q: Vec<f32>,
+    kbuf: Vec<f32>,
+    vbuf: Vec<f32>,
+    ao: Vec<f32>,
+    hb: Vec<f32>,
+    hb2: Vec<f32>,
+    att: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl Batch {
+    /// Allocate batched scratch for up to `cap` concurrent sequences.
+    pub fn new(c: &Config, cap: usize) -> Self {
+        let (dim, q_dim, kv_dim, hidden, vocab) =
+            (c.dim, c.q_dim(), c.kv_dim(), c.hidden_dim, c.vocab_size);
+        Batch {
+            cap,
+            x: vec![0.0; cap * dim],
+            xb: vec![0.0; cap * dim],
+            xb2: vec![0.0; cap * dim],
+            q: vec![0.0; cap * q_dim],
+            kbuf: vec![0.0; cap * kv_dim],
+            vbuf: vec![0.0; cap * kv_dim],
+            ao: vec![0.0; cap * q_dim],
+            hb: vec![0.0; cap * hidden],
+            hb2: vec![0.0; cap * hidden],
+            att: vec![0.0; c.n_heads * c.seq_len],
+            logits: vec![0.0; cap * vocab],
+        }
+    }
+
+    /// Maximum number of concurrent sequences this batch can decode.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Run one batched decode step over the active slots. Row `r` decodes
+    /// `tokens[r]` at `positions[r]` for `states[slots[r]]`: its K/V is appended
+    /// to that slot's own cache and it attends only its own cache. Returns the
+    /// row-major `(n, vocab)` logits — row `r` is `slots[r]`'s next-token logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_step(
+        &mut self,
+        model: &Model,
+        backend: &dyn Backend,
+        states: &mut [RunState],
+        slots: &[usize],
+        tokens: &[usize],
+        positions: &[usize],
+    ) -> &[f32] {
+        let p = &model.config;
+        let w = &model.weights;
+        let n = slots.len();
+        let dim = p.dim;
+        let kv_dim = p.kv_dim();
+        let head_size = p.head_size();
+        let q_dim = p.q_dim();
+        let hidden = p.hidden_dim;
+        let vocab = p.vocab_size;
+        let eps = p.rms_eps;
+        let bias = p.arch.has_qkv_bias();
+        let sandwich = p.arch.sandwich_norm();
+        let act = p.arch.ffn_activation();
+        debug_assert!(n <= self.cap && tokens.len() == n && positions.len() == n);
+
+        // Seed each row with its token's (dequantized) embedding, scaled (Gemma).
+        for (r, &tok) in tokens.iter().enumerate() {
+            w.token_embedding_table
+                .dequant_row(tok, &mut self.x[r * dim..r * dim + dim]);
+        }
+        if p.embd_scale != 1.0 {
+            for v in self.x[..n * dim].iter_mut() {
+                *v *= p.embd_scale;
+            }
+        }
+
+        for layer in 0..p.n_layers {
+            // --- Attention: matmuls batch; rope/KV-write/attention loop per slot.
+            backend.rmsnorm_batch(&mut self.xb[..n * dim], &self.x[..n * dim], slice(&w.rms_att_weight, layer, dim), eps, n);
+            backend.matmul_batch(&mut self.q[..n * q_dim], &self.xb[..n * dim], &w.wq[layer], n);
+            backend.matmul_batch(&mut self.kbuf[..n * kv_dim], &self.xb[..n * dim], &w.wk[layer], n);
+            backend.matmul_batch(&mut self.vbuf[..n * kv_dim], &self.xb[..n * dim], &w.wv[layer], n);
+            if bias {
+                add_bias_batch(&mut self.q[..n * q_dim], slice(&w.bq, layer, q_dim), q_dim, n);
+                add_bias_batch(&mut self.kbuf[..n * kv_dim], slice(&w.bk, layer, kv_dim), kv_dim, n);
+                add_bias_batch(&mut self.vbuf[..n * kv_dim], slice(&w.bv, layer, kv_dim), kv_dim, n);
+            }
+            for r in 0..n {
+                let pos = positions[r];
+                backend.rope(
+                    &mut self.q[r * q_dim..r * q_dim + q_dim],
+                    &mut self.kbuf[r * kv_dim..r * kv_dim + kv_dim],
+                    pos,
+                    head_size,
+                    kv_dim,
+                    &model.rope.inv_freq,
+                    model.rope.mscale,
+                );
+                let kv = &mut states[slots[r]].kv;
+                kv.k_slot_mut(layer, pos)
+                    .copy_from_slice(&self.kbuf[r * kv_dim..r * kv_dim + kv_dim]);
+                kv.v_slot_mut(layer, pos)
+                    .copy_from_slice(&self.vbuf[r * kv_dim..r * kv_dim + kv_dim]);
+                backend.attention(
+                    &mut self.ao[r * q_dim..r * q_dim + q_dim],
+                    &self.q[r * q_dim..r * q_dim + q_dim],
+                    kv.layer_k(layer),
+                    kv.layer_v(layer),
+                    &mut self.att,
+                    pos,
+                    p.n_heads,
+                    p.n_kv_heads,
+                    head_size,
+                    p.seq_len,
+                    kv_dim,
+                    p.attn_logit_softcap,
+                );
+            }
+            backend.matmul_batch(&mut self.xb2[..n * dim], &self.ao[..n * q_dim], &w.wo[layer], n);
+            if sandwich {
+                backend.rmsnorm_batch(&mut self.xb[..n * dim], &self.xb2[..n * dim], slice(&w.rms_attn_post, layer, dim), eps, n);
+                backend.add(&mut self.x[..n * dim], &self.xb[..n * dim]);
+            } else {
+                backend.add(&mut self.x[..n * dim], &self.xb2[..n * dim]);
+            }
+
+            // --- Feed-forward ---
+            backend.rmsnorm_batch(&mut self.xb[..n * dim], &self.x[..n * dim], slice(&w.rms_ffn_weight, layer, dim), eps, n);
+            backend.matmul_batch(&mut self.hb[..n * hidden], &self.xb[..n * dim], &w.w1[layer], n);
+            backend.matmul_batch(&mut self.hb2[..n * hidden], &self.xb[..n * dim], &w.w3[layer], n);
+            match act {
+                FfnActivation::SwiGlu => backend.swiglu(&mut self.hb[..n * hidden], &self.hb2[..n * hidden]),
+                FfnActivation::GeGlu => backend.geglu(&mut self.hb[..n * hidden], &self.hb2[..n * hidden]),
+            }
+            backend.matmul_batch(&mut self.xb[..n * dim], &self.hb[..n * hidden], &w.w2[layer], n);
+            if sandwich {
+                backend.rmsnorm_batch(&mut self.xb2[..n * dim], &self.xb[..n * dim], slice(&w.rms_ffn_post, layer, dim), eps, n);
+                backend.add(&mut self.x[..n * dim], &self.xb2[..n * dim]);
+            } else {
+                backend.add(&mut self.x[..n * dim], &self.xb[..n * dim]);
+            }
+        }
+
+        backend.rmsnorm_batch(&mut self.xb[..n * dim], &self.x[..n * dim], &w.rms_final_weight, eps, n);
+        backend.matmul_batch(&mut self.logits[..n * vocab], &self.xb[..n * dim], &w.wcls, n);
+        softcap(&mut self.logits[..n * vocab], p.final_logit_softcap);
+        &self.logits[..n * vocab]
+    }
+}
+
 /// Run one transformer step for `token` at position `pos`.
 ///
 /// Reads/writes the KV cache in `state` and leaves the next-token logits in

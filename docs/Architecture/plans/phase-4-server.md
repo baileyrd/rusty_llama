@@ -1,7 +1,7 @@
 # Phase 4 — Serving: HTTP server, continuous batching, paged KV (detailed plan)
 
-**Status: 4.1 (OpenAI-compatible HTTP server) SHIPPED. 4.2 (continuous batching)
-and 4.3 (paged KV) remain — the throughput-scaling layer.**
+**Status: 4.1 (HTTP server) + 4.2 (continuous batching) SHIPPED. 4.3 (paged KV)
+remains — the memory-efficiency layer for many/long sequences.**
 
 The engine already had everything a server sits on top of: fast decode
 ([`phase-2-decode-gemv.md`](phase-2-decode-gemv.md), 2.4× CUDA), architecture
@@ -72,24 +72,35 @@ flowchart LR
 
 ─────────────────────────────────────────────────────────────────────────────
 
-## 4.2 — Continuous batching (remaining)
+## 4.2 — Continuous batching (DONE)
 
-Turn the one-job-at-a-time worker into a **scheduler**: admit multiple in-flight
-sequences, batch their decode steps (one forward over N sequences at *mixed*
-positions), evict on EOS, and admit queued prompts as slots free.
+The server worker is a **continuous-batching scheduler**: a fixed pool of `cap`
+slots (`RUSTY_LLAMA_BATCH`, default 8), each a [`RunState`] with its own KV.
 
-- The blocker is a **batched-decode forward path**: `Backend::forward_step` is
-  single-sequence; batched decode needs attention with **per-sequence positions
-  and masks** (each sequence at its own `pos`, attending its own cache rows).
-- The worker loop becomes: collect ready sequences → one batched prefill/decode
-  step → route tokens to each sequence's reply channel → repeat.
+- **Admit**: a free slot pops a queued job, renders+tokenizes the prompt, and
+  prefills it (the free `forward_prefill`, per-op path — so the host KV the
+  batched decode reads is consistent on every backend, not just the CPU oracle).
+- **Decode**: one [`Batch::decode_step`] per round runs a single batched forward
+  over all active slots — the matmuls batch (N batch-1 GEMVs become one N-row
+  GEMM, the throughput win), while rope, the KV write, and attention loop per
+  slot (each at its own position, against its own cache). Each slot samples its
+  next token, streams it, and is evicted on EOS / token budget / full context;
+  freed slots admit queued prompts the next round.
+- **Correctness**: `batched_decode_matches_independent_sequences` proves a
+  batched decode of N sequences is bit-identical to N independent single-sequence
+  runs (the CPU ops are row-wise, so batching changes only scheduling, not math).
+  A concurrent server e2e fires simultaneous requests through the scheduler.
+- Works on every backend via the per-op path (on CUDA the batched matmuls are
+  N-row GEMMs); the resident single-sequence CUDA decode stays for the CLI.
 
-## 4.3 — Paged KV (remaining; prereq for 4.2 at scale)
+## 4.3 — Paged KV (remaining; memory efficiency)
 
-Block-table KV (fixed-size pages) so sequences share a pool instead of each
-reserving `seq_len × kv_dim`. Generalizes the flat single-sequence `KvCache`
-(Phase 0.4) to `(block, slot)` addressing — the foundation for memory-efficient
-batching and long context. Attention reads gather across a sequence's block list.
+Today each slot reserves a full `seq_len × kv_dim` KV (`cap` slots → `cap ×`
+that), which caps practical concurrency for long-context models. Block-table KV
+(fixed-size pages) would let sequences share a pool instead. Generalizes the flat
+single-sequence `KvCache` (Phase 0.4) to `(block, slot)` addressing — the
+foundation for memory-efficient batching and long context; attention reads gather
+across a sequence's block list.
 
 ─────────────────────────────────────────────────────────────────────────────
 
