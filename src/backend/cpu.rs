@@ -12,7 +12,8 @@ use crate::backend::Backend;
 use crate::math::silu;
 use crate::quant::{
     dequant_block, dequantize_into, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0,
-    vec_dot_q4_k, vec_dot_q6_k, vec_dot_q8_0, GgmlType, Q8Activation, Q8KActivation, MAX_BLOCK,
+    vec_dot_q4_k, vec_dot_q4_k_batch, vec_dot_q6_k, vec_dot_q6_k_batch, vec_dot_q8_0, GgmlType,
+    Q8Activation, Q8KActivation, MAX_BLOCK,
 };
 use crate::tensor::QMatrix;
 
@@ -176,16 +177,16 @@ impl Backend for CpuBackend {
                             .into_par_iter()
                             .map(|r| quantize_activation_q8k(xr(r)))
                             .collect();
-                        let dot: fn(&[u8], &Q8KActivation) -> f32 = match ty {
-                            GgmlType::Q4_K => vec_dot_q4_k,
-                            _ => vec_dot_q6_k,
+                        // Unpack-amortized batched dot: each weight super-block is
+                        // unpacked ONCE per token-block and reused across columns,
+                        // vs the per-column path re-unpacking it per token.
+                        let batch: fn(&[u8], &[Q8KActivation], &mut [f32]) = match ty {
+                            GgmlType::Q4_K => vec_dot_q4_k_batch,
+                            _ => vec_dot_q6_k_batch,
                         };
-                        tmp.par_chunks_mut(rows).enumerate().for_each(|(i, col)| {
-                            let wr = row(i);
-                            for (r, o) in col.iter_mut().enumerate() {
-                                *o = dot(wr, &acts[r]);
-                            }
-                        });
+                        tmp.par_chunks_mut(rows)
+                            .enumerate()
+                            .for_each(|(i, col)| batch(row(i), &acts, col));
                     }
                     // F16 (block size 1): dequantize each weight row once and
                     // reuse it. A sequential dot over the dequantized row is

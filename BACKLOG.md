@@ -139,13 +139,16 @@ lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge 
   **f16-cuBLAS-vs-int8-MMQ** structural gap (the big lever, not yet attempted —
   needs IMMA/MMQ int8 kernels). ("at the cuBLAS wall" is a misdiagnosis —
   llama.cpp doesn't use cuBLAS for quantized prefill.)
-- [ ] **6.4 CPU decode kernel — bigger than hsum tuning.** EMPIRICAL (6.1/this
-  sprint): a bit-exact AVX2 hsum-deferral in `vec_dot_q4_k` measured **~neutral**
-  on this AVX2-only box — the dot-compute is NOT the bottleneck. Prefill is bound
-  by per-column **weight-unpack redundancy** + activation memory locality (needs
-  a 2D-tiled GEMM micro-kernel that unpacks each weight block once across the
-  batch); decode is **bandwidth-bound** (~33 of ~70 GB/s DDR5). The real CPU
-  lever is the tiled micro-kernel + faster per-superblock unpack, not hsum count.
+- [~] **6.4 CPU prefill unpack-amortized batched dots DONE; register-tiling
+  remains.** EMPIRICAL: a bit-exact AVX2 hsum-deferral measured ~neutral (the dot
+  isn't the bottleneck); the per-column **weight-unpack redundancy** is. Added
+  `vec_dot_q4_k_batch`/`q6_k_batch` (token-blocked: each weight super-block
+  unpacked ONCE per 8-token block, reused across columns) + wired into
+  `matmul_batch`. **Measured pp512 113 → 141 t/s (+25%; 45 → 141 = 3.1× over the
+  original per-row)**, bit-exact (parity tests pass). Residual ~43× to llama.cpp
+  needs the full **register-tiled micro-kernel** (multiple token outputs per
+  loaded weight vector) + activation-locality blocking — the hard part, deferred.
+  Decode stays bandwidth-bound (~33 of ~70 GB/s DDR5) — a separate lever.
 - [ ] **6.x Bench-methodology + doc-drift fixes** (fold into the PRs above):
   real-model CPU/wgpu benches in the rigorous harness; warmup+reps for the CPU
   baseline; hoist `RunState` out of the timed prefill region; fix stale

@@ -979,6 +979,151 @@ pub(crate) mod x86 {
         }
         total
     }
+
+    /// Batched [`super::vec_dot_q4_k`]: `out[t] = dot(weight, acts[t])` for every
+    /// column. Each weight super-block's unpack (`rd_f16`, `get_scale_min_k4`,
+    /// nibble extraction) is done ONCE per token-block and reused across the block
+    /// — the prefill GEMM amortizing the unpack the per-column path redoes per
+    /// token. Bit-identical to calling [`super::vec_dot_q4_k`] per column (same
+    /// integer dot, same per-super-block f32 accumulation order).
+    /// # Safety
+    /// [`avx2_supported`] must return true.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q4_k_batch_avx2(weight: &[u8], acts: &[Q8KActivation], out: &mut [f32]) {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let (n, nsb) = (acts.len(), weight.len() / 144);
+        let mut bstart = 0;
+        while bstart < n {
+            let bs = (n - bstart).min(8);
+            let mut accf = [0.0f32; 8];
+            for sb in 0..nsb {
+                let wblk = &weight[sb * 144..sb * 144 + 144];
+                let d = rd_f16(wblk, 0);
+                let dmin = rd_f16(wblk, 2);
+                let scales = &wblk[4..16];
+                let qs = wblk[16..144].as_ptr();
+                // Unpack the 8 sub-block nibble vectors + (scale, min) ONCE.
+                let mut nib = [_mm256_setzero_si256(); 8];
+                for chunk in 0..4 {
+                    let v = _mm256_loadu_si256(qs.add(chunk * 32) as *const __m256i);
+                    nib[2 * chunk] = _mm256_and_si256(v, lomask);
+                    nib[2 * chunk + 1] = _mm256_and_si256(_mm256_srli_epi16::<4>(v), lomask);
+                }
+                let mut sc = [0i32; 8];
+                let mut mn = [0i32; 8];
+                for j in 0..8 {
+                    let (s, m) = get_scale_min_k4(j, scales);
+                    sc[j] = s as i32;
+                    mn[j] = m as i32;
+                }
+                for tt in 0..bs {
+                    let act = &acts[bstart + tt];
+                    let qx = act.qs.as_ptr().add(sb * 256);
+                    let bigd = act.d[sb];
+                    let mut vacc0 = _mm256_setzero_si256();
+                    let mut vacc1 = _mm256_setzero_si256();
+                    for chunk in 0..4 {
+                        let xlo = _mm256_loadu_si256(qx.add((2 * chunk) * 32) as *const __m256i);
+                        let xhi = _mm256_loadu_si256(qx.add((2 * chunk + 1) * 32) as *const __m256i);
+                        vacc0 = _mm256_add_epi32(vacc0, _mm256_mullo_epi32(madd_u8_i8(nib[2 * chunk], xlo), _mm256_set1_epi32(sc[2 * chunk])));
+                        vacc1 = _mm256_add_epi32(vacc1, _mm256_mullo_epi32(madd_u8_i8(nib[2 * chunk + 1], xhi), _mm256_set1_epi32(sc[2 * chunk + 1])));
+                    }
+                    let acc = hsum_i32_x8(_mm256_add_epi32(vacc0, vacc1));
+                    let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+                    let mut min_acc = 0i32;
+                    for (g, &b) in bsums.iter().enumerate() {
+                        min_acc += b as i32 * mn[g / 2];
+                    }
+                    accf[tt] += d * bigd * acc as f32 - dmin * bigd * min_acc as f32;
+                }
+            }
+            out[bstart..bstart + bs].copy_from_slice(&accf[..bs]);
+            bstart += bs;
+        }
+    }
+
+    /// Batched [`super::vec_dot_q6_k`]; see [`vec_dot_q4_k_batch_avx2`]. The 6-bit
+    /// reconstruction (the heaviest k-quant unpack) is done ONCE per token-block.
+    /// # Safety
+    /// [`avx2_supported`] must return true.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q6_k_batch_avx2(weight: &[u8], acts: &[Q8KActivation], out: &mut [f32]) {
+        let lomask = _mm256_set1_epi8(0x0f);
+        let three = _mm256_set1_epi8(3);
+        let (n, nsb) = (acts.len(), weight.len() / 210);
+        let mut bstart = 0;
+        while bstart < n {
+            let bs = (n - bstart).min(8);
+            let mut accf = [0.0f32; 8];
+            for sb in 0..nsb {
+                let wblk = &weight[sb * 210..sb * 210 + 210];
+                let ql = wblk.as_ptr();
+                let qh = wblk.as_ptr().add(128);
+                let scales = &wblk[192..208];
+                let d = rd_f16(wblk, 208);
+                // Reconstruct the 8 6-bit weight vectors (nb = k*32) ONCE.
+                let mut qv = [_mm256_setzero_si256(); 8];
+                for half in 0..2usize {
+                    let ql_lo = _mm256_loadu_si256(ql.add(half * 64) as *const __m256i);
+                    let ql_hi = _mm256_loadu_si256(ql.add(half * 64 + 32) as *const __m256i);
+                    let qhv = _mm256_loadu_si256(qh.add(half * 32) as *const __m256i);
+                    let hi2 = |sh: __m256i| _mm256_slli_epi16::<4>(_mm256_and_si256(sh, three));
+                    qv[half * 4] = _mm256_or_si256(_mm256_and_si256(ql_lo, lomask), hi2(qhv));
+                    qv[half * 4 + 1] = _mm256_or_si256(_mm256_and_si256(ql_hi, lomask), hi2(_mm256_srli_epi16::<2>(qhv)));
+                    qv[half * 4 + 2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(ql_lo), lomask), hi2(_mm256_srli_epi16::<4>(qhv)));
+                    qv[half * 4 + 3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(ql_hi), lomask), hi2(_mm256_srli_epi16::<6>(qhv)));
+                }
+                for tt in 0..bs {
+                    let act = &acts[bstart + tt];
+                    let qx = act.qs.as_ptr().add(sb * 256);
+                    let bsums = &act.bsums[sb * 16..sb * 16 + 16];
+                    let bigd = act.d[sb];
+                    let mut acc = 0i32;
+                    for (k, &qvk) in qv.iter().enumerate() {
+                        let xv = _mm256_loadu_si256(qx.add(k * 32) as *const __m256i);
+                        let dot = madd_u8_i8(qvk, xv);
+                        let da = hsum_i32_x4(_mm256_castsi256_si128(dot));
+                        let db = hsum_i32_x4(_mm256_extracti128_si256::<1>(dot));
+                        let ga = k * 2;
+                        acc += scales[ga] as i8 as i32 * (da - 32 * bsums[ga] as i32);
+                        acc += scales[ga + 1] as i8 as i32 * (db - 32 * bsums[ga + 1] as i32);
+                    }
+                    accf[tt] += d * bigd * acc as f32;
+                }
+            }
+            out[bstart..bstart + bs].copy_from_slice(&accf[..bs]);
+            bstart += bs;
+        }
+    }
+}
+
+/// Batched [`vec_dot_q4_k`]: `out[t] = vec_dot_q4_k(weight, &acts[t])` for all
+/// `t`, unpacking each weight super-block once across the token batch on AVX2 (the
+/// prefill GEMM's amortized form). Bit-identical to the per-column dot; falls back
+/// to looping it on non-AVX2 targets.
+pub fn vec_dot_q4_k_batch(weight: &[u8], acts: &[Q8KActivation], out: &mut [f32]) {
+    debug_assert_eq!(acts.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    if x86::avx2_supported() {
+        unsafe { x86::vec_dot_q4_k_batch_avx2(weight, acts, out) };
+        return;
+    }
+    for (o, act) in out.iter_mut().zip(acts) {
+        *o = vec_dot_q4_k(weight, act);
+    }
+}
+
+/// Batched [`vec_dot_q6_k`]; see [`vec_dot_q4_k_batch`].
+pub fn vec_dot_q6_k_batch(weight: &[u8], acts: &[Q8KActivation], out: &mut [f32]) {
+    debug_assert_eq!(acts.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    if x86::avx2_supported() {
+        unsafe { x86::vec_dot_q6_k_batch_avx2(weight, acts, out) };
+        return;
+    }
+    for (o, act) in out.iter_mut().zip(acts) {
+        *o = vec_dot_q6_k(weight, act);
+    }
 }
 
 // --- quantizers -------------------------------------------------------------
@@ -1255,6 +1400,63 @@ mod tests {
             let s = vec_dot_q6_k_scalar(&w, &act);
             let v = unsafe { x86::vec_dot_q6_k_avx2(&w, &act) };
             assert_eq!(s.to_bits(), v.to_bits(), "seed {seed}: scalar {s} != avx2 {v}");
+        }
+    }
+
+    #[test]
+    fn vec_dot_q4_k_batch_matches_per_column() {
+        let cols = 512; // 2 super-blocks
+        let n = 13; // crosses the TB=8 token-block boundary (8 + remainder 5)
+        let mut w = Vec::new();
+        for sb in 0..(cols / 256) {
+            w.extend_from_slice(&f32_to_f16(0.05 + sb as f32 * 0.01).to_le_bytes());
+            w.extend_from_slice(&f32_to_f16(0.02 + sb as f32 * 0.005).to_le_bytes());
+            w.extend_from_slice(&prng_bytes(31 + sb as u32, 140));
+        }
+        let acts: Vec<Q8KActivation> = (0..n)
+            .map(|t| {
+                let xf: Vec<f32> = (0..cols)
+                    .map(|i| {
+                        ((i as u32 ^ (t as u32 * 7 + 1)).wrapping_mul(2246822519) % 263) as f32 * 0.013
+                            - 1.7
+                    })
+                    .collect();
+                quantize_activation_q8k(&xf)
+            })
+            .collect();
+        let mut got = vec![0.0f32; n];
+        vec_dot_q4_k_batch(&w, &acts, &mut got);
+        for (t, act) in acts.iter().enumerate() {
+            let want = vec_dot_q4_k(&w, act);
+            assert_eq!(got[t].to_bits(), want.to_bits(), "Q4_K batch col {t}: {} != {}", got[t], want);
+        }
+    }
+
+    #[test]
+    fn vec_dot_q6_k_batch_matches_per_column() {
+        let cols = 512;
+        let n = 13;
+        let mut w = Vec::new();
+        for sb in 0..(cols / 256) {
+            w.extend_from_slice(&prng_bytes(41 + sb as u32, 208));
+            w.extend_from_slice(&f32_to_f16(0.03 + sb as f32 * 0.01).to_le_bytes());
+        }
+        let acts: Vec<Q8KActivation> = (0..n)
+            .map(|t| {
+                let xf: Vec<f32> = (0..cols)
+                    .map(|i| {
+                        ((i as u32 ^ (t as u32 * 5 + 3)).wrapping_mul(2654435761) % 251) as f32 * 0.011
+                            - 1.4
+                    })
+                    .collect();
+                quantize_activation_q8k(&xf)
+            })
+            .collect();
+        let mut got = vec![0.0f32; n];
+        vec_dot_q6_k_batch(&w, &acts, &mut got);
+        for (t, act) in acts.iter().enumerate() {
+            let want = vec_dot_q6_k(&w, act);
+            assert_eq!(got[t].to_bits(), want.to_bits(), "Q6_K batch col {t}: {} != {}", got[t], want);
         }
     }
 
