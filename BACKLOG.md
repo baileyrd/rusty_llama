@@ -102,3 +102,37 @@ bit-for-bit identical to the scalar path.
 **Still TODO:**
 - **NEON.** No aarch64 path yet; the dispatchers fall through to scalar there.
   (Can't be built/verified on this x86 machine.)
+
+---
+
+## Performance parity roadmap (2026-06-19 on-machine review)
+
+Full review, ground-truth numbers, roofline evidence, and the per-path parity
+verdict are in [`docs/Architecture/plans/phase-6-parity.md`](docs/Architecture/plans/phase-6-parity.md).
+TL;DR: the dominant gaps vs llama.cpp are **recoverable engineering overhead, not
+hardware walls** — snapshot parity is reachable on 3 of 4 paths, CUDA prefill
+lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge each):
+
+- [ ] **6.1 CPU cache-blocked prefill GEMM.** `CpuBackend` overrides no batched
+  op, so prefill loops single-row `matmul` (`mod.rs:143-148`) and re-streams the
+  whole weight set per token — pp512 ~44 t/s vs llama.cpp 6047 (**~130×**).
+  Override `matmul_batch` with a cache-blocked int8 GEMM (quantize N activations
+  once, stream each weight super-block once, tile output rows to L2). Target
+  ~130× → ~1.5×. Parity is bit-identical (dots unchanged).
+- [ ] **6.2 CUDA-graph decode capture.** Decode issues ~445 launches/step with no
+  graph (`cuda.rs:1143-1197`); rusty hits 127 GB/s vs llama.cpp 252 (both far
+  below peak ⇒ launch-bound). Capture+replay one CUDA graph/token (needs
+  off-NULL-stream + device-resident position). Target 191 → ~300–330 t/s.
+- [ ] **6.3 CUDA prefill conversion-kill (+int8).** Kill ~310 redundant f32↔f16
+  cvt passes (share narrowed activation, fold into rmsnorm/swiglu) + cache the ~7
+  cuBLASLt plans; then attempt int8 MMQ/IMMA instead of f16 cuBLAS. Target 3.4×
+  → ~1.5–2×. ("at the cuBLAS wall" is a misdiagnosis — llama.cpp doesn't use
+  cuBLAS for quantized prefill.)
+- [ ] **6.4 CPU decode AVX2 tuning.** `vec_dot_q4_k/q6_k/q8_0` AVX2 dots use one
+  accumulator + many horizontal reductions (`quant.rs:895-928,967-976`); rope
+  recomputes cos/sin per head (`cpu.rs:124-143`). Add multi-accumulator dots +
+  precompute rope cos/sin/position. Target 1.35× → ~1.1×. Keep bit-exact parity.
+- [ ] **6.x Bench-methodology + doc-drift fixes** (fold into the PRs above):
+  real-model CPU/wgpu benches in the rigorous harness; warmup+reps for the CPU
+  baseline; hoist `RunState` out of the timed prefill region; fix stale
+  "TF32"/"dequant-to-f32-on-host"/"no AVX2" doc claims. See the phase-6 doc.
