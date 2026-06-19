@@ -188,9 +188,69 @@ rope cos/sin per position once (`cpu.rs` rope) instead of per head.
 ## Doc-drift / correctness (low severity, verified; fix opportunistically)
 - `PERFORMANCE.md:125`, `HANDOFF.md:37-43` call the prefill GEMM "TF32/`Matmul<f32>`";
   it is f16 inputs / f32-accumulate (`cuda.rs:678`, cudarc `safe.rs:449`).
-- `gpu.rs:16-18` module doc says quantized weights are dequantized to f32 on host;
-  false — kept **packed**, dequantized in-shader (`gpu.rs:1409-1421`).
+- `gpu.rs` module doc said quantized weights are dequantized to f32 on host —
+  **FIXED** (2026-06-19): they're kept **packed** and dequantized in-shader
+  (Q4_K/Q6_K/Q8_0); only other formats host-dequant.
 - `PERFORMANCE.md` "Why the gaps" still says "no AVX2 integer path" — contradicted
   by its own roadmap item 1.
 - No functional bugs found; `unsafe` non-zeroing allocs in `gemm_dev` verified
   safe; prefill→decode f16-KV numeric path is parity-guarded.
+
+─────────────────────────────────────────────────────────────────────────────
+
+## Sprint results (2026-06-19) — what landed, and the empirical corrections
+
+An autonomous execution pass. **Landed + merged (verified on this machine):**
+
+| PR | Change | Measured | Status |
+|---|---|---|---|
+| #35 | This review + parity capture + backlog | — | merged |
+| #36 | 6.1 CPU cache-blocked prefill `matmul_batch` | pp512 **64 → 113 t/s (1.77×)**, decode unchanged, bit-identical | merged |
+| #37 | 6.3 CUDA prefill shared f16 narrow | pp512 **4671 → ~5230 t/s (1.12×)**, coherence held | merged |
+| (this) | wgpu doc-drift fix + roadmap finalize | — | — |
+
+**Empirical corrections to this review's own estimates** (the value of actually
+running it):
+- **CPU prefill batching is ~1.8×, not ~130×.** The 130× assumed memory-bound;
+  it's **compute-bound on the un-tuned `vec_dot`** (~1.4 MACs/cycle, ~45× below
+  AVX2 peak). Batching only recovers the RAM traffic that wasn't already hidden
+  behind slow compute.
+- **A bit-exact AVX2 hsum-deferral (6.4) measured ~neutral** here → the
+  dot-compute is NOT the CPU bottleneck. The real CPU prefill lever is a
+  **2D-tiled GEMM micro-kernel** that unpacks each weight super-block ONCE across
+  the batch (today the per-superblock unpack — `rd_f16`, `get_scale_min_k4`,
+  nibble extraction — is redone for every one of the N columns) AND blocks columns
+  for L1/L2 locality. CPU **decode** is bandwidth-bound (~33 of ~70 GB/s DDR5).
+- **Net:** the bounded "overhead removal" is real but small (1.1–1.8×); the gaps
+  are more compute/kernel-quality-bound than the review's framing implied — i.e.
+  closer to the original docs' "treadmill," though the *snapshot* targets below
+  remain reachable with the big kernel work.
+
+## Remaining big levers — feasibility-confirmed, ready to execute
+
+These are deliberately NOT rushed in this pass (load-bearing GPU/SIMD kernels;
+each is a focused effort). Scoping is concrete so they're a cold start:
+
+1. **CUDA-graph decode (6.2) — the biggest decode win (~191 → ~300–330 t/s).**
+   *Feasibility CONFIRMED:* the decode attention grid is `(rows*n_heads)` and its
+   shared-mem has no `seq_len` term (`cuda.rs:937-940`), and rope grid is `rows` —
+   all **`pos`-independent** for `rows==1`. Only the `pos` *value* (rope angle,
+   attention causal bound) and the KV-write offset vary per step. Plan: (a) switch
+   `ctx.default_stream()` → `ctx.new_stream()` (legacy NULL stream isn't
+   capturable); (b) make `pos` device-resident — `rope_kernel`/`attention_kernel`
+   read `pos_base` from a `const int*` (both already compute `pos_base + row`,
+   `cuda.rs:120,147`), and replace the KV-write `memcpy_dtod` with a `kv_append`
+   kernel that writes at `pos[0]*kv_dim`; (c) capture the per-step kernel sequence
+   once into a `cudarc` `CudaGraph` (`begin_capture`/`end_capture`/`launch` exist)
+   and replay, writing `pos`+embedding before each launch. Gate on
+   `decode_multistep_coherent` + `prefill_then_decode_coherent`.
+2. **CUDA prefill int8 MMQ (6.3 cont.) — the structural 3.0× lever.** Replace the
+   f16 cuBLAS GEMM with on-device int8: `quantize_q8k` activation (kernel exists)
+   + cuBLASLt IMMA (`CUDA_R_8I`/`COMPUTE_32I`) or a packed-weight `__dp4a` MMQ
+   (the decode `gemv_q4_k`/`gemv_q6_k` + `weight_packed` cache already exist).
+3. **CPU tiled GEMM micro-kernel (6.1/6.4 cont.).** Per-batch weight-unpack
+   amortization + column blocking (see corrections above).
+
+After 1–3, snapshot targets: CUDA decode ~1.1–1.2×, CUDA prefill ~1.6–2×, CPU
+prefill ~1.5–2× behind llama.cpp. Parity-as-a-maintained-property stays a
+treadmill; these are bounded one-time wins.
