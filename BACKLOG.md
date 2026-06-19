@@ -139,16 +139,18 @@ lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge 
   **f16-cuBLAS-vs-int8-MMQ** structural gap (the big lever, not yet attempted —
   needs IMMA/MMQ int8 kernels). ("at the cuBLAS wall" is a misdiagnosis —
   llama.cpp doesn't use cuBLAS for quantized prefill.)
-- [~] **6.4 CPU prefill unpack-amortized batched dots DONE; register-tiling
-  remains.** EMPIRICAL: a bit-exact AVX2 hsum-deferral measured ~neutral (the dot
-  isn't the bottleneck); the per-column **weight-unpack redundancy** is. Added
-  `vec_dot_q4_k_batch`/`q6_k_batch` (token-blocked: each weight super-block
-  unpacked ONCE per 8-token block, reused across columns) + wired into
-  `matmul_batch`. **Measured pp512 113 → 141 t/s (+25%; 45 → 141 = 3.1× over the
-  original per-row)**, bit-exact (parity tests pass). Residual ~43× to llama.cpp
-  needs the full **register-tiled micro-kernel** (multiple token outputs per
-  loaded weight vector) + activation-locality blocking — the hard part, deferred.
-  Decode stays bandwidth-bound (~33 of ~70 GB/s DDR5) — a separate lever.
+- [x] **6.4 CPU prefill — register-tiled GEMM DONE.** EMPIRICAL: a bit-exact AVX2
+  hsum-deferral measured ~neutral (the dot isn't the bottleneck); prefill is
+  **L3-bound on activation reuse** (each act re-read once per output feature) +
+  per-column weight-unpack redundancy. Two steps: (a) unpack-amortized batched
+  dots (each weight super-block unpacked once per token-block): 113 → 141 (+25%);
+  (b) **MR=4 register-tiled** dots (`vec_dot_q4_k_tiled`/`q6_k_tiled`: 4 output
+  rows/task, each activation loaded once and reused across the 4 rows): **141 →
+  214 t/s (+52%)**. Total **45 → 214 = ~4.75× over the original per-row**,
+  bit-exact (parity tests pass). Now ~28× behind llama.cpp (was ~130×). MR=8
+  spills the deferred-hsum accumulators (16 YMM), so MR=4 is the sweet spot; the
+  residual is per-row unpack + madd/hsum throughput. Decode stays bandwidth-bound
+  (~33 of ~70 GB/s DDR5) — a separate lever.
 - [ ] **6.x Bench-methodology + doc-drift fixes** (fold into the PRs above):
   real-model CPU/wgpu benches in the rigorous harness; warmup+reps for the CPU
   baseline; hoist `RunState` out of the timed prefill region; fix stale
