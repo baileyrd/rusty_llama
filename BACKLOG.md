@@ -228,13 +228,21 @@ cool machine; numbers below are reasoned, not all freshly benched.
   hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
 - [ ] **L10. wgpu megakernel** (collapse the ~300 serial compute passes/step) for
   the non-NVIDIA path (wgpu ~8× behind, overhead-bound not tensor-core-bound).
-- [ ] **L11. CUDA decode kernel fusion** (NEW — the real decode lever, found while
-  ruling out L6). Decode is ~150 tiny kernels/token at ~27% of peak bandwidth →
-  *launch/ramp-bound*. Fuse q/k/v + gate/up GEMVs into single launches (GPU analog
-  of L3) and fuse rmsnorm+quantize_q8k. Parity-verifiable; medium effort, bounded.
+- [~] **L11. CUDA decode kernel fusion — q/k/v DONE (+~1.5% decode).** Fused the
+  three q/k/v decode GEMVs (which share the Q8_K activation) into one `gemv_qkv`
+  launch — Q4_K_M layout (q,k Q4_K; v Q6_K), absorbing the small under-saturating
+  k/v grids. Extracted `dot_q4_k_row`/`dot_q6_k_row` device fns so the fused and
+  per-matrix kernels are one implementation (parity tests pass; graph coherence
+  rel L2 0.0361 unchanged). Interleaved A/B: **decode 270.7 → 274.7 t/s (+1.5%,
+  5/6 rounds)**. Smaller than hoped: the CUDA graph **already overlaps** the
+  independent q/k/v kernels, so fusion mainly recovers node/ramp overhead, not the
+  full under-saturation. `RUSTY_LLAMA_CUDA_NO_QKV_FUSE` toggles it. *Remaining:*
+  gate/up fusion (both already saturate → ~0) and rmsnorm+quantize (one block would
+  serialize the quantize → likely regression); neither pursued.
 
-Order: **L3 (+7%) and L5 (+~3%) DONE, bit-exact (~9% decode combined); L1 + L4 + L6
-ruled out** (occupancy/LTO/PGO regressions; decode GEMV already optimal — it's
-fusion-bound, not GEMV-bound). Remaining bounded: **L11 (decode kernel fusion, the
-real GPU-decode lever)** and L2 (CPU threading, needs a cool machine), then the
-treadmill (L7-L10) only if worth it.
+Order: **L3 (+7%), L5 (+~3%) CPU-decode and L11 q/k/v (+~1.5%) CUDA-decode DONE,
+all bit-exact; L1 + L4 + L6 ruled out** (occupancy/LTO/PGO regressions; decode GEMV
+already optimal). Remaining bounded: **L2 (CPU threading, needs a cool machine)**;
+then the treadmill (L7-L10) only if worth it. CUDA decode is now graph + fused and
+near its structural limit for this kernel set — further gains need L7 (int8 MMQ) or
+deeper fusion.
