@@ -38,6 +38,12 @@ pub enum Arch {
     /// explicit head dim, "sandwich" post-attention / post-FFN norms, and tanh
     /// logit softcapping on the attention scores and the final logits.
     Gemma2,
+    /// Qwen2-MoE: the Qwen2 attention graph (QKV bias, NeoX rope) with a routed
+    /// mixture-of-experts FFN plus an always-on shared expert. Selected by the
+    /// `qwen2moe` arch string; routed experts use a separate `n_ff_exp`, the
+    /// shared expert `n_ff_shexp`, and the top-k weights are NOT renormalized
+    /// (unlike Mixtral).
+    Qwen2Moe,
 }
 
 /// Canonical GGUF tensor names.
@@ -78,6 +84,13 @@ pub struct TensorNames {
     pub ffn_gate_exps: &'static str,
     pub ffn_up_exps: &'static str,
     pub ffn_down_exps: &'static str,
+    /// Qwen2-MoE shared-expert tensors: a sigmoid gate (`ffn_gate_inp_shexp`, a
+    /// length-`dim` vector → one scalar) and an always-on SwiGLU FFN at
+    /// `n_ff_shexp`. Present only when the model carries a shared expert.
+    pub ffn_gate_inp_shexp: &'static str,
+    pub ffn_gate_shexp: &'static str,
+    pub ffn_up_shexp: &'static str,
+    pub ffn_down_shexp: &'static str,
 }
 
 /// The canonical GGUF tensor names (the literals previously inlined in
@@ -106,6 +119,10 @@ pub const TENSOR_NAMES: TensorNames = TensorNames {
     ffn_gate_exps: "ffn_gate_exps.weight",
     ffn_up_exps: "ffn_up_exps.weight",
     ffn_down_exps: "ffn_down_exps.weight",
+    ffn_gate_inp_shexp: "ffn_gate_inp_shexp.weight",
+    ffn_gate_shexp: "ffn_gate_shexp.weight",
+    ffn_up_shexp: "ffn_up_shexp.weight",
+    ffn_down_shexp: "ffn_down_shexp.weight",
 };
 
 impl Arch {
@@ -119,6 +136,7 @@ impl Arch {
             "qwen2" => Arch::Qwen2,
             "phi3" => Arch::Phi3,
             "gemma2" => Arch::Gemma2,
+            "qwen2moe" => Arch::Qwen2Moe,
             _ => Arch::Llama,
         }
     }
@@ -128,9 +146,9 @@ impl Arch {
         &TENSOR_NAMES
     }
 
-    /// Additive bias on the Q/K/V projections (Qwen2).
+    /// Additive bias on the Q/K/V projections (Qwen2 / Qwen2-MoE).
     pub fn has_qkv_bias(&self) -> bool {
-        matches!(self, Arch::Qwen2)
+        matches!(self, Arch::Qwen2 | Arch::Qwen2Moe)
     }
 
     /// A single fused `attn_qkv` tensor (split into Q/K/V at load) — Phi-3.
@@ -163,7 +181,7 @@ impl Arch {
     /// permute NeoX Q/K weights at load instead (the inverse of that converter
     /// step), so no backend changes are needed.
     pub fn rope_neox(&self) -> bool {
-        matches!(self, Arch::Qwen2 | Arch::Phi3 | Arch::Gemma2)
+        matches!(self, Arch::Qwen2 | Arch::Phi3 | Arch::Gemma2 | Arch::Qwen2Moe)
     }
 
     /// Only plain Llama uses the fused resident GPU/CUDA decode; every other arch
@@ -192,6 +210,8 @@ mod tests {
         assert_eq!(TENSOR_NAMES.ffn_down, "ffn_down.weight");
         assert_eq!(TENSOR_NAMES.attn_post_norm, "post_attention_norm.weight");
         assert_eq!(TENSOR_NAMES.ffn_post_norm, "post_ffw_norm.weight");
+        assert_eq!(TENSOR_NAMES.ffn_gate_inp_shexp, "ffn_gate_inp_shexp.weight");
+        assert_eq!(TENSOR_NAMES.ffn_down_shexp, "ffn_down_shexp.weight");
     }
 
     #[test]
@@ -200,6 +220,7 @@ mod tests {
         assert_eq!(Arch::from_name("qwen2"), Arch::Qwen2);
         assert_eq!(Arch::from_name("phi3"), Arch::Phi3);
         assert_eq!(Arch::from_name("gemma2"), Arch::Gemma2);
+        assert_eq!(Arch::from_name("qwen2moe"), Arch::Qwen2Moe);
         // Unknown / unsupported archs stay permissive (Llama tensor layout).
         for a in ["mistral", "gemma", "totally-unknown"] {
             assert_eq!(Arch::from_name(a), Arch::Llama, "arch {a}");
@@ -214,5 +235,7 @@ mod tests {
         assert_eq!(Arch::Llama.ffn_activation(), FfnActivation::SwiGlu);
         assert!(Arch::Gemma2.sandwich_norm() && !Arch::Llama.sandwich_norm());
         assert!(Arch::Llama.uses_resident_decode() && !Arch::Gemma2.uses_resident_decode());
+        // Qwen2-MoE shares Qwen2 attention (QKV bias, NeoX rope).
+        assert!(Arch::Qwen2Moe.has_qkv_bias() && Arch::Qwen2Moe.rope_neox());
     }
 }

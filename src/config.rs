@@ -106,6 +106,15 @@ pub struct Config {
     /// Number of experts each token is routed to (top-k). Must be in
     /// `1..=n_expert` when `n_expert > 0`; ignored for dense models.
     pub n_expert_used: usize,
+    /// FFN intermediate dim of each routed expert. Defaults to `hidden_dim`
+    /// (Mixtral); Qwen2-MoE sets a smaller `expert_feed_forward_length`.
+    pub n_ff_exp: usize,
+    /// FFN intermediate dim of the always-on shared expert. `0` = no shared
+    /// expert (Mixtral); `> 0` = Qwen2-MoE's `expert_shared_feed_forward_length`.
+    pub n_ff_shexp: usize,
+    /// Whether the selected top-k routing weights are renormalized to sum to 1.
+    /// `true` for Mixtral (`norm_w`), `false` for Qwen2-MoE.
+    pub expert_weights_norm: bool,
 }
 
 impl Default for Config {
@@ -130,6 +139,9 @@ impl Default for Config {
             final_logit_softcap: 0.0,
             n_expert: 0,
             n_expert_used: 0,
+            n_ff_exp: 0,
+            n_ff_shexp: 0,
+            expert_weights_norm: true,
         }
     }
 }

@@ -26,7 +26,7 @@ The roadmap is defined in `PERFORMANCE.md` §"Improvement roadmap". Status:
 | 2 | **GPU int8 / DP4A decode** | ✅ (CUDA) / 🟡 (wgpu) — **CUDA packed-weight DP4A GEMV ADOPTED** (Phase 2): warp-cooperative, coalesced Q4_K/Q6_K `__dp4a` decode GEMV (`quantize_q8k` + `gemv_q4_k`/`gemv_q6_k`), default-on, **2.4× decode** (86→207 tok/s on real TinyLlama; plan [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md)). The wgpu Stage-2 stays parked (int8 vs an already-packed dequant GEMV saves no bytes); the CUDA win is real because its baseline was f16. (`02`/`03`/`04`) |
 | 3 | **GPU tensor cores** | ✅ (CUDA) / ❌ (portable) — portable wgpu coopmat **ruled out** on this hardware (advertises only f16 16×16; wgpu 29 wires only 8×8 f32 → silent all-zero garbage). CUDA backend M0→M2b + resident decode **DONE and merged** (PRs #20–#22). Closed PR #23: a naive packed dequant-GEMV was ~1.6× *slower* than f16. (`03`/`04`) |
 | 4 | Flash attention; cache-blocked CPU prefill | ❌ not started |
-| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 archs** (Qwen2/Phi-3/Gemma 2) **+ 3.2 MoE (Mixtral) + 4.1 server + 4.2 continuous batching + 5.1 GBNF grammar SHIPPED**: OpenAI HTTP server (`server` feature) with streaming SSE, a continuous-batching scheduler (`Batch::decode_step`), grammar-constrained / JSON output, and routed mixture-of-experts ([`plans/phase-3-archs.md`](plans/phase-3-archs.md), [`plans/phase-4-server.md`](plans/phase-4-server.md), [`plans/phase-5-grammar.md`](plans/phase-5-grammar.md)). KV-quant ❌; 4.3 paged KV, 5.2 flash attention, 3.2 Qwen2-MoE shared experts, 3.3 recurrent remain. |
+| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 archs** (Qwen2/Phi-3/Gemma 2) **+ 3.2 MoE (Mixtral + Qwen2-MoE) + 4.1 server + 4.2 continuous batching + 5.1 GBNF grammar SHIPPED**: OpenAI HTTP server (`server` feature) with streaming SSE, a continuous-batching scheduler (`Batch::decode_step`), grammar-constrained / JSON output, and routed + shared-expert mixture-of-experts ([`plans/phase-3-archs.md`](plans/phase-3-archs.md), [`plans/phase-4-server.md`](plans/phase-4-server.md), [`plans/phase-5-grammar.md`](plans/phase-5-grammar.md)). KV-quant ❌; 4.3 paged KV, 5.2 flash attention, 3.3 recurrent remain. |
 
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ Two distinct walls (see `04` and `../Research/03-cuda-kernels.md`):
 
 | Area | State | Doc |
 |---|---|---|
-| Architectures | Llama, Qwen2, Phi-3, Gemma 2 (`Arch` registry seam, `src/arch.rs`; Phase 3.1) + **Mixtral routed MoE** (`expert_count` GGUF hparam; Phase 3.2) | `01`,`06`,`plans/phase-3-archs.md` |
+| Architectures | Llama, Qwen2, Phi-3, Gemma 2 (`Arch` registry seam, `src/arch.rs`; Phase 3.1) + **Mixtral & Qwen2-MoE mixture-of-experts** (`expert_count` hparam; shared expert + non-renormalized routing for Qwen2-MoE; Phase 3.2) | `01`,`06`,`plans/phase-3-archs.md` |
 | Quant (consume) | F32/F16/Q4_0/Q8_0/Q4_K/Q6_K | `05` |
 | Quant (produce) | only `quantize_q8_0` (test fixtures); no quantize-to-disk | `05` |
 | Tokenizers | SPM + GPT-2 BPE (GPT-2/Llama-3/Qwen2 pretokenizers) | `07` |
@@ -114,7 +114,7 @@ than HANDOFF assumed** — llama.cpp's `mmvq` is a concrete, proven design to po
   [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md).
 
 **Tier 3 — large capability jumps** (`06`, `../Research/05`,`06`,`08`):
-- Arch registry → Qwen2/Phi-3/Gemma2 (near-Llama) ✅ **done — Phase 3.1**; Mixtral routed MoE ✅ **done — Phase 3.2** (`plans/phase-3-archs.md`); next Qwen2-MoE shared experts / Mamba / RWKV.
+- Arch registry → Qwen2/Phi-3/Gemma2 (near-Llama) ✅ **done — Phase 3.1**; Mixtral + Qwen2-MoE mixture-of-experts ✅ **done — Phase 3.2** (`plans/phase-3-archs.md`); next Mamba / RWKV.
 - Paged multi-sequence KV → continuous batching → minimal server: **4.1 server + 4.2 continuous batching done** (`plans/phase-4-server.md`); 4.3 paged KV remains (memory efficiency).
 - GBNF grammar / JSON-schema structured output ✅ **done — Phase 5.1** (`plans/phase-5-grammar.md`): GBNF parser + byte-NFA matcher + a `GrammarStage` on the sampler chain; CLI `--grammar` and server `grammar` / `response_format` (`json_object`).
 

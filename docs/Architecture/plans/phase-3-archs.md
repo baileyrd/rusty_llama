@@ -283,20 +283,21 @@ These run with no network and no real GGUF, exactly as `tests/gguf.rs` does toda
 
 ─────────────────────────────────────────────────────────────────────────────
 
-## 3.2 — MoE (Mixtral) — SHIPPED
+## 3.2 — MoE (Mixtral + Qwen2-MoE) — SHIPPED
 
-Mixtral-style routed mixture-of-experts. The key design call: rather than the
-`MUL_MAT_ID`-equivalent fused expert-gather op the original sketch anticipated,
-the FFN is expressed as **host-side routing composed with the existing per-row
-`matmul`** — so it is correct and identical on every backend (CPU oracle, GPU,
-CUDA per-op) with no new `Backend` method. The fused gather is left as a
-decode-speed follow-on.
+Routed mixture-of-experts (Mixtral) plus Qwen2-MoE's always-on shared expert.
+The key design call: rather than the `MUL_MAT_ID`-equivalent fused expert-gather
+op the original sketch anticipated, the FFN is expressed as **host-side routing
+composed with the existing per-row `matmul`** — so it is correct and identical on
+every backend (CPU oracle, GPU, CUDA per-op) with no new `Backend` method. The
+fused gather is left as a decode-speed follow-on.
 
-**MoE is not an `Arch` variant** — Mixtral's `general.architecture` is `llama`.
-It is selected by the GGUF hparams `{arch}.expert_count` / `expert_used_count`
-(`Config::n_expert` / `n_expert_used`); `n_expert > 0` switches the FFN to the
-routed path. This mirrors llama.cpp, where MoE is a property of the layer graph,
-not the arch name.
+**Selection.** The routed MoE path is keyed on the GGUF hparam
+`{arch}.expert_count` (`Config::n_expert > 0`), not the arch name — mirroring
+llama.cpp, where MoE is a layer-graph property. **Mixtral is not its own `Arch`**
+(its `general.architecture` is `llama`); **Qwen2-MoE is `Arch::Qwen2Moe`** only
+because it needs the Qwen2 attention deltas (QKV bias + NeoX rope), with the MoE
+wiring layered on top.
 
 - **Loading** (`Model::from_gguf`): when `n_expert > 0`, each layer loads a router
   (`ffn_gate_inp`, a `(n_expert, dim)` projection) plus three stacked expert
@@ -308,34 +309,42 @@ not the arch name.
   added to the shared `TensorNames` table; the four MoE names are the only
   additions.
 - **Forward** (`moe_ffn_row`): router logits → softmax over **all** experts →
-  top-`k` by probability (ties → lower index) → renormalize the selected
-  probabilities to sum to 1 → accumulate each selected expert's SwiGLU/GeGLU
-  output scaled by its weight. Matches llama.cpp's `build_moe_ffn` for the
-  softmax-gated, top-k-renormalized case. The single helper is shared by all
-  three forward paths (`forward_with`, `prefill_residual`, `Batch::decode_step`),
-  which branch dense-vs-MoE only at the FFN block; routing is per-token, so the
-  MoE FFN runs row-by-row (no batch GEMM) while the dense path keeps its batched
-  matmuls.
+  top-`k` by probability (ties → lower index) → weight each selected expert's
+  SwiGLU/GeGLU output. Whether the selected weights are renormalized to sum to 1
+  is `config.expert_weights_norm`: **Mixtral renormalizes (`norm_w=true`),
+  Qwen2-MoE uses the raw softmax probabilities (`norm_w=false`)** — the one
+  behavioral routing delta, source-verified against llama.cpp. The single helper
+  is shared by all three forward paths (`forward_with`, `prefill_residual`,
+  `Batch::decode_step`), which branch dense-vs-MoE only at the FFN block; routing
+  is per-token, so the MoE FFN runs row-by-row (no batch GEMM) while the dense
+  path keeps its batched matmuls.
+- **Shared expert** (Qwen2-MoE, `config.n_ff_shexp > 0`): after the routed sum,
+  `moe_ffn_row` adds `sigmoid(ffn_gate_inp_shexp · xn) · SwiGLU_shexp(xn)` — an
+  always-on FFN at its own `n_ff_shexp` gated by a single sigmoid logit. Routed
+  experts use `n_ff_exp` (`expert_feed_forward_length`); the shared expert uses
+  `n_ff_shexp` (`expert_shared_feed_forward_length`). The gate tensor is a 1-D
+  `(dim)` GGUF vector loaded as a `(1, dim)` matrix (`qmatrix_from_gguf` grew a
+  1-D row-vector case). FFN scratch (`hb`/`hb2`) is sized to
+  `max(hidden, n_ff_exp, n_ff_shexp)` and sliced per use.
 - **Resident decode gate**: Mixtral is `Arch::Llama`, so the CUDA/GPU fused
   resident decode would otherwise claim it. `Config::uses_resident_decode()` now
   also requires `n_expert == 0`, routing MoE to the generic per-op path on every
   backend.
 
-**Validation.** Numeric parity unit tests: `moe_ffn_row` vs an independent
-weighted-expert-sum reference (`n_expert_used == n_expert`), and top-1 selecting
-exactly the argmax expert (weight renormalized to 1). End-to-end: a synthetic
-Mixtral GGUF (`dummy::synthetic_gguf_moe`) loads with the right shapes, prefill
+**Validation.** Numeric parity unit tests against from-scratch references:
+Mixtral routed sum (`moe_ffn_row` vs weighted-expert-sum; top-1 = argmax expert)
+and Qwen2-MoE (top-k with **raw** probs, no renorm, **plus** the sigmoid-gated
+shared SwiGLU). End-to-end: synthetic Mixtral (`synthetic_gguf_moe`) and
+Qwen2-MoE (`synthetic_gguf_qwen2moe`) GGUFs load with the right shapes, prefill
 is finite, greedy generation is reproducible, batched `decode_step` is
 bit-identical to independent per-sequence runs, and prefill is bit-identical to
-the sequential path. **No real-Mixtral-vs-`llama-cli` greedy check yet** — no MoE
-GGUF is in the repo (Mixtral Q4 is ~26 GB); the synthetic parity tests check the
-routing math from scratch. **Effort: M.**
+the sequential path. **No real-model-vs-`llama-cli` greedy check yet** — no MoE
+GGUF is in the repo (Mixtral Q4 ~26 GB); the synthetic parity tests check the
+routing/shared-expert math from scratch. **Effort: M (Mixtral) + M (Qwen2-MoE).**
 
-**Remaining / follow-ons.** (1) **Qwen2-MoE shared experts** — an always-on
-shared FFN plus a sigmoid shared-expert gate added to the routed output; a clean
-additive delta on `moe_ffn_row` once a target lands. (2) **Fused `MUL_MAT_ID`
-gather** — the per-row expert GEMVs are correctness-first, not a fused
-device-side gather; a decode-speed follow-on (and the resident-decode path).
+**Remaining / follow-ons.** **Fused `MUL_MAT_ID` gather** — the per-row expert
+GEMVs are correctness-first, not a fused device-side gather; a decode-speed
+follow-on (and the resident-decode path for MoE).
 
 ## 3.3 — Recurrent (Mamba / RWKV) — sketch (remaining)
 
@@ -349,8 +358,8 @@ model** plus new ops (selective scan / WKV). It is large and cleanly separable f
 
 ## Non-goals / remaining
 
-- **3.2 MoE (Mixtral)** — ✅ SHIPPED (see §3.2 above). Remaining: Qwen2-MoE shared
-  experts, and a fused `MUL_MAT_ID` gather for decode speed.
+- **3.2 MoE (Mixtral + Qwen2-MoE)** — ✅ SHIPPED (see §3.2 above). Remaining: a
+  fused `MUL_MAT_ID` gather for decode speed.
 - **3.3 recurrent (Mamba / RWKV)** — a separate state model (not a KV cache) + new
   ops; large and separable; deferred.
 - **Large-model NeoX rope** — 3.1 pays an owned Q/K (and bias) copy at load to keep
