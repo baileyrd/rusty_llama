@@ -57,12 +57,19 @@ pub struct Weights<'a> {
     /// MoE router projection per layer, each `(n_expert, dim)`. Empty for a
     /// dense model; populated when `config.n_expert > 0` (Mixtral).
     pub ffn_gate_inp: Vec<QMatrix<'a>>,
-    /// MoE expert projections, `[layer][expert]`: gate `(hidden_dim, dim)`, down
-    /// `(dim, hidden_dim)`, up `(hidden_dim, dim)`. Empty for a dense model. When
-    /// these are populated `w1`/`w2`/`w3` are empty, and vice-versa.
+    /// MoE routed-expert projections, `[layer][expert]`: gate `(n_ff_exp, dim)`,
+    /// down `(dim, n_ff_exp)`, up `(n_ff_exp, dim)`. Empty for a dense model.
+    /// When these are populated `w1`/`w2`/`w3` are empty, and vice-versa.
     pub w1_exp: Vec<Vec<QMatrix<'a>>>,
     pub w2_exp: Vec<Vec<QMatrix<'a>>>,
     pub w3_exp: Vec<Vec<QMatrix<'a>>>,
+    /// Qwen2-MoE shared expert (per layer). `ffn_gate_inp_shexp` is a `(1, dim)`
+    /// sigmoid gate; `w1/w2/w3_shexp` are the always-on SwiGLU FFN at `n_ff_shexp`.
+    /// All empty unless the model has a shared expert (`config.n_ff_shexp > 0`).
+    pub ffn_gate_inp_shexp: Vec<QMatrix<'a>>,
+    pub w1_shexp: Vec<QMatrix<'a>>,
+    pub w2_shexp: Vec<QMatrix<'a>>,
+    pub w3_shexp: Vec<QMatrix<'a>>,
 }
 
 /// A parsed model: hyper-parameters plus weights.
@@ -148,6 +155,10 @@ impl<'a> Model<'a> {
                 w1_exp: Vec::new(),
                 w2_exp: Vec::new(),
                 w3_exp: Vec::new(),
+                ffn_gate_inp_shexp: Vec::new(),
+                w1_shexp: Vec::new(),
+                w2_shexp: Vec::new(),
+                w3_shexp: Vec::new(),
             },
         })
     }
@@ -178,6 +189,25 @@ impl<'a> Model<'a> {
         // Mixture-of-experts counts (absent ⇒ 0 ⇒ a dense FFN).
         let n_expert = gguf.meta_u64(&key("expert_count")).unwrap_or(0) as usize;
         let n_expert_used = gguf.meta_u64(&key("expert_used_count")).unwrap_or(0) as usize;
+        // Routed-expert FFN dim (Mixtral has no key ⇒ defaults to hidden_dim);
+        // shared-expert FFN dim + presence (Qwen2-MoE only).
+        let n_ff_exp = gguf
+            .meta_u64(&key("expert_feed_forward_length"))
+            .map(|v| v as usize)
+            .unwrap_or(hidden_dim);
+        let has_shared = n_expert > 0
+            && gguf
+                .tensor(&format!("blk.0.{}", names.ffn_gate_inp_shexp))
+                .is_some();
+        let n_ff_shexp = if has_shared {
+            gguf.meta_u64(&key("expert_shared_feed_forward_length"))
+                .map(|v| v as usize)
+                .unwrap_or(hidden_dim)
+        } else {
+            0
+        };
+        // Top-k weight renormalization: Mixtral renormalizes, Qwen2-MoE does not.
+        let expert_weights_norm = !matches!(arch, Arch::Qwen2Moe);
         let seq_len = gguf.meta_u64(&key("context_length"))? as usize;
         let rope_freq_base = gguf.meta_f32(&key("rope.freq_base")).unwrap_or(10000.0);
         let rms_eps = gguf
@@ -248,6 +278,9 @@ impl<'a> Model<'a> {
             final_logit_softcap,
             n_expert,
             n_expert_used,
+            n_ff_exp,
+            n_ff_shexp,
+            expert_weights_norm,
         };
         config.validate()?;
         let q_dim = config.q_dim();
@@ -312,8 +345,8 @@ impl<'a> Model<'a> {
                     })
                     .collect()
             };
-            let w1e = split_exps(names.ffn_gate_exps, hidden_dim)?;
-            let w3e = split_exps(names.ffn_up_exps, hidden_dim)?;
+            let w1e = split_exps(names.ffn_gate_exps, n_ff_exp)?;
+            let w3e = split_exps(names.ffn_up_exps, n_ff_exp)?;
             let w2e = split_exps(names.ffn_down_exps, dim)?;
             (Vec::new(), Vec::new(), Vec::new(), router, w1e, w2e, w3e)
         } else if arch.fused_gate_up() {
@@ -338,6 +371,19 @@ impl<'a> Model<'a> {
                 e2,
                 e3,
             )
+        };
+
+        // Qwen2-MoE shared expert: a per-layer sigmoid gate + an always-on SwiGLU
+        // FFN, added to the routed output. Absent (empty) for Mixtral.
+        let (ffn_gate_inp_shexp, w1_shexp, w2_shexp, w3_shexp) = if n_ff_shexp > 0 {
+            (
+                layers(names.ffn_gate_inp_shexp)?,
+                layers(names.ffn_gate_shexp)?,
+                layers(names.ffn_down_shexp)?,
+                layers(names.ffn_up_shexp)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
         let (bq, bk, bv) = if arch.has_qkv_bias() {
@@ -409,6 +455,10 @@ impl<'a> Model<'a> {
                 w1_exp,
                 w2_exp,
                 w3_exp,
+                ffn_gate_inp_shexp,
+                w1_shexp,
+                w2_shexp,
+                w3_shexp,
             },
         })
     }
@@ -473,9 +523,12 @@ pub(crate) fn qmatrix_from_gguf<'a>(gguf: &Gguf<'a>, name: &str) -> Result<QMatr
         .ok_or_else(|| Error::Format(format!("GGUF missing tensor '{name}'")))?;
     let (cols, rows) = match info.dims.as_slice() {
         [c, r] => (*c as usize, *r as usize),
+        // A 1-D tensor is a single-row matrix (Qwen2-MoE's `ffn_gate_inp_shexp`,
+        // a length-`dim` vector that projects to one sigmoid-gate logit).
+        [c] => (*c as usize, 1),
         other => {
             return Err(Error::Format(format!(
-                "tensor '{name}' must be 2-D, has {} dims",
+                "tensor '{name}' must be 1-D or 2-D, has {} dims",
                 other.len()
             )))
         }
@@ -635,8 +688,10 @@ impl RunState {
             x: vec![0.0; c.dim],
             xb: vec![0.0; big],
             xb2: vec![0.0; big],
-            hb: vec![0.0; c.hidden_dim],
-            hb2: vec![0.0; c.hidden_dim],
+            // FFN scratch must cover the largest FFN width: dense `hidden_dim`,
+            // routed expert `n_ff_exp`, or shared expert `n_ff_shexp` (MoE).
+            hb: vec![0.0; c.hidden_dim.max(c.n_ff_exp).max(c.n_ff_shexp)],
+            hb2: vec![0.0; c.hidden_dim.max(c.n_ff_exp).max(c.n_ff_shexp)],
             q: vec![0.0; q_dim],
             att: vec![0.0; c.n_heads * c.seq_len],
             logits: vec![0.0; c.vocab_size],
@@ -700,6 +755,9 @@ impl Batch {
     pub fn new(c: &Config, cap: usize) -> Self {
         let (dim, q_dim, kv_dim, hidden, vocab) =
             (c.dim, c.q_dim(), c.kv_dim(), c.hidden_dim, c.vocab_size);
+        // FFN scratch width covers dense `hidden_dim` and the routed/shared MoE
+        // expert widths (the MoE FFN reuses one row of `hb`/`hb2`).
+        let hb_w = hidden.max(c.n_ff_exp).max(c.n_ff_shexp);
         Batch {
             cap,
             x: vec![0.0; cap * dim],
@@ -709,8 +767,8 @@ impl Batch {
             kbuf: vec![0.0; cap * kv_dim],
             vbuf: vec![0.0; cap * kv_dim],
             ao: vec![0.0; cap * q_dim],
-            hb: vec![0.0; cap * hidden],
-            hb2: vec![0.0; cap * hidden],
+            hb: vec![0.0; cap * hb_w],
+            hb2: vec![0.0; cap * hb_w],
             att: vec![0.0; c.n_heads * c.seq_len],
             logits: vec![0.0; cap * vocab],
             router: vec![0.0; c.n_expert],
@@ -751,6 +809,7 @@ impl Batch {
         let sandwich = p.arch.sandwich_norm();
         let act = p.arch.ffn_activation();
         let is_moe = p.n_expert > 0;
+        let ff_w = hidden.max(p.n_ff_exp).max(p.n_ff_shexp);
         debug_assert!(n <= self.cap && tokens.len() == n && positions.len() == n);
 
         // Seed each row with its token's (dequantized) embedding, scaled (Gemma).
@@ -825,8 +884,8 @@ impl Batch {
                         layer,
                         &self.xb[r * dim..r * dim + dim],
                         &mut self.xb2[r * dim..r * dim + dim],
-                        &mut self.hb[..hidden],
-                        &mut self.hb2[..hidden],
+                        &mut self.hb[..ff_w],
+                        &mut self.hb2[..ff_w],
                         &mut self.moe_tmp,
                         &mut self.router,
                     );
@@ -1077,6 +1136,8 @@ fn prefill_residual<B: Backend + ?Sized>(
     let sandwich = p.arch.sandwich_norm();
     let act = p.arch.ffn_activation();
     let is_moe = p.n_expert > 0;
+    // FFN scratch width: dense `hidden`, or the larger routed/shared MoE widths.
+    let ff_w = hidden.max(p.n_ff_exp).max(p.n_ff_shexp);
 
     // Row-major (n, *) scratch for the batch. Attention output `ao` is `(n,
     // q_dim)` and kept separate from the `(n, dim)` norm scratch `xb`, since
@@ -1086,8 +1147,8 @@ fn prefill_residual<B: Backend + ?Sized>(
     let mut xb2 = vec![0.0f32; n * dim];
     let mut q = vec![0.0f32; n * q_dim];
     let mut ao = vec![0.0f32; n * q_dim];
-    let mut hb = vec![0.0f32; n * hidden];
-    let mut hb2 = vec![0.0f32; n * hidden];
+    let mut hb = vec![0.0f32; n * ff_w];
+    let mut hb2 = vec![0.0f32; n * ff_w];
     // MoE routing scratch (one row at a time); empty for a dense model.
     let mut router = vec![0.0f32; if is_moe { p.n_expert } else { 0 }];
     let mut moe_tmp = vec![0.0f32; if is_moe { dim } else { 0 }];
@@ -1163,8 +1224,8 @@ fn prefill_residual<B: Backend + ?Sized>(
                     layer,
                     &xb[r * dim..r * dim + dim],
                     &mut xb2[r * dim..r * dim + dim],
-                    &mut hb[..hidden],
-                    &mut hb2[..hidden],
+                    &mut hb[..ff_w],
+                    &mut hb2[..ff_w],
                     &mut moe_tmp,
                     &mut router,
                 );
@@ -1436,17 +1497,22 @@ fn softmax_inplace(x: &mut [f32]) {
 }
 
 /// One token's mixture-of-experts FFN: route `xn` (the FFN-normed input row,
-/// length `dim`) through the top-k experts and write the weighted sum into `out`
+/// length `dim`) through the top-k experts and write the result into `out`
 /// (length `dim`).
 ///
-/// Mirrors llama.cpp's `build_moe_ffn` for the softmax-gated, top-k-renormalized
-/// case (Mixtral): softmax over **all** experts, pick the top `n_expert_used`,
-/// renormalize their probabilities to sum to 1, then accumulate each selected
-/// expert's SwiGLU/GeGLU output scaled by its weight. Ties are broken toward the
-/// lower expert index. The dense FFN path never calls this.
+/// Mirrors llama.cpp's `build_moe_ffn`: softmax over **all** experts, pick the
+/// top `n_expert_used` (ties → lower index), and accumulate each selected
+/// expert's SwiGLU/GeGLU output scaled by its weight. When
+/// `config.expert_weights_norm` (Mixtral) the selected weights are renormalized
+/// to sum to 1; when not (Qwen2-MoE) the raw softmax probabilities are used.
 ///
-/// Scratch (caller-owned, contents clobbered): `g`/`u` length `hidden_dim`,
-/// `tmp` length `dim`, `router` length `n_expert`.
+/// When the model has a shared expert (`config.n_ff_shexp > 0`, Qwen2-MoE) its
+/// always-on SwiGLU FFN, gated by `sigmoid(ffn_gate_inp_shexp · xn)`, is added to
+/// the routed output. The dense FFN path never calls this.
+///
+/// Scratch (caller-owned, contents clobbered): `g`/`u` length
+/// `≥ max(n_ff_exp, n_ff_shexp)` (sliced internally), `tmp` length `dim`,
+/// `router` length `n_expert`.
 #[allow(clippy::too_many_arguments)]
 fn moe_ffn_row<B: Backend + ?Sized>(
     model: &Model,
@@ -1462,13 +1528,13 @@ fn moe_ffn_row<B: Backend + ?Sized>(
     let p = &model.config;
     let w = &model.weights;
     let act = p.arch.ffn_activation();
+    let nf = p.n_ff_exp;
 
     // Router logits → softmax probabilities over all experts.
     backend.matmul(router, xn, &w.ffn_gate_inp[layer]);
     softmax_inplace(router);
 
-    // Select the top-k experts by probability (ties → lower index) and the sum
-    // of their probabilities (for renormalization).
+    // Select the top-k experts by probability (ties → lower index).
     let mut sel: Vec<(usize, f32)> = Vec::with_capacity(p.n_expert_used);
     for _ in 0..p.n_expert_used {
         let mut best = 0usize;
@@ -1481,21 +1547,44 @@ fn moe_ffn_row<B: Backend + ?Sized>(
         }
         sel.push((best, best_p));
     }
-    let wsum: f32 = sel.iter().map(|&(_, prob)| prob).sum();
+    // Mixtral renormalizes the selected weights to sum to 1; Qwen2-MoE does not.
+    let wsum: f32 = if p.expert_weights_norm {
+        sel.iter().map(|&(_, prob)| prob).sum()
+    } else {
+        1.0
+    };
 
-    // Weighted sum of the selected experts' FFN outputs.
+    // Weighted sum of the selected routed experts' FFN outputs.
     out.fill(0.0);
     for (e, prob) in sel {
         let weight = prob / wsum;
-        backend.matmul(g, xn, &w.w1_exp[layer][e]);
-        backend.matmul(u, xn, &w.w3_exp[layer][e]);
+        backend.matmul(&mut g[..nf], xn, &w.w1_exp[layer][e]);
+        backend.matmul(&mut u[..nf], xn, &w.w3_exp[layer][e]);
         match act {
-            FfnActivation::SwiGlu => backend.swiglu(g, u),
-            FfnActivation::GeGlu => backend.geglu(g, u),
+            FfnActivation::SwiGlu => backend.swiglu(&mut g[..nf], &u[..nf]),
+            FfnActivation::GeGlu => backend.geglu(&mut g[..nf], &u[..nf]),
         }
-        backend.matmul(tmp, g, &w.w2_exp[layer][e]);
+        backend.matmul(tmp, &g[..nf], &w.w2_exp[layer][e]);
         for (o, &t) in out.iter_mut().zip(tmp.iter()) {
             *o += weight * t;
+        }
+    }
+
+    // Qwen2-MoE shared expert: out += sigmoid(gate · xn) · SwiGLU_shared(xn).
+    if p.n_ff_shexp > 0 {
+        let ns = p.n_ff_shexp;
+        let mut gate = [0.0f32];
+        backend.matmul(&mut gate, xn, &w.ffn_gate_inp_shexp[layer]);
+        let sig = 1.0 / (1.0 + (-gate[0]).exp());
+        backend.matmul(&mut g[..ns], xn, &w.w1_shexp[layer]);
+        backend.matmul(&mut u[..ns], xn, &w.w3_shexp[layer]);
+        match act {
+            FfnActivation::SwiGlu => backend.swiglu(&mut g[..ns], &u[..ns]),
+            FfnActivation::GeGlu => backend.geglu(&mut g[..ns], &u[..ns]),
+        }
+        backend.matmul(tmp, &g[..ns], &w.w2_shexp[layer]);
+        for (o, &t) in out.iter_mut().zip(tmp.iter()) {
+            *o += sig * t;
         }
     }
 }
@@ -1770,6 +1859,82 @@ mod tests {
         backend.matmul(&mut want, &ge, &m.weights.w2_exp[0][best]);
         for (o, w) in out.iter().zip(&want) {
             assert!((o - w).abs() < 1e-6, "top1 out {o} vs expert {w}");
+        }
+    }
+
+    #[test]
+    fn qwen2moe_ffn_row_routed_no_renorm_plus_shared() {
+        // Qwen2-MoE: routed top-k with RAW softmax probs (no renormalization)
+        // plus a sigmoid-gated shared SwiGLU expert at its own `n_ff_shexp`.
+        let c = Config {
+            dim: 8,
+            hidden_dim: 16,
+            n_layers: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            vocab_size: 16,
+            seq_len: 8,
+            ..Default::default()
+        };
+        let bytes = crate::dummy::synthetic_gguf_qwen2moe(&c, 4, 2, 12, 20);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let m = Model::from_gguf(&gguf).unwrap();
+        assert_eq!(m.config.arch, Arch::Qwen2Moe);
+        assert_eq!((m.config.n_ff_exp, m.config.n_ff_shexp), (12, 20));
+        assert!(!m.config.expert_weights_norm);
+        // Shapes: routed experts at n_ff_exp, shared at n_ff_shexp, gate is (1,dim).
+        assert_eq!(m.weights.w1_exp[0][0].rows(), 12);
+        assert_eq!(m.weights.w1_shexp[0].rows(), 20);
+        assert_eq!(m.weights.w2_shexp[0].cols(), 20);
+        assert_eq!(m.weights.ffn_gate_inp_shexp[0].rows(), 1);
+        assert_eq!(m.weights.ffn_gate_inp_shexp[0].cols(), 8);
+
+        let backend = crate::backend::CpuBackend::new();
+        let (dim, ne) = (m.config.dim, m.config.n_expert);
+        let (nfe, nfs) = (m.config.n_ff_exp, m.config.n_ff_shexp);
+        let xn: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.4 - 0.7).sin()).collect();
+
+        let mut out = vec![0.0; dim];
+        let w = nfe.max(nfs);
+        let (mut g, mut u, mut tmp, mut router) =
+            (vec![0.0; w], vec![0.0; w], vec![0.0; dim], vec![0.0; ne]);
+        moe_ffn_row(&m, &backend, 0, &xn, &mut out, &mut g, &mut u, &mut tmp, &mut router);
+
+        // Reference. Routed: softmax over all experts, top-k by prob (ties → lower
+        // index), weights = RAW probs (NOT renormalized — the Qwen2-MoE delta).
+        let mut probs = vec![0.0; ne];
+        backend.matmul(&mut probs, &xn, &m.weights.ffn_gate_inp[0]);
+        softmax_inplace(&mut probs);
+        let mut idx: Vec<usize> = (0..ne).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b)));
+        let mut want = vec![0.0; dim];
+        for &e in idx.iter().take(m.config.n_expert_used) {
+            let (mut ge, mut ue) = (vec![0.0; nfe], vec![0.0; nfe]);
+            backend.matmul(&mut ge, &xn, &m.weights.w1_exp[0][e]);
+            backend.matmul(&mut ue, &xn, &m.weights.w3_exp[0][e]);
+            backend.swiglu(&mut ge, &ue);
+            let mut de = vec![0.0; dim];
+            backend.matmul(&mut de, &ge, &m.weights.w2_exp[0][e]);
+            for (wv, &d) in want.iter_mut().zip(&de) {
+                *wv += probs[e] * d;
+            }
+        }
+        // Shared: sigmoid(gate · xn) * SwiGLU_shared(xn), added to the routed sum.
+        let mut gate = [0.0f32];
+        backend.matmul(&mut gate, &xn, &m.weights.ffn_gate_inp_shexp[0]);
+        let sig = 1.0 / (1.0 + (-gate[0]).exp());
+        let (mut gs, mut us) = (vec![0.0; nfs], vec![0.0; nfs]);
+        backend.matmul(&mut gs, &xn, &m.weights.w1_shexp[0]);
+        backend.matmul(&mut us, &xn, &m.weights.w3_shexp[0]);
+        backend.swiglu(&mut gs, &us);
+        let mut ds = vec![0.0; dim];
+        backend.matmul(&mut ds, &gs, &m.weights.w2_shexp[0]);
+        for (wv, &d) in want.iter_mut().zip(&ds) {
+            *wv += sig * d;
+        }
+
+        for (o, wv) in out.iter().zip(&want) {
+            assert!((o - wv).abs() < 1e-5, "qwen2moe out {o} vs ref {wv}");
         }
     }
 }
