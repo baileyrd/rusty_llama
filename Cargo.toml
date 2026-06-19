@@ -18,6 +18,13 @@ serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 wgpu = { version = "29.0.3", optional = true }
 
+# `thin` LTO + `codegen-units=1` is deliberate. Measured 2026-06-19 on the
+# TinyLlama-Q4_K_M CPU path: `lto="fat"` is a wash-to-slightly-worse, and full PGO
+# (instrument → profile → profile-use) regressed ~3% prefill / ~2% decode in an
+# interleaved A/B (4/4 rounds). The hot path is autovectorized SIMD kernels that
+# `opt-level=3` + `codegen-units=1` + `target-cpu=native` already optimize; whole-
+# program LTO and profile-guided block-layout disrupt that codegen. Don't "upgrade"
+# to fat-LTO/PGO without re-measuring. See BACKLOG.md "L4".
 [profile.release]
 opt-level = 3
 lto = "thin"

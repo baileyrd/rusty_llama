@@ -183,8 +183,15 @@ cool machine; numbers below are reasoned, not all freshly benched.
   (quantized 3×), gate/up share theirs (2×); decode (`forward`) and prefill
   (`matmul_batch` re-quantizes shared `xb`) both pay it. Quantize once per shared
   input. Bounded, ~few %.
-- [ ] **L4. PGO + fat-LTO build.** Profile-guided + `lto="fat"` often buys a few %
-  across every path for ~zero code risk. Cheapest experiment; try first.
+- [✗] **L4. PGO + fat-LTO — SPIKED, RULED OUT.** Both regress this workload.
+  `lto="fat"` (vs the current `"thin"`+`codegen-units=1`): no win, wash-to-slightly-worse.
+  **PGO** (instrument → real-generation profile → `profile-use` rebuild), measured
+  with an *interleaved* plain-vs-PGO A/B to cancel thermal drift: **−3% prefill
+  (~199 → ~193 t/s) and −2% decode (49 → 48), in all 4/4 rounds.** Root cause: the
+  hot path is already-optimal autovectorized SIMD loops (`opt-level=3` +
+  `codegen-units=1` + `target-cpu=native` already nail them); whole-program LTO and
+  profile-guided inlining/block-layout are tuned for *branchy* code and disrupt the
+  hand-tuned numeric kernels. The build is already well-tuned — nothing to reclaim here.
 - [ ] **L5. CPU RoPE cos/sin recompute.** `CpuBackend::rope` recomputes cos/sin
   per head (~32× redundant); precompute the `head_size/2` values per position.
   Small (~1-2%), bit-exact.
@@ -201,5 +208,7 @@ cool machine; numbers below are reasoned, not all freshly benched.
 - [ ] **L10. wgpu megakernel** (collapse the ~300 serial compute passes/step) for
   the non-NVIDIA path (wgpu ~8× behind, overhead-bound not tensor-core-bound).
 
-Order: **L1 ruled out** (occupancy regression). Next bounded: **L4 (PGO/LTO) →
-L2 (CPU threading, needs a cool machine)**, then the treadmill (L7-L10) if worth it.
+Order: **L1 + L4 both ruled out** (occupancy regression; LTO/PGO disrupt the SIMD
+kernels). Two of the three "easy" GPU/build levers are dead — the codegen is already
+tuned. Next bounded: **L2 (CPU threading, needs a cool machine)**, else L3/L5/L6
+(small, bit-exact CPU tweaks), then the treadmill (L7-L10) only if worth it.
