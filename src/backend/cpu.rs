@@ -11,8 +11,8 @@ use rayon::prelude::*;
 use crate::backend::Backend;
 use crate::math::silu;
 use crate::quant::{
-    dequant_block, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0, vec_dot_q4_k,
-    vec_dot_q6_k, vec_dot_q8_0, GgmlType, Q8Activation, Q8KActivation, MAX_BLOCK,
+    dequant_block, dequantize_into, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0,
+    vec_dot_q4_k, vec_dot_q6_k, vec_dot_q8_0, GgmlType, Q8Activation, Q8KActivation, MAX_BLOCK,
 };
 use crate::tensor::QMatrix;
 
@@ -103,6 +103,125 @@ impl Backend for CpuBackend {
                 }
             }
         }
+    }
+
+    /// Cache-blocked batched matmul — *the prefill GEMM*.
+    ///
+    /// The default trait impl loops the single-row [`Self::matmul`] per token,
+    /// which re-streams the **entire** weight matrix from RAM once per token: an
+    /// N-token prefill then pays N passes over the weights and runs at decode
+    /// bandwidth (zero reuse). Here every weight row is streamed **once** and
+    /// dot-producted against all `rows` activation columns (quantized up front),
+    /// so prefill becomes compute-bound like llama.cpp's chunked-row GEMM.
+    ///
+    /// Bit-identical to the default: it calls the same `vec_dot_*` kernels on the
+    /// same per-row quantized activations, only reordered for weight reuse.
+    fn matmul_batch(&self, out: &mut [f32], x: &[f32], w: &QMatrix, rows: usize) {
+        let (oc, ic) = (w.rows(), w.cols());
+        debug_assert_eq!(out.len(), rows * oc);
+        debug_assert_eq!(x.len(), rows * ic);
+        // A/B toggle: the pre-blocking per-row GEMV (re-streams the whole weight
+        // matrix once per token) for honest before/after benchmarking. Off by
+        // default; mirrors the `RUSTY_LLAMA_NO_AVX2`/`NO_INT8` perf toggles.
+        if std::env::var_os("RUSTY_LLAMA_NO_BLOCKED_GEMM").is_some() {
+            for r in 0..rows {
+                self.matmul(&mut out[r * oc..r * oc + oc], &x[r * ic..r * ic + ic], w);
+            }
+            return;
+        }
+        // No reuse to exploit for 0/1 rows — the plain GEMV is already optimal.
+        if rows <= 1 {
+            if rows == 1 {
+                self.matmul(&mut out[..oc], &x[..ic], w);
+            }
+            return;
+        }
+        let xr = |r: usize| &x[r * ic..r * ic + ic];
+        // Transposed scratch `(oc, rows)`: each weight row maps to one
+        // contiguous column, so it is read from RAM once and reused across every
+        // token instead of re-streamed per token.
+        let mut tmp = vec![0.0f32; oc * rows];
+        match w {
+            QMatrix::F32 { data, cols, .. } => {
+                let cols = *cols;
+                tmp.par_chunks_mut(rows).enumerate().for_each(|(i, col)| {
+                    let wrow = &data[i * cols..i * cols + cols];
+                    for (r, o) in col.iter_mut().enumerate() {
+                        *o = wrow.iter().zip(xr(r)).map(|(&a, &b)| a * b).sum();
+                    }
+                });
+            }
+            QMatrix::Quant { ty, data, cols, .. } => {
+                let rb = ty.bytes_for(*cols);
+                let row = |i: usize| &data[i * rb..i * rb + rb];
+                match ty {
+                    GgmlType::Q8_0 | GgmlType::Q4_0 => {
+                        let acts: Vec<Q8Activation> = (0..rows)
+                            .into_par_iter()
+                            .map(|r| quantize_activation_q8(xr(r)))
+                            .collect();
+                        let dot: fn(&[u8], &Q8Activation) -> f32 = match ty {
+                            GgmlType::Q8_0 => vec_dot_q8_0,
+                            _ => vec_dot_q4_0,
+                        };
+                        tmp.par_chunks_mut(rows).enumerate().for_each(|(i, col)| {
+                            let wr = row(i);
+                            for (r, o) in col.iter_mut().enumerate() {
+                                *o = dot(wr, &acts[r]);
+                            }
+                        });
+                    }
+                    GgmlType::Q4_K | GgmlType::Q6_K => {
+                        let acts: Vec<Q8KActivation> = (0..rows)
+                            .into_par_iter()
+                            .map(|r| quantize_activation_q8k(xr(r)))
+                            .collect();
+                        let dot: fn(&[u8], &Q8KActivation) -> f32 = match ty {
+                            GgmlType::Q4_K => vec_dot_q4_k,
+                            _ => vec_dot_q6_k,
+                        };
+                        tmp.par_chunks_mut(rows).enumerate().for_each(|(i, col)| {
+                            let wr = row(i);
+                            for (r, o) in col.iter_mut().enumerate() {
+                                *o = dot(wr, &acts[r]);
+                            }
+                        });
+                    }
+                    // F16 (block size 1): dequantize each weight row once and
+                    // reuse it. A sequential dot over the dequantized row is
+                    // bit-identical to `dot_quant_row`, which at block size 1 also
+                    // accumulates element by element.
+                    _ => {
+                        let ty = *ty;
+                        tmp.par_chunks_mut(rows).enumerate().for_each(|(i, col)| {
+                            let mut wbuf = vec![0.0f32; ic];
+                            dequantize_into(ty, row(i), &mut wbuf).expect("dequant weight row");
+                            for (r, o) in col.iter_mut().enumerate() {
+                                *o = wbuf.iter().zip(xr(r)).map(|(&a, &b)| a * b).sum();
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        // Transpose the `(oc, rows)` scratch into the row-major `(rows, oc)`
+        // output. Cache-blocked T×T tiles so the strided side reuses each loaded
+        // cache line across the tile instead of thrashing the 11 MB scratch;
+        // parallel over output-row tiles (each owns a disjoint contiguous block).
+        const T: usize = 32;
+        out.par_chunks_mut(T * oc).enumerate().for_each(|(blk, oblk)| {
+            let r0 = blk * T;
+            let rb = oblk.len() / oc; // T, or the final remainder
+            for i0 in (0..oc).step_by(T) {
+                let iend = (i0 + T).min(oc);
+                for rl in 0..rb {
+                    let dst = &mut oblk[rl * oc + i0..rl * oc + iend];
+                    for (k, o) in dst.iter_mut().enumerate() {
+                        *o = tmp[(i0 + k) * rows + r0 + rl];
+                    }
+                }
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -399,6 +518,58 @@ mod tests {
             "Q4_K {rows}x{cols} x{iters}: dequant={dequant:?} int8={int8:?} \
              speedup={:.2}x (sink={sink})",
             dequant.as_secs_f64() / int8.as_secs_f64()
+        );
+    }
+
+    /// Clean CPU-only real-model throughput (prefill `pp512` + decode `tg128`) on
+    /// the actual GGUF — isolated from any GPU work (no thermal contamination)
+    /// and on the rigorous `llama-bench` protocol (1 untimed warmup + r timed
+    /// reps, `RunState` reused so the KV cache is not re-zeroed in the timed
+    /// region). Set `RUSTY_LLAMA_GGUF` to override the path. Compare against
+    /// `llamacpp_bench/lc/llama-bench.exe -m <gguf> -ngl 0`.
+    #[test]
+    #[ignore = "needs the real GGUF; run with --release -- --ignored --nocapture"]
+    fn bench_prefill_decode_real_cpu() {
+        use crate::bench_util::{bench_reps, bench_stat};
+        use std::time::Duration;
+        let path = std::env::var("RUSTY_LLAMA_GGUF")
+            .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string());
+        let cp = match crate::Checkpoint::open(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipping CPU real-model bench: can't open {path}: {e}");
+                return;
+            }
+        };
+        if !crate::Gguf::is_gguf(cp.bytes()) {
+            eprintln!("skipping CPU real-model bench: {path} is not a GGUF");
+            return;
+        }
+        let gguf = crate::Gguf::parse(cp.bytes()).expect("parse gguf");
+        let model = crate::Model::from_gguf(&gguf).expect("build model");
+        let c = &model.config;
+        let b = CpuBackend::new();
+        let reps = bench_reps();
+
+        let n = 512.min(c.seq_len);
+        let tokens: Vec<usize> = (0..n).map(|i| (i * 7 + 1) % c.vocab_size).collect();
+        let mut ps = crate::RunState::new(&model.config);
+        let (pp, pp_sd) = bench_stat(n, reps, Duration::from_secs(3), || {
+            b.forward_prefill(&model, &mut ps, &tokens, 0);
+        });
+
+        let steps = 128usize;
+        let mut ds = crate::RunState::new(&model.config);
+        let (tg, tg_sd) = bench_stat(steps, reps, Duration::from_secs(3), || {
+            for pos in 0..steps {
+                b.forward_step(&model, &mut ds, (pos * 13 + 1) % c.vocab_size, pos);
+            }
+        });
+
+        eprintln!(
+            "CPU real-model {path}: pp{n} {pp:.0} ± {pp_sd:.0} tok/s  \
+             tg{steps} {tg:.0} ± {tg_sd:.0} tok/s  \
+             (compare: llama-bench -m <gguf> -ngl 0 -p {n} -n {steps} -r {reps})"
         );
     }
 

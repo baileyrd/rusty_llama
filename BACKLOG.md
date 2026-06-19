@@ -113,12 +113,15 @@ TL;DR: the dominant gaps vs llama.cpp are **recoverable engineering overhead, no
 hardware walls** — snapshot parity is reachable on 3 of 4 paths, CUDA prefill
 lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge each):
 
-- [ ] **6.1 CPU cache-blocked prefill GEMM.** `CpuBackend` overrides no batched
-  op, so prefill loops single-row `matmul` (`mod.rs:143-148`) and re-streams the
-  whole weight set per token — pp512 ~44 t/s vs llama.cpp 6047 (**~130×**).
-  Override `matmul_batch` with a cache-blocked int8 GEMM (quantize N activations
-  once, stream each weight super-block once, tile output rows to L2). Target
-  ~130× → ~1.5×. Parity is bit-identical (dots unchanged).
+- [x] **6.1 CPU cache-blocked prefill GEMM — DONE (PR pending).** `CpuBackend`
+  overrode no batched op, so prefill looped single-row `matmul` (`mod.rs:143-148`)
+  and re-streamed the whole weight set per token. Added a cache-blocked
+  `matmul_batch` (quantize N activations once, stream each weight row once, reuse
+  across tokens, blocked transpose to row-major) + a clean CPU real-model bench +
+  a `RUSTY_LLAMA_NO_BLOCKED_GEMM` A/B toggle. **Measured pp512 64 → 113 t/s
+  (1.77×)**, decode unchanged, bit-identical (parity tests pass). Far below the
+  ~130× projection: prefill is compute-bound on the un-tuned `vec_dot` kernel, so
+  the dominant CPU lever is 6.4 (kernel tuning) — they compound.
 - [ ] **6.2 CUDA-graph decode capture.** Decode issues ~445 launches/step with no
   graph (`cuda.rs:1143-1197`); rusty hits 127 GB/s vs llama.cpp 252 (both far
   below peak ⇒ launch-bound). Capture+replay one CUDA graph/token (needs
