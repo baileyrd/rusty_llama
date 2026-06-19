@@ -25,8 +25,8 @@ The roadmap is defined in `PERFORMANCE.md` §"Improvement roadmap". Status:
 | 1 | **CPU AVX2 integer quant kernels** | ✅ DONE — `vpmaddubsw`+`vpmaddwd` int8 dot for Q4_K/Q6_K/Q8_0/Q4_0, dispatched VNNI→AVX2→scalar (`src/quant.rs`); +36% CPU decode (36.7→49.8 tok/s), bit-identical to scalar. VNNI path present but **dormant** on the dev box (no AVX-512). NEON still TODO. (`BACKLOG.md` #3) |
 | 2 | **GPU int8 / DP4A decode** | ✅ (CUDA) / 🟡 (wgpu) — **CUDA packed-weight DP4A GEMV ADOPTED** (Phase 2): warp-cooperative, coalesced Q4_K/Q6_K `__dp4a` decode GEMV (`quantize_q8k` + `gemv_q4_k`/`gemv_q6_k`), default-on, **2.4× decode** (86→207 tok/s on real TinyLlama; plan [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md)). The wgpu Stage-2 stays parked (int8 vs an already-packed dequant GEMV saves no bytes); the CUDA win is real because its baseline was f16. (`02`/`03`/`04`) |
 | 3 | **GPU tensor cores** | ✅ (CUDA) / ❌ (portable) — portable wgpu coopmat **ruled out** on this hardware (advertises only f16 16×16; wgpu 29 wires only 8×8 f32 → silent all-zero garbage). CUDA backend M0→M2b + resident decode **DONE and merged** (PRs #20–#22). Closed PR #23: a naive packed dequant-GEMV was ~1.6× *slower* than f16. (`03`/`04`) |
-| 4 | Flash attention; cache-blocked CPU prefill | ❌ not started |
-| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 archs** (Qwen2/Phi-3/Gemma 2) **+ 3.2 MoE (Mixtral + Qwen2-MoE) + 4.1 server + 4.2 continuous batching + 5.1 GBNF grammar SHIPPED**: OpenAI HTTP server (`server` feature) with streaming SSE, a continuous-batching scheduler (`Batch::decode_step`), grammar-constrained / JSON output, and routed + shared-expert mixture-of-experts ([`plans/phase-3-archs.md`](plans/phase-3-archs.md), [`plans/phase-4-server.md`](plans/phase-4-server.md), [`plans/phase-5-grammar.md`](plans/phase-5-grammar.md)). KV-quant ❌; 4.3 paged KV, 5.2 flash attention, 3.3 recurrent remain. |
+| 4 | Flash attention; cache-blocked CPU prefill | 🟡 PARTIAL — **flash (online-softmax) attention SHIPPED (Phase 5.2)** on the CPU oracle + CUDA resident decode: no `seq_len` score buffer (CPU drops the `att` scratch; CUDA no longer caps context by shared memory — validated to 16 384 tokens), decode-throughput-neutral ([`plans/phase-5-flash-attention.md`](plans/phase-5-flash-attention.md)). Cache-blocked CPU prefill ❌. |
+| 5 | **Breadth** (archs, samplers, KV-quant, server) | 🟡 PARTIAL — **Phase 3.1 archs** (Qwen2/Phi-3/Gemma 2) **+ 3.2 MoE (Mixtral + Qwen2-MoE) + 4.1 server + 4.2 continuous batching + 5.1 GBNF grammar + 5.2 flash attention SHIPPED**: OpenAI HTTP server (`server` feature) with streaming SSE, a continuous-batching scheduler (`Batch::decode_step`), grammar-constrained / JSON output, routed + shared-expert mixture-of-experts, and online-softmax attention ([`plans/phase-3-archs.md`](plans/phase-3-archs.md), [`plans/phase-4-server.md`](plans/phase-4-server.md), [`plans/phase-5-grammar.md`](plans/phase-5-grammar.md), [`plans/phase-5-flash-attention.md`](plans/phase-5-flash-attention.md)). KV-quant ❌; 4.3 paged KV, 3.3 recurrent remain. |
 
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ TinyLlama-1.1B Q4_K_M; Core Ultra 9 285H (AVX2, no AVX-512) + RTX 5070 Ti
 Two distinct walls (see `04` and `../Research/03-cuda-kernels.md`):
 - **Decode ~2× (was ~3.4×) — bandwidth wall closed (Phase 2).** The packed
   Q4_K/Q6_K `__dp4a` GEMV streams ~0.56 B/weight vs f16's ~2 B — CUDA decode
-  86 → 207 tok/s same-session (2.4×). The residual ~2× is kernel tuning + flash attn.
+  86 → 207 tok/s same-session (2.4×). The residual ~2× is kernel/GEMV tuning — **flash attention (Phase 5.2) was measured decode-neutral**, confirming attention is not the decode bottleneck.
 - **Prefill ~4.4× = GEMM kernel quality.** cuBLASLt `Matmul<f16>` + our nvrtc
   kernels vs llama.cpp's fused int8 tensor-core MMQ. Now compute-bound (per-op
   overhead already cut), so further gains require beating cuBLASLt.
@@ -61,7 +61,7 @@ Two distinct walls (see `04` and `../Research/03-cuda-kernels.md`):
 | Quant (produce) | only `quantize_q8_0` (test fixtures); no quantize-to-disk | `05` |
 | Tokenizers | SPM + GPT-2 BPE (GPT-2/Llama-3/Qwen2 pretokenizers) | `07` |
 | Samplers | greedy / temperature / multinomial / top-p / top-k / min-p / penalties; **GBNF grammar-constrained decoding** (Phase 5.1) | `07`,`plans/phase-5-grammar.md` |
-| KV-cache | single-sequence flat per-layer f32 (resident on GPU/CUDA) + multi-sequence batched decode (server scheduler, per-slot KV) | `01`,`03`,`04`,`plans/phase-4-server.md` |
+| KV-cache / attention | single-sequence flat per-layer f32 (resident on GPU/CUDA) + multi-sequence batched decode (server scheduler, per-slot KV); **flash (online-softmax) attention** (Phase 5.2) — no `seq_len` score buffer, context not shared-mem-bound | `01`,`03`,`04`,`plans/phase-4-server.md`,`plans/phase-5-flash-attention.md` |
 | Loading | single-file GGUF (v2/3) + llama2.c; mmap zero-copy; no sharding/validation/async | `06` |
 | Backends | CPU (oracle) + wgpu + CUDA | `02`,`03`,`04` |
 | Serving | OpenAI HTTP server + continuous batching (`server` feature; Phase 4.1/4.2), with `grammar` / `response_format` JSON constraints (Phase 5.1); LoRA + embeddings shipped (Phase 1); multimodal: none | `plans/phase-4-server.md`,`plans/phase-5-grammar.md` |
@@ -120,8 +120,10 @@ than HANDOFF assumed** — llama.cpp's `mmvq` is a concrete, proven design to po
 
 **Tier 4 — defer / proven dead-ends:**
 - Portable wgpu coopmat (ruled out), scalar DP4A for k-quants (loses),
-  multimodal, distributed/RPC, i-quant/MXFP4 formats. Keep KV resident across
-  prefill→decode and flash attention are minor decode wins if revisited.
+  multimodal, distributed/RPC, i-quant/MXFP4 formats. KV is already resident
+  across prefill→decode; **flash attention is done (Phase 5.2)** — confirmed
+  decode-neutral (attention isn't the decode bottleneck), adopted for the
+  long-context / memory win.
 
 ─────────────────────────────────────────────────────────────────────────────
 
