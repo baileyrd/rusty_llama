@@ -13,9 +13,11 @@
 //! pointlessly slow. Instead, matmul weights are uploaded **once** and cached,
 //! keyed on the weight's data pointer (stable across tokens, since the weights
 //! are borrowed from the mmap'd file / owned by the [`Model`](crate::model)).
-//! Quantized weights are dequantized to f32 on the host at upload time, so a
-//! single f32 matmul shader covers every `GgmlType`. The small RoPE inverse-
-//! frequency table is cached the same way.
+//! Quantized weights that have an in-shader dequant kernel (Q4_K/Q6_K/Q8_0) are
+//! kept **packed** on device and decompressed inside the matmul (so decode
+//! streams ~4× less than f32); every other `GgmlType` is dequantized to f32 on
+//! the host at upload. The small RoPE inverse-frequency table is cached the
+//! same way.
 //!
 //! Activations (the residual stream, the KV-cache slices, attention scratch)
 //! are small and re-passed by the trait every call, so they are uploaded per
