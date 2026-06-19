@@ -2,9 +2,9 @@
 
 > Detailed plan for **Phase 3** of the master plan
 > [`../10-evolution-plan.md`](../10-evolution-plan.md) (§Phase 3, lines 126–139).
-> **Phase 3.1 is SHIPPED** and is documented below as built; **3.2 (MoE)** and
-> **3.3 (recurrent)** remain master-plan sketches and are kept here only as
-> non-goals/remaining work. Sibling phase docs: Phase 0
+> **Phase 3.1 and 3.2 are SHIPPED** and documented below as built; **3.3
+> (recurrent)** remains a master-plan sketch, kept here only as remaining work.
+> Sibling phase docs: Phase 0
 > ([`phase-0-foundations.md`](phase-0-foundations.md), §0.2 — the `Arch` enum +
 > `TensorNames` seam this extends), Phase 1
 > ([`phase-1-breadth.md`](phase-1-breadth.md), §1.1 sampler chain / §1.4 chat
@@ -283,16 +283,59 @@ These run with no network and no real GGUF, exactly as `tests/gguf.rs` does toda
 
 ─────────────────────────────────────────────────────────────────────────────
 
-## 3.2 — MoE (Mixtral / Qwen-MoE) — sketch (remaining)
+## 3.2 — MoE (Mixtral) — SHIPPED
 
-Still a master-plan sketch; **not built**. The blocker is the expert path: MoE needs
-a **`MUL_MAT_ID`-equivalent expert-gather op** — select top-k experts per token and
-do a weighted matmul over only those experts' weights. That is a genuinely new
-`Backend` op (today's `matmul` has no per-token expert index), so it follows the
-oracle-first discipline: **CPU implementation first** (the parity oracle), then a
-CUDA kernel validated bit-for-bit against it, then wiring the router + gate into the
-graph as a Gemma-style declarative delta. **Effort: L.** Deepen this once a concrete
-MoE target model is chosen (master plan §D2: "3.2 if a MoE model is a target").
+Mixtral-style routed mixture-of-experts. The key design call: rather than the
+`MUL_MAT_ID`-equivalent fused expert-gather op the original sketch anticipated,
+the FFN is expressed as **host-side routing composed with the existing per-row
+`matmul`** — so it is correct and identical on every backend (CPU oracle, GPU,
+CUDA per-op) with no new `Backend` method. The fused gather is left as a
+decode-speed follow-on.
+
+**MoE is not an `Arch` variant** — Mixtral's `general.architecture` is `llama`.
+It is selected by the GGUF hparams `{arch}.expert_count` / `expert_used_count`
+(`Config::n_expert` / `n_expert_used`); `n_expert > 0` switches the FFN to the
+routed path. This mirrors llama.cpp, where MoE is a property of the layer graph,
+not the arch name.
+
+- **Loading** (`Model::from_gguf`): when `n_expert > 0`, each layer loads a router
+  (`ffn_gate_inp`, a `(n_expert, dim)` projection) plus three stacked expert
+  tensors (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`), each a 3-D
+  `(n_expert, rows, cols)` GGUF tensor. A new `qmatrix_from_gguf_3d` flattens the
+  expert axis into the row axis and `split_rows` carves the per-expert
+  `(rows, cols)` matrices (expert-major, contiguous bytes — zero-copy, quantized
+  or F32). The dense `w1`/`w2`/`w3` stay empty (and vice-versa). New tensor names
+  added to the shared `TensorNames` table; the four MoE names are the only
+  additions.
+- **Forward** (`moe_ffn_row`): router logits → softmax over **all** experts →
+  top-`k` by probability (ties → lower index) → renormalize the selected
+  probabilities to sum to 1 → accumulate each selected expert's SwiGLU/GeGLU
+  output scaled by its weight. Matches llama.cpp's `build_moe_ffn` for the
+  softmax-gated, top-k-renormalized case. The single helper is shared by all
+  three forward paths (`forward_with`, `prefill_residual`, `Batch::decode_step`),
+  which branch dense-vs-MoE only at the FFN block; routing is per-token, so the
+  MoE FFN runs row-by-row (no batch GEMM) while the dense path keeps its batched
+  matmuls.
+- **Resident decode gate**: Mixtral is `Arch::Llama`, so the CUDA/GPU fused
+  resident decode would otherwise claim it. `Config::uses_resident_decode()` now
+  also requires `n_expert == 0`, routing MoE to the generic per-op path on every
+  backend.
+
+**Validation.** Numeric parity unit tests: `moe_ffn_row` vs an independent
+weighted-expert-sum reference (`n_expert_used == n_expert`), and top-1 selecting
+exactly the argmax expert (weight renormalized to 1). End-to-end: a synthetic
+Mixtral GGUF (`dummy::synthetic_gguf_moe`) loads with the right shapes, prefill
+is finite, greedy generation is reproducible, batched `decode_step` is
+bit-identical to independent per-sequence runs, and prefill is bit-identical to
+the sequential path. **No real-Mixtral-vs-`llama-cli` greedy check yet** — no MoE
+GGUF is in the repo (Mixtral Q4 is ~26 GB); the synthetic parity tests check the
+routing math from scratch. **Effort: M.**
+
+**Remaining / follow-ons.** (1) **Qwen2-MoE shared experts** — an always-on
+shared FFN plus a sigmoid shared-expert gate added to the routed output; a clean
+additive delta on `moe_ffn_row` once a target lands. (2) **Fused `MUL_MAT_ID`
+gather** — the per-row expert GEMVs are correctness-first, not a fused
+device-side gather; a decode-speed follow-on (and the resident-decode path).
 
 ## 3.3 — Recurrent (Mamba / RWKV) — sketch (remaining)
 
@@ -306,8 +349,8 @@ model** plus new ops (selective scan / WKV). It is large and cleanly separable f
 
 ## Non-goals / remaining
 
-- **3.2 MoE** — needs a `MUL_MAT_ID`-equivalent expert-gather op, CPU-oracle first
-  then CUDA; deferred until a MoE model is a target.
+- **3.2 MoE (Mixtral)** — ✅ SHIPPED (see §3.2 above). Remaining: Qwen2-MoE shared
+  experts, and a fused `MUL_MAT_ID` gather for decode speed.
 - **3.3 recurrent (Mamba / RWKV)** — a separate state model (not a KV cache) + new
   ops; large and separable; deferred.
 - **Large-model NeoX rope** — 3.1 pays an owned Q/K (and bias) copy at load to keep

@@ -183,6 +183,7 @@ and that greedy generation reproduces.
 - [x] CUDA packed-weight DP4A decode GEMV — Q4_K/Q6_K weights stay packed, `__dp4a` against an on-device Q8_K activation: **2.4× decode** (86 → 207 tok/s on TinyLlama Q4_K_M), default-on
 - [x] OpenAI-compatible HTTP server (`--serve`, `server` feature): `/v1/chat/completions` + `/v1/completions`, streaming SSE, any backend, with a **continuous-batching scheduler** (`RUSTY_LLAMA_BATCH`) that batches concurrent requests' decode (paged KV for memory efficiency is the next step)
 - [x] GBNF **grammar-constrained decoding** for structured output: a parser + byte-NFA matcher + a `GrammarStage` on the sampler chain — CLI `--grammar` / `--grammar-file`, server `grammar` field + `response_format: {"type":"json_object"}` (validated: constrained output emits well-formed JSON)
+- [x] **Mixture-of-experts** (Mixtral): routed top-k experts selected by the GGUF `expert_count` / `expert_used_count` hparams (Mixtral's arch is `llama`) — router softmax → top-k → renormalize → weighted SwiGLU sum, composed from the existing per-row matmul so it's correct on every backend; 3-D expert stacks split per-expert at load. Validated by numeric routing-parity + synthetic-GGUF end-to-end
 
 See [`BACKLOG.md`](BACKLOG.md) for the history of these items.
 

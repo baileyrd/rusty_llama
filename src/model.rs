@@ -54,6 +54,15 @@ pub struct Weights<'a> {
     /// flattened `(n_layers, dim)`. Empty unless `arch.sandwich_norm()`.
     pub rms_attn_post: Vec<f32>,
     pub rms_ffn_post: Vec<f32>,
+    /// MoE router projection per layer, each `(n_expert, dim)`. Empty for a
+    /// dense model; populated when `config.n_expert > 0` (Mixtral).
+    pub ffn_gate_inp: Vec<QMatrix<'a>>,
+    /// MoE expert projections, `[layer][expert]`: gate `(hidden_dim, dim)`, down
+    /// `(dim, hidden_dim)`, up `(hidden_dim, dim)`. Empty for a dense model. When
+    /// these are populated `w1`/`w2`/`w3` are empty, and vice-versa.
+    pub w1_exp: Vec<Vec<QMatrix<'a>>>,
+    pub w2_exp: Vec<Vec<QMatrix<'a>>>,
+    pub w3_exp: Vec<Vec<QMatrix<'a>>>,
 }
 
 /// A parsed model: hyper-parameters plus weights.
@@ -135,6 +144,10 @@ impl<'a> Model<'a> {
                 bv: Vec::new(),
                 rms_attn_post: Vec::new(),
                 rms_ffn_post: Vec::new(),
+                ffn_gate_inp: Vec::new(),
+                w1_exp: Vec::new(),
+                w2_exp: Vec::new(),
+                w3_exp: Vec::new(),
             },
         })
     }
@@ -162,6 +175,9 @@ impl<'a> Model<'a> {
             .meta_u64(&key("attention.head_count_kv"))
             .unwrap_or(n_heads as u64) as usize;
         let hidden_dim = gguf.meta_u64(&key("feed_forward_length"))? as usize;
+        // Mixture-of-experts counts (absent ⇒ 0 ⇒ a dense FFN).
+        let n_expert = gguf.meta_u64(&key("expert_count")).unwrap_or(0) as usize;
+        let n_expert_used = gguf.meta_u64(&key("expert_used_count")).unwrap_or(0) as usize;
         let seq_len = gguf.meta_u64(&key("context_length"))? as usize;
         let rope_freq_base = gguf.meta_f32(&key("rope.freq_base")).unwrap_or(10000.0);
         let rms_eps = gguf
@@ -230,6 +246,8 @@ impl<'a> Model<'a> {
             embd_scale,
             attn_logit_softcap,
             final_logit_softcap,
+            n_expert,
+            n_expert_used,
         };
         config.validate()?;
         let q_dim = config.q_dim();
@@ -277,9 +295,29 @@ impl<'a> Model<'a> {
             (layers(names.attn_q)?, layers(names.attn_k)?, layers(names.attn_v)?)
         };
 
-        // Gate/up FFN: a fused gate+up tensor in `ffn_up` split in half (Phi-3),
-        // or separate `ffn_gate` / `ffn_up` tensors.
-        let (w1, w3) = if arch.fused_gate_up() {
+        // FFN weights. A dense model has per-layer gate/up/down (Phi-3's fused
+        // gate+up is split here); an MoE model (`n_expert > 0`, e.g. Mixtral)
+        // instead has a per-layer router plus stacked expert tensors — and no
+        // dense FFN tensors, so `w1`/`w2`/`w3` stay empty.
+        let (w1, w2, w3, ffn_gate_inp, w1_exp, w2_exp, w3_exp) = if n_expert > 0 {
+            let router = layers(names.ffn_gate_inp)?;
+            // Each `*_exps` tensor is a `(n_expert, rows, cols)` stack; split it
+            // into the per-expert `(rows, cols)` matrices. Rows are expert-major
+            // and contiguous, so the row-split byte math is exact.
+            let split_exps = |suffix: &str, rows: usize| -> Result<Vec<Vec<QMatrix<'a>>>> {
+                (0..n_layers)
+                    .map(|i| {
+                        let stack = qmatrix_from_gguf_3d(gguf, &format!("blk.{i}.{suffix}"))?;
+                        split_rows(stack, &vec![rows; n_expert])
+                    })
+                    .collect()
+            };
+            let w1e = split_exps(names.ffn_gate_exps, hidden_dim)?;
+            let w3e = split_exps(names.ffn_up_exps, hidden_dim)?;
+            let w2e = split_exps(names.ffn_down_exps, dim)?;
+            (Vec::new(), Vec::new(), Vec::new(), router, w1e, w2e, w3e)
+        } else if arch.fused_gate_up() {
+            // Phi-3: a fused gate+up tensor in `ffn_up` (rows = 2*hidden), split.
             let (mut w1, mut w3) = (Vec::new(), Vec::new());
             for i in 0..n_layers {
                 let gate_up = qmatrix_from_gguf(gguf, &format!("blk.{i}.{}", names.ffn_up))?;
@@ -287,9 +325,19 @@ impl<'a> Model<'a> {
                 w1.push(parts.next().unwrap());
                 w3.push(parts.next().unwrap());
             }
-            (w1, w3)
+            let (e1, e2, e3) = (Vec::new(), Vec::new(), Vec::new());
+            (w1, layers(names.ffn_down)?, w3, Vec::new(), e1, e2, e3)
         } else {
-            (layers(names.ffn_gate)?, layers(names.ffn_up)?)
+            let (e1, e2, e3) = (Vec::new(), Vec::new(), Vec::new());
+            (
+                layers(names.ffn_gate)?,
+                layers(names.ffn_down)?,
+                layers(names.ffn_up)?,
+                Vec::new(),
+                e1,
+                e2,
+                e3,
+            )
         };
 
         let (bq, bk, bv) = if arch.has_qkv_bias() {
@@ -350,13 +398,17 @@ impl<'a> Model<'a> {
                 wv,
                 wo: layers(names.attn_output)?,
                 w1,
-                w2: layers(names.ffn_down)?,
+                w2,
                 w3,
                 bq,
                 bk,
                 bv,
                 rms_attn_post,
                 rms_ffn_post,
+                ffn_gate_inp,
+                w1_exp,
+                w2_exp,
+                w3_exp,
             },
         })
     }
@@ -435,6 +487,33 @@ pub(crate) fn qmatrix_from_gguf<'a>(gguf: &Gguf<'a>, name: &str) -> Result<QMatr
         }
     }
     QMatrix::quant(info.ggml_type, Cow::Borrowed(bytes), rows, cols)
+}
+
+/// Build a [`QMatrix`] from a named 3-D GGUF tensor `(experts, rows, cols)` by
+/// flattening the outer (expert) axis into the row axis: the result is an
+/// `(experts * rows, cols)` matrix borrowing the same bytes. Expert `e`'s
+/// `(rows, cols)` block is then a contiguous row range — exactly what
+/// [`split_rows`] carves out. Used for MoE expert stacks (`ffn_*_exps.weight`).
+fn qmatrix_from_gguf_3d<'a>(gguf: &Gguf<'a>, name: &str) -> Result<QMatrix<'a>> {
+    let info = gguf
+        .tensor(name)
+        .ok_or_else(|| Error::Format(format!("GGUF missing tensor '{name}'")))?;
+    let (cols, rows, experts) = match info.dims.as_slice() {
+        [c, r, e] => (*c as usize, *r as usize, *e as usize),
+        other => {
+            return Err(Error::Format(format!(
+                "MoE expert tensor '{name}' must be 3-D, has {} dims",
+                other.len()
+            )))
+        }
+    };
+    let bytes = gguf.tensor_bytes(info)?;
+    if info.ggml_type == GgmlType::F32 {
+        if let Ok(f) = f32_slice(bytes, 0, experts * rows * cols) {
+            return QMatrix::f32(Cow::Borrowed(f), experts * rows, cols);
+        }
+    }
+    QMatrix::quant(info.ggml_type, Cow::Borrowed(bytes), experts * rows, cols)
 }
 
 /// Dequantize a named GGUF tensor to a fresh `f32` buffer.
@@ -539,6 +618,8 @@ pub struct RunState {
     q: Vec<f32>,           // query (dim)
     att: Vec<f32>,         // attention scores (n_heads * seq_len)
     logits: Vec<f32>,      // output logits (vocab_size)
+    router: Vec<f32>,      // MoE router logits/probs (n_expert; empty if dense)
+    moe_tmp: Vec<f32>,     // MoE per-expert FFN output (dim; empty if dense)
     kv: KvCache, // single sequence; flat (n_layers, seq_len, kv_dim)
 }
 
@@ -559,6 +640,8 @@ impl RunState {
             q: vec![0.0; q_dim],
             att: vec![0.0; c.n_heads * c.seq_len],
             logits: vec![0.0; c.vocab_size],
+            router: vec![0.0; c.n_expert],
+            moe_tmp: vec![0.0; if c.n_expert > 0 { c.dim } else { 0 }],
             kv: KvCache::new(c.n_layers, c.seq_len, kv_dim),
         }
     }
@@ -608,6 +691,8 @@ pub struct Batch {
     hb2: Vec<f32>,
     att: Vec<f32>,
     logits: Vec<f32>,
+    router: Vec<f32>,  // MoE router logits/probs, one row (n_expert; empty if dense)
+    moe_tmp: Vec<f32>, // MoE per-expert FFN output, one row (dim; empty if dense)
 }
 
 impl Batch {
@@ -628,6 +713,8 @@ impl Batch {
             hb2: vec![0.0; cap * hidden],
             att: vec![0.0; c.n_heads * c.seq_len],
             logits: vec![0.0; cap * vocab],
+            router: vec![0.0; c.n_expert],
+            moe_tmp: vec![0.0; if c.n_expert > 0 { dim } else { 0 }],
         }
     }
 
@@ -663,6 +750,7 @@ impl Batch {
         let bias = p.arch.has_qkv_bias();
         let sandwich = p.arch.sandwich_norm();
         let act = p.arch.ffn_activation();
+        let is_moe = p.n_expert > 0;
         debug_assert!(n <= self.cap && tokens.len() == n && positions.len() == n);
 
         // Seed each row with its token's (dequantized) embedding, scaled (Gemma).
@@ -728,18 +816,36 @@ impl Batch {
 
             // --- Feed-forward ---
             backend.rmsnorm_batch(&mut self.xb[..n * dim], &self.x[..n * dim], slice(&w.rms_ffn_weight, layer, dim), eps, n);
-            backend.matmul_batch(&mut self.hb[..n * hidden], &self.xb[..n * dim], &w.w1[layer], n);
-            backend.matmul_batch(&mut self.hb2[..n * hidden], &self.xb[..n * dim], &w.w3[layer], n);
-            match act {
-                FfnActivation::SwiGlu => backend.swiglu(&mut self.hb[..n * hidden], &self.hb2[..n * hidden]),
-                FfnActivation::GeGlu => backend.geglu(&mut self.hb[..n * hidden], &self.hb2[..n * hidden]),
-            }
-            backend.matmul_batch(&mut self.xb[..n * dim], &self.hb[..n * hidden], &w.w2[layer], n);
-            if sandwich {
-                backend.rmsnorm_batch(&mut self.xb2[..n * dim], &self.xb[..n * dim], slice(&w.rms_ffn_post, layer, dim), eps, n);
-                backend.add(&mut self.x[..n * dim], &self.xb2[..n * dim]);
+            if is_moe {
+                // Per-token routing: the FFN runs row-by-row (no batch GEMM).
+                for r in 0..n {
+                    moe_ffn_row(
+                        model,
+                        backend,
+                        layer,
+                        &self.xb[r * dim..r * dim + dim],
+                        &mut self.xb2[r * dim..r * dim + dim],
+                        &mut self.hb[..hidden],
+                        &mut self.hb2[..hidden],
+                        &mut self.moe_tmp,
+                        &mut self.router,
+                    );
+                }
             } else {
+                backend.matmul_batch(&mut self.hb[..n * hidden], &self.xb[..n * dim], &w.w1[layer], n);
+                backend.matmul_batch(&mut self.hb2[..n * hidden], &self.xb[..n * dim], &w.w3[layer], n);
+                match act {
+                    FfnActivation::SwiGlu => backend.swiglu(&mut self.hb[..n * hidden], &self.hb2[..n * hidden]),
+                    FfnActivation::GeGlu => backend.geglu(&mut self.hb[..n * hidden], &self.hb2[..n * hidden]),
+                }
+                backend.matmul_batch(&mut self.xb2[..n * dim], &self.hb[..n * hidden], &w.w2[layer], n);
+            }
+            // The FFN output now lives in `xb2` for both the dense and MoE paths.
+            if sandwich {
+                backend.rmsnorm_batch(&mut self.xb[..n * dim], &self.xb2[..n * dim], slice(&w.rms_ffn_post, layer, dim), eps, n);
                 backend.add(&mut self.x[..n * dim], &self.xb[..n * dim]);
+            } else {
+                backend.add(&mut self.x[..n * dim], &self.xb2[..n * dim]);
             }
         }
 
@@ -777,6 +883,7 @@ pub fn forward_with(
     let bias = p.arch.has_qkv_bias();
     let sandwich = p.arch.sandwich_norm();
     let act = p.arch.ffn_activation();
+    let is_moe = p.n_expert > 0;
 
     // Seed the residual stream with this token's (dequantized) embedding,
     // scaled by `embd_scale` (1.0 except Gemma).
@@ -852,23 +959,38 @@ pub fn forward_with(
             slice(&w.rms_ffn_weight, layer, dim),
             p.rms_eps,
         );
-        backend.matmul(&mut state.hb, &state.xb[..dim], &w.w1[layer]);
-        backend.matmul(&mut state.hb2, &state.xb[..dim], &w.w3[layer]);
-        match act {
-            FfnActivation::SwiGlu => backend.swiglu(&mut state.hb, &state.hb2),
-            FfnActivation::GeGlu => backend.geglu(&mut state.hb, &state.hb2),
+        if is_moe {
+            moe_ffn_row(
+                model,
+                backend,
+                layer,
+                &state.xb[..dim],
+                &mut state.xb2[..dim],
+                &mut state.hb,
+                &mut state.hb2,
+                &mut state.moe_tmp,
+                &mut state.router,
+            );
+        } else {
+            backend.matmul(&mut state.hb, &state.xb[..dim], &w.w1[layer]);
+            backend.matmul(&mut state.hb2, &state.xb[..dim], &w.w3[layer]);
+            match act {
+                FfnActivation::SwiGlu => backend.swiglu(&mut state.hb, &state.hb2),
+                FfnActivation::GeGlu => backend.geglu(&mut state.hb, &state.hb2),
+            }
+            backend.matmul(&mut state.xb2[..dim], &state.hb, &w.w2[layer]);
         }
-        backend.matmul(&mut state.xb[..dim], &state.hb, &w.w2[layer]);
+        // The FFN output now lives in `xb2` for both the dense and MoE paths.
         if sandwich {
             backend.rmsnorm(
-                &mut state.xb2[..dim],
-                &state.xb[..dim],
+                &mut state.xb[..dim],
+                &state.xb2[..dim],
                 slice(&w.rms_ffn_post, layer, dim),
                 p.rms_eps,
             );
-            backend.add(&mut state.x, &state.xb2[..dim]);
-        } else {
             backend.add(&mut state.x, &state.xb[..dim]);
+        } else {
+            backend.add(&mut state.x, &state.xb2[..dim]);
         }
         if let Some(cv) = control {
             cv.apply_layer(layer, &mut state.x);
@@ -954,6 +1076,7 @@ fn prefill_residual<B: Backend + ?Sized>(
     let bias = p.arch.has_qkv_bias();
     let sandwich = p.arch.sandwich_norm();
     let act = p.arch.ffn_activation();
+    let is_moe = p.n_expert > 0;
 
     // Row-major (n, *) scratch for the batch. Attention output `ao` is `(n,
     // q_dim)` and kept separate from the `(n, dim)` norm scratch `xb`, since
@@ -965,6 +1088,9 @@ fn prefill_residual<B: Backend + ?Sized>(
     let mut ao = vec![0.0f32; n * q_dim];
     let mut hb = vec![0.0f32; n * hidden];
     let mut hb2 = vec![0.0f32; n * hidden];
+    // MoE routing scratch (one row at a time); empty for a dense model.
+    let mut router = vec![0.0f32; if is_moe { p.n_expert } else { 0 }];
+    let mut moe_tmp = vec![0.0f32; if is_moe { dim } else { 0 }];
 
     // Seed each row with its token's (dequantized) embedding, scaled (Gemma).
     for (r, &tok) in tokens.iter().enumerate() {
@@ -1028,18 +1154,36 @@ fn prefill_residual<B: Backend + ?Sized>(
 
         // --- Feed-forward -----------------------------------------------
         backend.rmsnorm_batch(&mut xb, &x, slice(&w.rms_ffn_weight, layer, dim), p.rms_eps, n);
-        backend.matmul_batch(&mut hb, &xb, &w.w1[layer], n);
-        backend.matmul_batch(&mut hb2, &xb, &w.w3[layer], n);
-        match act {
-            FfnActivation::SwiGlu => backend.swiglu(&mut hb, &hb2),
-            FfnActivation::GeGlu => backend.geglu(&mut hb, &hb2),
-        }
-        backend.matmul_batch(&mut xb, &hb, &w.w2[layer], n);
-        if sandwich {
-            backend.rmsnorm_batch(&mut xb2, &xb, slice(&w.rms_ffn_post, layer, dim), p.rms_eps, n);
-            backend.add(&mut x, &xb2);
+        if is_moe {
+            // Routing is per-token, so the FFN runs row-by-row (no batch GEMM).
+            for r in 0..n {
+                moe_ffn_row(
+                    model,
+                    backend,
+                    layer,
+                    &xb[r * dim..r * dim + dim],
+                    &mut xb2[r * dim..r * dim + dim],
+                    &mut hb[..hidden],
+                    &mut hb2[..hidden],
+                    &mut moe_tmp,
+                    &mut router,
+                );
+            }
         } else {
+            backend.matmul_batch(&mut hb, &xb, &w.w1[layer], n);
+            backend.matmul_batch(&mut hb2, &xb, &w.w3[layer], n);
+            match act {
+                FfnActivation::SwiGlu => backend.swiglu(&mut hb, &hb2),
+                FfnActivation::GeGlu => backend.geglu(&mut hb, &hb2),
+            }
+            backend.matmul_batch(&mut xb2, &hb, &w.w2[layer], n);
+        }
+        // The FFN output now lives in `xb2` for both the dense and MoE paths.
+        if sandwich {
+            backend.rmsnorm_batch(&mut xb, &xb2, slice(&w.rms_ffn_post, layer, dim), p.rms_eps, n);
             backend.add(&mut x, &xb);
+        } else {
+            backend.add(&mut x, &xb2);
         }
         if let Some(cv) = control {
             for r in 0..n {
@@ -1277,6 +1421,85 @@ fn softcap(x: &mut [f32], cap: f32) {
     }
 }
 
+/// Numerically stable in-place softmax.
+fn softmax_inplace(x: &mut [f32]) {
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    let inv = 1.0 / sum;
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// One token's mixture-of-experts FFN: route `xn` (the FFN-normed input row,
+/// length `dim`) through the top-k experts and write the weighted sum into `out`
+/// (length `dim`).
+///
+/// Mirrors llama.cpp's `build_moe_ffn` for the softmax-gated, top-k-renormalized
+/// case (Mixtral): softmax over **all** experts, pick the top `n_expert_used`,
+/// renormalize their probabilities to sum to 1, then accumulate each selected
+/// expert's SwiGLU/GeGLU output scaled by its weight. Ties are broken toward the
+/// lower expert index. The dense FFN path never calls this.
+///
+/// Scratch (caller-owned, contents clobbered): `g`/`u` length `hidden_dim`,
+/// `tmp` length `dim`, `router` length `n_expert`.
+#[allow(clippy::too_many_arguments)]
+fn moe_ffn_row<B: Backend + ?Sized>(
+    model: &Model,
+    backend: &B,
+    layer: usize,
+    xn: &[f32],
+    out: &mut [f32],
+    g: &mut [f32],
+    u: &mut [f32],
+    tmp: &mut [f32],
+    router: &mut [f32],
+) {
+    let p = &model.config;
+    let w = &model.weights;
+    let act = p.arch.ffn_activation();
+
+    // Router logits → softmax probabilities over all experts.
+    backend.matmul(router, xn, &w.ffn_gate_inp[layer]);
+    softmax_inplace(router);
+
+    // Select the top-k experts by probability (ties → lower index) and the sum
+    // of their probabilities (for renormalization).
+    let mut sel: Vec<(usize, f32)> = Vec::with_capacity(p.n_expert_used);
+    for _ in 0..p.n_expert_used {
+        let mut best = 0usize;
+        let mut best_p = f32::NEG_INFINITY;
+        for (e, &prob) in router.iter().enumerate() {
+            if prob > best_p && !sel.iter().any(|&(s, _)| s == e) {
+                best_p = prob;
+                best = e;
+            }
+        }
+        sel.push((best, best_p));
+    }
+    let wsum: f32 = sel.iter().map(|&(_, prob)| prob).sum();
+
+    // Weighted sum of the selected experts' FFN outputs.
+    out.fill(0.0);
+    for (e, prob) in sel {
+        let weight = prob / wsum;
+        backend.matmul(g, xn, &w.w1_exp[layer][e]);
+        backend.matmul(u, xn, &w.w3_exp[layer][e]);
+        match act {
+            FfnActivation::SwiGlu => backend.swiglu(g, u),
+            FfnActivation::GeGlu => backend.geglu(g, u),
+        }
+        backend.matmul(tmp, g, &w.w2_exp[layer][e]);
+        for (o, &t) in out.iter_mut().zip(tmp.iter()) {
+            *o += weight * t;
+        }
+    }
+}
+
 /// Split a fused row-major weight (Phi-3's `attn_qkv` / gate+up) into parts with
 /// the given row counts, each sharing the source bytes (zero-copy for the usual
 /// borrowed-from-mmap case). `row_counts` must sum to the source's row count.
@@ -1445,5 +1668,108 @@ mod tests {
         assert_eq!(kv.k_span_mut(0, 0, 2).len(), 8);
         kv.v_slot_mut(0, 1).copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(&kv.layer_v(0)[4..8], [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    fn moe_model_bytes(n_expert: usize, n_expert_used: usize) -> Vec<u8> {
+        let c = Config {
+            dim: 8,
+            hidden_dim: 16,
+            n_layers: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            vocab_size: 16,
+            seq_len: 8,
+            ..Default::default()
+        };
+        crate::dummy::synthetic_gguf_moe(&c, n_expert, n_expert_used)
+    }
+
+    #[test]
+    fn moe_loads_router_and_experts() {
+        let bytes = moe_model_bytes(4, 2);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let m = Model::from_gguf(&gguf).unwrap();
+        assert_eq!(m.config.n_expert, 4);
+        assert_eq!(m.config.n_expert_used, 2);
+        // A router and an expert list per layer; experts have the FFN shapes.
+        assert_eq!(m.weights.ffn_gate_inp.len(), m.config.n_layers);
+        assert_eq!(m.weights.ffn_gate_inp[0].rows(), 4);
+        assert_eq!(m.weights.ffn_gate_inp[0].cols(), m.config.dim);
+        assert_eq!(m.weights.w1_exp[0].len(), 4);
+        assert_eq!(m.weights.w1_exp[0][0].rows(), m.config.hidden_dim);
+        assert_eq!(m.weights.w1_exp[0][0].cols(), m.config.dim);
+        assert_eq!(m.weights.w2_exp[0][0].rows(), m.config.dim);
+        assert_eq!(m.weights.w2_exp[0][0].cols(), m.config.hidden_dim);
+        // Dense FFN tensors are absent for an MoE model.
+        assert!(m.weights.w1.is_empty() && m.weights.w2.is_empty() && m.weights.w3.is_empty());
+    }
+
+    #[test]
+    fn moe_ffn_row_matches_weighted_expert_sum() {
+        // n_expert_used == n_expert: top-k is every expert, so the renormalized
+        // weights are exactly the softmax probabilities — checks routing softmax,
+        // expert loading/indexing, and the weighted accumulation.
+        let bytes = moe_model_bytes(4, 4);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let m = Model::from_gguf(&gguf).unwrap();
+        let backend = crate::backend::CpuBackend::new();
+        let (dim, hidden, ne) = (m.config.dim, m.config.hidden_dim, m.config.n_expert);
+        let xn: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.3 - 1.0).sin()).collect();
+
+        let mut out = vec![0.0; dim];
+        let (mut g, mut u, mut tmp, mut router) =
+            (vec![0.0; hidden], vec![0.0; hidden], vec![0.0; dim], vec![0.0; ne]);
+        moe_ffn_row(&m, &backend, 0, &xn, &mut out, &mut g, &mut u, &mut tmp, &mut router);
+
+        let mut probs = vec![0.0; ne];
+        backend.matmul(&mut probs, &xn, &m.weights.ffn_gate_inp[0]);
+        softmax_inplace(&mut probs);
+        let mut want = vec![0.0; dim];
+        for (e, &prob) in probs.iter().enumerate() {
+            let (mut ge, mut ue) = (vec![0.0; hidden], vec![0.0; hidden]);
+            backend.matmul(&mut ge, &xn, &m.weights.w1_exp[0][e]);
+            backend.matmul(&mut ue, &xn, &m.weights.w3_exp[0][e]);
+            backend.swiglu(&mut ge, &ue);
+            let mut de = vec![0.0; dim];
+            backend.matmul(&mut de, &ge, &m.weights.w2_exp[0][e]);
+            for (w, &d) in want.iter_mut().zip(&de) {
+                *w += prob * d;
+            }
+        }
+        for (o, w) in out.iter().zip(&want) {
+            assert!((o - w).abs() < 1e-5, "moe out {o} vs ref {w}");
+        }
+    }
+
+    #[test]
+    fn moe_top1_selects_argmax_expert() {
+        // With n_expert_used == 1 the single weight renormalizes to 1.0, so the
+        // FFN output is exactly the argmax expert's output.
+        let bytes = moe_model_bytes(4, 1);
+        let gguf = Gguf::parse(&bytes).unwrap();
+        let m = Model::from_gguf(&gguf).unwrap();
+        let backend = crate::backend::CpuBackend::new();
+        let (dim, hidden, ne) = (m.config.dim, m.config.hidden_dim, m.config.n_expert);
+        let xn: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.7 + 0.2).cos()).collect();
+
+        let mut out = vec![0.0; dim];
+        let (mut g, mut u, mut tmp, mut router) =
+            (vec![0.0; hidden], vec![0.0; hidden], vec![0.0; dim], vec![0.0; ne]);
+        moe_ffn_row(&m, &backend, 0, &xn, &mut out, &mut g, &mut u, &mut tmp, &mut router);
+
+        let mut logits = vec![0.0; ne];
+        backend.matmul(&mut logits, &xn, &m.weights.ffn_gate_inp[0]);
+        let best = (0..ne)
+            .max_by(|&a, &b| logits[a].partial_cmp(&logits[b]).unwrap())
+            .unwrap();
+        let (mut ge, mut ue) = (vec![0.0; hidden], vec![0.0; hidden]);
+        backend.matmul(&mut ge, &xn, &m.weights.w1_exp[0][best]);
+        backend.matmul(&mut ue, &xn, &m.weights.w3_exp[0][best]);
+        backend.swiglu(&mut ge, &ue);
+        let mut want = vec![0.0; dim];
+        backend.matmul(&mut want, &ge, &m.weights.w2_exp[0][best]);
+        for (o, w) in out.iter().zip(&want) {
+            assert!((o - w).abs() < 1e-6, "top1 out {o} vs expert {w}");
+        }
     }
 }

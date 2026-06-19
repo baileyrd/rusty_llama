@@ -2119,7 +2119,7 @@ impl Backend for GpuBackend {
         token: usize,
         pos: usize,
     ) {
-        if !model.config.arch.uses_resident_decode() {
+        if !model.config.uses_resident_decode() {
             crate::model::forward(model, state, self, token, pos);
             return;
         }

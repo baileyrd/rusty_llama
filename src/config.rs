@@ -100,6 +100,12 @@ pub struct Config {
     pub attn_logit_softcap: f32,
     /// tanh softcap on the final output logits (`0.0` = off; Gemma2 = 30).
     pub final_logit_softcap: f32,
+    /// Number of mixture-of-experts experts per FFN block. `0` = a dense FFN
+    /// (every arch so far); `> 0` selects the routed MoE path (Mixtral).
+    pub n_expert: usize,
+    /// Number of experts each token is routed to (top-k). Must be in
+    /// `1..=n_expert` when `n_expert > 0`; ignored for dense models.
+    pub n_expert_used: usize,
 }
 
 impl Default for Config {
@@ -122,6 +128,8 @@ impl Default for Config {
             embd_scale: 1.0,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
+            n_expert: 0,
+            n_expert_used: 0,
         }
     }
 }
@@ -157,6 +165,15 @@ impl Config {
     #[inline]
     pub fn kv_mul(&self) -> usize {
         self.n_heads / self.n_kv_heads
+    }
+
+    /// Whether this model is eligible for the fused, device-resident
+    /// decode/prefill fast path (CUDA/GPU). Only dense Llama-graph models
+    /// qualify; MoE models (Mixtral is `Arch::Llama` but routed) and the breadth
+    /// archs fall back to the generic per-op path.
+    #[inline]
+    pub fn uses_resident_decode(&self) -> bool {
+        self.arch.uses_resident_decode() && self.n_expert == 0
     }
 
     /// Number of dimensions RoPE rotates per head (`rope_dim`, or the full
@@ -317,6 +334,12 @@ impl Config {
             return bad(format!(
                 "head_size ({}) must be even for RoPE",
                 self.head_size()
+            ));
+        }
+        if self.n_expert > 0 && !(1..=self.n_expert).contains(&self.n_expert_used) {
+            return bad(format!(
+                "n_expert_used ({}) must be in 1..={} for an MoE model",
+                self.n_expert_used, self.n_expert
             ));
         }
         let positive = |v: f32| v.is_finite() && v > 0.0;

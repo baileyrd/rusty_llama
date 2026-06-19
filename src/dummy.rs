@@ -538,6 +538,105 @@ pub fn synthetic_gguf_arch(config: &Config, arch: &str) -> Vec<u8> {
     out.buf
 }
 
+/// A synthetic Mixtral-style MoE GGUF (arch `llama`, `expert_count` experts,
+/// `expert_used_count` routed per token). Each layer carries a router
+/// (`ffn_gate_inp`) plus 3-D expert stacks (`ffn_gate_exps` / `ffn_up_exps` /
+/// `ffn_down_exps`) and no dense FFN tensors — exactly the layout
+/// [`crate::Model::from_gguf`]'s MoE path expects. F32 weights, dummy SPM
+/// tokenizer; the byte layout mirrors [`synthetic_gguf`].
+pub fn synthetic_gguf_moe(config: &Config, n_expert: usize, n_expert_used: usize) -> Vec<u8> {
+    let c = config;
+    let kv_dim = c.kv_dim();
+    let (dim, hidden, ne) = (c.dim as u64, c.hidden_dim as u64, n_expert as u64);
+
+    // (name, ggml dims) in file order. ggml dims put the fastest-varying axis
+    // first; an expert stack is `[cols, rows, n_expert]`.
+    let mut tensors: Vec<(String, Vec<u64>)> = vec![
+        ("token_embd.weight".into(), vec![dim, c.vocab_size as u64]),
+        ("output_norm.weight".into(), vec![dim]),
+    ];
+    if !c.shared_weights {
+        tensors.push(("output.weight".into(), vec![dim, c.vocab_size as u64]));
+    }
+    for i in 0..c.n_layers {
+        let p = format!("blk.{i}.");
+        tensors.push((format!("{p}attn_norm.weight"), vec![dim]));
+        tensors.push((format!("{p}attn_q.weight"), vec![dim, dim]));
+        tensors.push((format!("{p}attn_k.weight"), vec![dim, kv_dim as u64]));
+        tensors.push((format!("{p}attn_v.weight"), vec![dim, kv_dim as u64]));
+        tensors.push((format!("{p}attn_output.weight"), vec![dim, dim]));
+        tensors.push((format!("{p}ffn_norm.weight"), vec![dim]));
+        tensors.push((format!("{p}ffn_gate_inp.weight"), vec![dim, ne]));
+        tensors.push((format!("{p}ffn_gate_exps.weight"), vec![dim, hidden, ne]));
+        tensors.push((format!("{p}ffn_up_exps.weight"), vec![dim, hidden, ne]));
+        tensors.push((format!("{p}ffn_down_exps.weight"), vec![hidden, dim, ne]));
+    }
+
+    // Tensor-data section (deterministic small F32 values; the build_gguf scheme).
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ tensors.len() as u64;
+    for (_, dims) in &tensors {
+        let n: usize = dims.iter().product::<u64>() as usize;
+        let mut bytes = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            let u = (rng.wrapping_mul(0x2545F491_4F6CDD1D) >> 40) as u32;
+            let v = (u as f32 / (1u32 << 24) as f32 - 0.5) * 0.2;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let off = data.len().next_multiple_of(GGUF_ALIGNMENT);
+        data.resize(off, 0);
+        offsets.push(off as u64);
+        data.extend_from_slice(&bytes);
+    }
+
+    let mut meta = GgufWriter::default();
+    meta.kv_str("general.architecture", "llama");
+    meta.kv_u32("general.alignment", GGUF_ALIGNMENT as u32);
+    meta.kv_u32("llama.embedding_length", c.dim as u32);
+    meta.kv_u32("llama.block_count", c.n_layers as u32);
+    meta.kv_u32("llama.attention.head_count", c.n_heads as u32);
+    meta.kv_u32("llama.attention.head_count_kv", c.n_kv_heads as u32);
+    meta.kv_u32("llama.feed_forward_length", c.hidden_dim as u32);
+    meta.kv_u32("llama.context_length", c.seq_len as u32);
+    meta.kv_f32("llama.attention.layer_norm_rms_epsilon", c.rms_eps);
+    meta.kv_f32("llama.rope.freq_base", c.rope_freq_base);
+    meta.kv_u32("llama.rope.dimension_count", c.rotary_dim() as u32);
+    meta.kv_u32("llama.expert_count", n_expert as u32);
+    meta.kv_u32("llama.expert_used_count", n_expert_used as u32);
+    meta.kv_str("tokenizer.ggml.model", "llama");
+    meta.kv_str_array("tokenizer.ggml.tokens", &dummy_tokens(c.vocab_size));
+    meta.kv_f32_array("tokenizer.ggml.scores", &vec![0.0; c.vocab_size]);
+    meta.kv_u32("tokenizer.ggml.bos_token_id", 1);
+    meta.kv_u32("tokenizer.ggml.eos_token_id", 2);
+
+    let mut tinfo = GgufWriter::default();
+    for ((name, dims), off) in tensors.iter().zip(&offsets) {
+        tinfo.raw_str(name.as_bytes());
+        tinfo.u32(dims.len() as u32);
+        for &d in dims {
+            tinfo.u64(d);
+        }
+        tinfo.u32(GgmlType::F32.to_u32());
+        tinfo.u64(*off);
+    }
+
+    let mut out = GgufWriter::default();
+    out.buf.extend_from_slice(b"GGUF");
+    out.u32(3);
+    out.u64(tensors.len() as u64);
+    out.u64(meta.kv_count);
+    out.buf.extend_from_slice(&meta.buf);
+    out.buf.extend_from_slice(&tinfo.buf);
+    let padded = out.buf.len().next_multiple_of(GGUF_ALIGNMENT);
+    out.buf.resize(padded, 0);
+    out.buf.extend_from_slice(&data);
+    out.buf
+}
+
 /// A synthetic LoRA adapter GGUF targeting `targets` (`(base_name, out, in)`),
 /// each as an `(A, B)` pair at `rank` with scaling `alpha`. Tensors are F32.
 /// When `corrupt`, the first target's `lora_b` is emitted with a mismatched rank
