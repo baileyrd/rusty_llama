@@ -148,6 +148,15 @@ per token. Prereqs: (1) move off the legacy NULL stream (`ctx.new_stream()`);
 (2) kill per-step kernel-arg drift (`pos`, `off = pos*kv_dim`) — make position
 device-resident so one graph replays unchanged.
 - **Target:** 191 → ~300–330 t/s (~1.1× behind).
+- **Measured (DONE, 2026-06-19):** implemented exactly as planned — capturable
+  non-NULL stream, device-resident `pos` (rope/attention take `const int* pos`; a
+  `kv_append` kernel replaces the fixed-offset dtod memcpy), capture once into a
+  `cudarc::CudaGraph` + replay per token (gated on all-k-quant weights; pre-warm
+  the packed-weight cache so its uploads aren't recorded; `RUSTY_LLAMA_CUDA_NO_GRAPH`
+  A/B toggle). Clean A/B: tg128 **206 → 289 t/s (1.40× graph vs direct; 1.51×
+  over the original 191)** — gap to llama.cpp 378 now **~1.31×** (was ~1.98×).
+  Correctness: graph == direct path (proven), `decode_graph_coherent_real` rel L2
+  ≤0.04 vs CPU over greedy decode, coherent CLI output.
 - **Acceptance:** multi-step + prefill→decode coherence vs CPU (rel L2 ≤ 6e-4);
   before/after `bench_decode_real_tinyllama` and `llama-bench -ngl 99 -n 128`.
 
@@ -207,7 +216,8 @@ An autonomous execution pass. **Landed + merged (verified on this machine):**
 | #35 | This review + parity capture + backlog | — | merged |
 | #36 | 6.1 CPU cache-blocked prefill `matmul_batch` | pp512 **64 → 113 t/s (1.77×)**, decode unchanged, bit-identical | merged |
 | #37 | 6.3 CUDA prefill shared f16 narrow | pp512 **4671 → ~5230 t/s (1.12×)**, coherence held | merged |
-| (this) | wgpu doc-drift fix + roadmap finalize | — | — |
+| #38 | wgpu doc-drift fix + roadmap finalize | — | merged |
+| 6.2 | **CUDA-graph decode capture** | tg128 **206 → 289 t/s** (1.40× graph vs direct; 1.51× over the original 191) | this PR |
 
 **Empirical corrections to this review's own estimates** (the value of actually
 running it):
@@ -231,19 +241,14 @@ running it):
 These are deliberately NOT rushed in this pass (load-bearing GPU/SIMD kernels;
 each is a focused effort). Scoping is concrete so they're a cold start:
 
-1. **CUDA-graph decode (6.2) — the biggest decode win (~191 → ~300–330 t/s).**
-   *Feasibility CONFIRMED:* the decode attention grid is `(rows*n_heads)` and its
-   shared-mem has no `seq_len` term (`cuda.rs:937-940`), and rope grid is `rows` —
-   all **`pos`-independent** for `rows==1`. Only the `pos` *value* (rope angle,
-   attention causal bound) and the KV-write offset vary per step. Plan: (a) switch
-   `ctx.default_stream()` → `ctx.new_stream()` (legacy NULL stream isn't
-   capturable); (b) make `pos` device-resident — `rope_kernel`/`attention_kernel`
-   read `pos_base` from a `const int*` (both already compute `pos_base + row`,
-   `cuda.rs:120,147`), and replace the KV-write `memcpy_dtod` with a `kv_append`
-   kernel that writes at `pos[0]*kv_dim`; (c) capture the per-step kernel sequence
-   once into a `cudarc` `CudaGraph` (`begin_capture`/`end_capture`/`launch` exist)
-   and replay, writing `pos`+embedding before each launch. Gate on
-   `decode_multistep_coherent` + `prefill_then_decode_coherent`.
+1. **CUDA-graph decode (6.2) — DONE (this PR).** tg128 **206 → 289 t/s (1.40×
+   graph vs direct; 1.51× over the original 191)**; gap to llama.cpp 378 now
+   **~1.31×** (was ~1.98×). Implemented as planned: capturable non-NULL stream +
+   device-resident `pos` (rope/attention take `const int* pos`; a `kv_append`
+   kernel replaces the fixed-offset dtod memcpy) + capture-once/replay-per-token,
+   gated on all-k-quant weights, with a `RUSTY_LLAMA_CUDA_NO_GRAPH` A/B toggle and
+   a packed-weight pre-warm so the one-time uploads aren't recorded. Verified
+   graph == direct path + `decode_graph_coherent_real` (rel L2 ≤0.04 vs CPU).
 2. **CUDA prefill int8 MMQ (6.3 cont.) — the structural 3.0× lever.** Replace the
    f16 cuBLAS GEMM with on-device int8: `quantize_q8k` activation (kernel exists)
    + cuBLASLt IMMA (`CUDA_R_8I`/`COMPUTE_32I`) or a packed-weight `__dp4a` MMQ
