@@ -29,6 +29,7 @@ use crate::chat::{ChatTemplate, Message, Role};
 use crate::gguf::Gguf;
 use crate::loader::Checkpoint;
 use crate::model::{forward_prefill, Batch, Model, RunState};
+use crate::grammar::{Grammar, GrammarStage, JSON_GRAMMAR};
 use crate::sampler::{SamplerChain, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 
@@ -56,6 +57,13 @@ struct SamplingParams {
     presence_penalty: Option<f32>,
 }
 
+/// OpenAI `response_format` — `{"type":"json_object"}` constrains output to JSON.
+#[derive(Deserialize)]
+struct ResponseFormat {
+    #[serde(default, rename = "type")]
+    kind: String,
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     #[serde(default)]
@@ -65,6 +73,10 @@ struct ChatRequest {
     stream: bool,
     #[serde(flatten)]
     params: SamplingParams,
+    #[serde(default)]
+    grammar: Option<String>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +89,10 @@ struct CompletionRequest {
     stream: bool,
     #[serde(flatten)]
     params: SamplingParams,
+    #[serde(default)]
+    grammar: Option<String>,
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +180,7 @@ struct Job {
     kind: JobKind,
     sampler: SamplerConfig,
     max_tokens: usize,
+    grammar: Option<String>,
     reply: Sender<Event>,
 }
 
@@ -330,6 +347,10 @@ fn worker(
     let mut states: Vec<RunState> = (0..cap).map(|_| RunState::new(&model.config)).collect();
     let mut slots: Vec<Option<Slot>> = (0..cap).map(|_| None).collect();
     let mut queue: VecDeque<Job> = VecDeque::new();
+    // End-of-generation ids + a lazily-built token-piece table for grammar
+    // constraints (a vocab-sized table, computed once on the first grammar job).
+    let eog = tokenizer.eog_ids();
+    let mut pieces: Option<Arc<Vec<Vec<u8>>>> = None;
 
     loop {
         let active_now = slots.iter().filter(|s| s.is_some()).count();
@@ -349,7 +370,16 @@ fn worker(
         for i in 0..cap {
             if slots[i].is_none() {
                 if let Some(job) = queue.pop_front() {
-                    slots[i] = admit(&model, &tokenizer, backend.as_ref(), template, &mut states[i], job);
+                    slots[i] = admit(
+                        &model,
+                        &tokenizer,
+                        backend.as_ref(),
+                        template,
+                        &mut states[i],
+                        &mut pieces,
+                        &eog,
+                        job,
+                    );
                 }
             }
         }
@@ -388,12 +418,15 @@ fn worker(
 /// occupied [`Slot`] ready to decode — or `None` after sending the client an
 /// error. Uses the free `forward_prefill` (per-op path) so the host KV matches
 /// what the batched decode reads on every backend.
+#[allow(clippy::too_many_arguments)]
 fn admit(
     model: &Model,
     tokenizer: &Tokenizer,
     backend: &dyn crate::Backend,
     template: Option<ChatTemplate>,
     state: &mut RunState,
+    pieces: &mut Option<Arc<Vec<Vec<u8>>>>,
+    eog: &[u32],
     job: Job,
 ) -> Option<Slot> {
     let prompt = match &job.kind {
@@ -424,6 +457,20 @@ fn admit(
     }
     forward_prefill(model, state, backend, &prompt, 0);
     let mut sampler = SamplerChain::from_config(&job.sampler, model.config.vocab_size);
+    if let Some(src) = job.grammar.as_deref().filter(|s| !s.is_empty()) {
+        let grammar = match Grammar::parse(src) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = job.reply.send(Event::Error(format!("grammar error: {e}")));
+                return None;
+            }
+        };
+        // Build the vocab-sized piece table once, then share it across requests.
+        let table = pieces.get_or_insert_with(|| {
+            Arc::new((0..tokenizer.vocab_size()).map(|i| tokenizer.token_piece(i)).collect())
+        });
+        sampler.prepend(Box::new(GrammarStage::new(grammar, table.clone(), eog.to_vec())));
+    }
     let cur = sampler.sample(state.logits());
     Some(Slot {
         reply: job.reply,
@@ -512,6 +559,7 @@ fn handle_chat(
         kind: JobKind::Chat(msgs),
         sampler: resolve_sampler(&req.params),
         max_tokens: req.params.max_tokens.unwrap_or(256),
+        grammar: req_grammar(req.grammar, req.response_format),
         reply,
     };
     if jobs.send(job).is_err() {
@@ -540,6 +588,7 @@ fn handle_completion(
         kind: JobKind::Completion(req.prompt),
         sampler: resolve_sampler(&req.params),
         max_tokens: req.params.max_tokens.unwrap_or(256),
+        grammar: req_grammar(req.grammar, req.response_format),
         reply,
     };
     if jobs.send(job).is_err() {
@@ -698,6 +747,20 @@ fn resolve_sampler(p: &SamplingParams) -> SamplerConfig {
         presence_penalty: p.presence_penalty.unwrap_or(0.0),
         seed: p.seed.unwrap_or_else(time_seed),
     }
+}
+
+/// The grammar source for a request: an explicit `grammar` (raw GBNF) wins, else
+/// `response_format: {"type":"json_object"}` selects the bundled JSON grammar.
+fn req_grammar(grammar: Option<String>, fmt: Option<ResponseFormat>) -> Option<String> {
+    if let Some(g) = grammar {
+        if !g.is_empty() {
+            return Some(g);
+        }
+    }
+    if fmt.is_some_and(|f| f.kind == "json_object") {
+        return Some(JSON_GRAMMAR.to_string());
+    }
+    None
 }
 
 fn parse_role(s: &str) -> Role {

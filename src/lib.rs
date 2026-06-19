@@ -28,6 +28,7 @@ pub mod config;
 pub mod dummy;
 pub mod error;
 pub mod gguf;
+pub mod grammar;
 mod math;
 pub mod model;
 pub mod quant;
@@ -49,6 +50,7 @@ pub use arch::Arch;
 pub use backend::CudaBackend;
 #[cfg(feature = "gpu")]
 pub use backend::GpuBackend;
+pub use grammar::{Grammar, GrammarStage};
 pub use config::{Config, RopeScaling, RopeTable};
 pub use error::{Error, Result};
 pub use gguf::Gguf;

@@ -469,6 +469,13 @@ impl SamplerChain {
         }
         id as usize
     }
+
+    /// Insert `stage` at the front of the chain (runs first in both `apply` and
+    /// `accept`). Used to add a grammar constraint ahead of the truncation /
+    /// selector stages, so they only ever see grammar-valid candidates.
+    pub fn prepend(&mut self, stage: Box<dyn SamplerStage>) {
+        self.stages.insert(0, stage);
+    }
 }
 
 #[cfg(test)]
