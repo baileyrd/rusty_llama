@@ -129,7 +129,15 @@ cache-blocked int8 GEMM: quantize all N activation rows once to Q8/Q8_K, then
 **outer-loop weight super-blocks (stream each once)**, inner-loop the N quantized
 columns doing the existing `vec_dot_*` integer dots, tiled by output-row blocks
 (~32–64) to stay in L2. Mirrors llama.cpp's chunked-row GEMM.
-- **Target:** ~130× → ~1.5× (real-model `pp512` from ~44 to multiple-thousand t/s).
+- **Measured (DONE, 2026-06-19):** clean A/B on this machine (rigorous harness,
+  `RUSTY_LLAMA_NO_BLOCKED_GEMM` toggle) — real-model `pp512` **64 → 113 tok/s
+  (1.77×)**, decode unchanged. **Far below the projected ~130×**: the workload is
+  compute-bound on the un-tuned `vec_dot` AVX2 kernel (~1.4 MACs/cycle, ~45×
+  below peak), so removing the redundant weight RAM traffic only recovers the
+  fraction that wasn't already hidden behind slow compute. **Batching is
+  necessary but the dominant CPU lever is kernel efficiency (6.4); they compound**
+  — once the dot is near-peak the GEMM becomes RAM-bound and this blocking pays
+  the larger multiple. Still ~53× behind llama.cpp's 6047 (kernel + tiling).
 - **Acceptance:** per-op parity vs current `matmul_batch` (bit-identical for the
   int8 formats, since the dots are unchanged) + e2e greedy coherence; before/after
   `bench_prefill_real_tinyllama` (cpu arm) and `llama-bench -ngl 0 -p 512`.
