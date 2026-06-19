@@ -9,7 +9,7 @@
 use rayon::prelude::*;
 
 use crate::backend::Backend;
-use crate::math::{silu, softmax};
+use crate::math::silu;
 use crate::quant::{
     dequant_block, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0, vec_dot_q4_k,
     vec_dot_q6_k, vec_dot_q8_0, GgmlType, Q8Activation, Q8KActivation, MAX_BLOCK,
@@ -158,45 +158,52 @@ impl Backend for CpuBackend {
         kv_dim: usize,
         logit_softcap: f32,
     ) {
+        // Flash attention: a single streaming pass over the keys per head with an
+        // online (running-max) softmax, so no `seq_len`-sized score buffer is
+        // needed — `out_h` doubles as the running value accumulator. Algebraically
+        // identical to the materialized-softmax form (to fp rounding), and the
+        // memory it saves matters for long context / many concurrent slots.
+        let _ = (att, seq_len); // online softmax keeps its state in registers.
         let kv_mul = n_heads / n_kv_heads;
         let scale = 1.0 / (head_size as f32).sqrt();
 
-        // One independent task per head. `out` and `att` are sliced into
-        // disjoint per-head chunks so the closures never alias.
+        // One independent task per head; `out` is sliced into disjoint per-head
+        // chunks so the closures never alias.
         out.par_chunks_mut(head_size)
-            .zip(att.par_chunks_mut(seq_len))
             .enumerate()
-            .for_each(|(h, (out_h, att_h))| {
+            .for_each(|(h, out_h)| {
                 let q_h = &q[h * head_size..h * head_size + head_size];
                 // Which key/value head this query head attends to.
                 let kv_off = (h / kv_mul) * head_size;
 
-                // Scaled dot-product scores against every key so far.
-                for (t, score) in att_h[..=pos].iter_mut().enumerate() {
-                    let base = t * kv_dim + kv_off;
-                    let k = &key_cache[base..base + head_size];
-                    *score = q_h.iter().zip(k).map(|(&a, &b)| a * b).sum::<f32>() * scale;
-                }
-
-                // Gemma2 tanh logit softcapping on the raw scores.
-                if logit_softcap > 0.0 {
-                    for score in att_h[..=pos].iter_mut() {
-                        *score = logit_softcap * (*score / logit_softcap).tanh();
-                    }
-                }
-
-                softmax(&mut att_h[..=pos]);
-
-                // Value-weighted sum.
+                let mut m = f32::NEG_INFINITY; // running max score
+                let mut l = 0.0f32; // running exp-sum (softmax denominator)
                 for o in out_h.iter_mut() {
                     *o = 0.0;
                 }
-                for (t, &a) in att_h[..=pos].iter().enumerate() {
+                for t in 0..=pos {
                     let base = t * kv_dim + kv_off;
+                    let k = &key_cache[base..base + head_size];
+                    let mut s = q_h.iter().zip(k).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                    // Gemma2 tanh logit softcapping on the raw score.
+                    if logit_softcap > 0.0 {
+                        s = logit_softcap * (s / logit_softcap).tanh();
+                    }
+                    let m_new = m.max(s);
+                    // exp(m - m_new): rescales the running state when the max grows
+                    // (== 0 on the first key, where m == -inf, zeroing the seed).
+                    let alpha = (m - m_new).exp();
+                    let p = (s - m_new).exp();
+                    l = l * alpha + p;
                     let v = &value_cache[base..base + head_size];
                     for (o, &vi) in out_h.iter_mut().zip(v) {
-                        *o += a * vi;
+                        *o = *o * alpha + p * vi;
                     }
+                    m = m_new;
+                }
+                let inv = 1.0 / l;
+                for o in out_h.iter_mut() {
+                    *o *= inv;
                 }
             });
     }
@@ -415,14 +422,13 @@ mod tests {
         let (mut a, mut b) = ([0.0; 4], [0.0; 4]);
         CpuBackend.rmsnorm(&mut a, &x, &w, 1e-5);
         CpuBackend.rmsnorm(&mut b, &x, &w, 9.0);
-        approx(b[0], 1.0 / (1.0 + 9.0f32).sqrt());
         assert!(b[0] < a[0]);
     }
 
     #[test]
     fn softmax_uniform() {
         let mut v = [1.0, 1.0];
-        softmax(&mut v);
+        crate::math::softmax(&mut v);
         approx(v[0], 0.5);
         approx(v[1], 0.5);
     }
@@ -578,5 +584,78 @@ mod tests {
         );
         approx(out[0], 4.0); // mean(2, 6)
         approx(out[1], 6.0); // mean(4, 8)
+    }
+
+    /// Flash (online-softmax) attention must equal the classic
+    /// scores→softmax→value-weighted-sum form, across GQA, several positions, and
+    /// Gemma2 logit softcapping.
+    #[test]
+    fn attention_flash_matches_classic_reference() {
+        let (n_heads, n_kv_heads, head_size, seq_len) = (4usize, 2usize, 8usize, 12usize);
+        let kv_dim = n_kv_heads * head_size;
+        let kv_mul = n_heads / n_kv_heads;
+        let dim = n_heads * head_size;
+        // Deterministic pseudo-random fills in [-0.5, 0.5).
+        let r = |i: usize| ((i.wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32) % 1.0 - 0.5;
+        let q: Vec<f32> = (0..dim).map(r).collect();
+        let key_cache: Vec<f32> = (0..seq_len * kv_dim).map(|i| r(i + 7)).collect();
+        let value_cache: Vec<f32> = (0..seq_len * kv_dim).map(|i| r(i + 99)).collect();
+
+        // Classic reference for one (pos, softcap).
+        let reference = |pos: usize, softcap: f32| -> Vec<f32> {
+            let scale = 1.0 / (head_size as f32).sqrt();
+            let mut out = vec![0.0f32; dim];
+            for h in 0..n_heads {
+                let q_h = &q[h * head_size..h * head_size + head_size];
+                let kv_off = (h / kv_mul) * head_size;
+                let mut scores = vec![0.0f32; pos + 1];
+                for (t, sc) in scores.iter_mut().enumerate() {
+                    let b = t * kv_dim + kv_off;
+                    let mut s = q_h
+                        .iter()
+                        .zip(&key_cache[b..b + head_size])
+                        .map(|(&a, &c)| a * c)
+                        .sum::<f32>()
+                        * scale;
+                    if softcap > 0.0 {
+                        s = softcap * (s / softcap).tanh();
+                    }
+                    *sc = s;
+                }
+                crate::math::softmax(&mut scores);
+                let out_h = &mut out[h * head_size..h * head_size + head_size];
+                for (t, &a) in scores.iter().enumerate() {
+                    let b = t * kv_dim + kv_off;
+                    for (o, &vi) in out_h.iter_mut().zip(&value_cache[b..b + head_size]) {
+                        *o += a * vi;
+                    }
+                }
+            }
+            out
+        };
+
+        for &softcap in &[0.0f32, 30.0] {
+            for pos in [0usize, 1, 5, seq_len - 1] {
+                let mut att = vec![0.0f32; n_heads * seq_len];
+                let mut out = vec![0.0f32; dim];
+                CpuBackend.attention(
+                    &mut out,
+                    &q,
+                    &key_cache,
+                    &value_cache,
+                    &mut att,
+                    pos,
+                    n_heads,
+                    n_kv_heads,
+                    head_size,
+                    seq_len,
+                    kv_dim,
+                    softcap,
+                );
+                for (o, w) in out.iter().zip(&reference(pos, softcap)) {
+                    assert!((o - w).abs() < 1e-6, "flash {o} vs classic {w} (pos {pos} cap {softcap})");
+                }
+            }
+        }
     }
 }

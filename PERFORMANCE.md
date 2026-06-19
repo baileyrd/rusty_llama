@@ -208,9 +208,17 @@ separable from the CLI but is far below llama.cpp regardless).
    `RUSTY_LLAMA_CUDA_NO_QGEMV`. Correctness: integer-core parity vs the CPU dot +
    multi-step / prefill→decode coherence (rel L2 ≤6e-4). **Phase 2.2** also made
    the prefill→decode KV handoff device-resident (the one-time host round-trip is
-   gone). The residual ~2× to llama.cpp is kernel tuning + flash attention.
-4. **Flash attention** (tiled) for long context; **cache-blocked CPU prefill
-   GEMM**.
+   gone). The residual ~2× to llama.cpp is **GEMV/kernel tuning** — flash
+   attention (item 4) was measured decode-neutral, ruling attention out as the
+   residual decode cost.
+4. **Flash (online-softmax) attention — DONE (Phase 5.2), decode-neutral.** A
+   single streaming pass with a running max/sum/accumulator, so no
+   `seq_len`-sized score buffer: the CPU oracle drops its per-head `att` scratch,
+   and the CUDA resident kernel (cooperative, tiled) no longer caps context by
+   shared memory (validated to 16 384 tokens). Decode tok/s unchanged within
+   noise (attention is a small slice of decode); adopted for the long-context /
+   memory win, not speed. Still open: **cache-blocked CPU prefill GEMM**. Plan:
+   `docs/Architecture/plans/phase-5-flash-attention.md`.
 5. **Breadth (usefulness, not speed):** more architectures (Qwen/Gemma/Phi/MoE),
    IQ-quants, KV-cache quantization, richer samplers (min-p, repetition penalty,
    GBNF grammars), batching / server.

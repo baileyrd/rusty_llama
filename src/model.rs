@@ -1482,20 +1482,6 @@ fn softcap(x: &mut [f32], cap: f32) {
     }
 }
 
-/// Numerically stable in-place softmax.
-fn softmax_inplace(x: &mut [f32]) {
-    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
-    }
-    let inv = 1.0 / sum;
-    for v in x.iter_mut() {
-        *v *= inv;
-    }
-}
-
 /// One token's mixture-of-experts FFN: route `xn` (the FFN-normed input row,
 /// length `dim`) through the top-k experts and write the result into `out`
 /// (length `dim`).
@@ -1532,7 +1518,7 @@ fn moe_ffn_row<B: Backend + ?Sized>(
 
     // Router logits → softmax probabilities over all experts.
     backend.matmul(router, xn, &w.ffn_gate_inp[layer]);
-    softmax_inplace(router);
+    crate::math::softmax(router);
 
     // Select the top-k experts by probability (ties → lower index).
     let mut sel: Vec<(usize, f32)> = Vec::with_capacity(p.n_expert_used);
@@ -1812,7 +1798,7 @@ mod tests {
 
         let mut probs = vec![0.0; ne];
         backend.matmul(&mut probs, &xn, &m.weights.ffn_gate_inp[0]);
-        softmax_inplace(&mut probs);
+        crate::math::softmax(&mut probs);
         let mut want = vec![0.0; dim];
         for (e, &prob) in probs.iter().enumerate() {
             let (mut ge, mut ue) = (vec![0.0; hidden], vec![0.0; hidden]);
@@ -1904,7 +1890,7 @@ mod tests {
         // index), weights = RAW probs (NOT renormalized — the Qwen2-MoE delta).
         let mut probs = vec![0.0; ne];
         backend.matmul(&mut probs, &xn, &m.weights.ffn_gate_inp[0]);
-        softmax_inplace(&mut probs);
+        crate::math::softmax(&mut probs);
         let mut idx: Vec<usize> = (0..ne).collect();
         idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b)));
         let mut want = vec![0.0; dim];

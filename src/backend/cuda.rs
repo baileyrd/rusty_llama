@@ -130,12 +130,13 @@ extern "C" __global__ void rope_kernel(float* q, float* k, const float* inv_freq
         kr[i + 1] = k0 * fci + k1 * fcr;
     }
 }
-// Causal GQA, one thread BLOCK per (row, head) — cooperative, not one thread
-// per (row, head). Threads split the keys for the scores and the head dims for
-// the output; the score row + softmax reduction live in shared memory (no
-// global scratch). `blockDim.x` must be a power of two. Dynamic shared layout:
-// [ sq: head_size | sc: seq_len | red: blockDim.x ] floats. Matches
-// CpuBackend::attention_batch.
+// Causal GQA flash attention: one thread BLOCK per (row, head), streaming the
+// keys in tiles of `blockDim.x` with an online (running-max) softmax. No
+// `seq_len`-sized score buffer — only a per-tile prob row — so context is not
+// bounded by shared memory. `blockDim.x` must be a power of two. Dynamic shared
+// layout: [ sq: head_size | sp: blockDim.x | acc: head_size | red: blockDim.x ]
+// floats. The resident decode path is Llama-only, so no logit softcap here
+// (Gemma2's softcap runs the per-op path, which delegates attention to the CPU).
 extern "C" __global__ void attention_kernel(float* out, const float* q,
         const float* kcache, const float* vcache,
         int rows, int pos_base, int n_heads, int kv_mul, int head_size,
@@ -150,57 +151,67 @@ extern "C" __global__ void attention_kernel(float* out, const float* q,
     int tid = threadIdx.x, nt = blockDim.x;
 
     extern __shared__ float smem[];
-    float* sq = smem;                 // head_size: this (row,head)'s query
-    float* sc = sq + head_size;       // seq_len: scores, used 0..=pos
-    float* red = sc + seq_len;        // nt: reduction scratch
+    float* sq  = smem;                // head_size: this (row,head)'s query
+    float* sp  = sq + head_size;      // nt: current tile's softmax probabilities
+    float* acc = sp + nt;             // head_size: running value accumulator
+    float* red = acc + head_size;     // nt: reduction scratch
 
-    for (int i = tid; i < head_size; i += nt) sq[i] = qh[i];
+    for (int i = tid; i < head_size; i += nt) { sq[i] = qh[i]; acc[i] = 0.0f; }
     __syncthreads();
 
     float scale = 1.0f / sqrtf((float)head_size);
-    // Scores q·k_t (threads split the keys), tracking a per-thread max.
-    float lmax = -1e30f;
-    for (int t = tid; t <= pos; t += nt) {
-        const float* kt = kcache + (long long)t * kv_dim + kv_off;
-        float s = 0.0f;
-        for (int i = 0; i < head_size; i++) s += sq[i] * kt[i];
-        s *= scale;
-        sc[t] = s;
-        if (s > lmax) lmax = s;
-    }
-    red[tid] = lmax;
-    __syncthreads();
-    for (int s = nt / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
-        __syncthreads();
-    }
-    float maxv = red[0];
-    __syncthreads();
+    float m = -1e30f; // running max score (all threads track it identically)
+    float l = 0.0f;   // running exp-sum
 
-    // Exponentiate (threads split the keys), reduce the sum.
-    float lsum = 0.0f;
-    for (int t = tid; t <= pos; t += nt) {
-        float e = expf(sc[t] - maxv);
-        sc[t] = e;
-        lsum += e;
-    }
-    red[tid] = lsum;
-    __syncthreads();
-    for (int s = nt / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] += red[tid + s];
-        __syncthreads();
-    }
-    float invsum = 1.0f / red[0];
-
-    // Output: each thread owns a stride of head dims, summed over all keys.
-    float* outh = out + (long long)r * dim + (long long)h * head_size;
-    for (int i = tid; i < head_size; i += nt) {
-        float acc = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            acc += sc[t] * vcache[(long long)t * kv_dim + kv_off + i];
+    for (int tile = 0; tile <= pos; tile += nt) {
+        int t = tile + tid;
+        // 1. score for this thread's key (-inf past `pos`).
+        float s = -1e30f;
+        if (t <= pos) {
+            const float* kt = kcache + (long long)t * kv_dim + kv_off;
+            float dot = 0.0f;
+            for (int i = 0; i < head_size; i++) dot += sq[i] * kt[i];
+            s = dot * scale;
         }
-        outh[i] = acc * invsum;
+        // 2. tile max.
+        red[tid] = s;
+        __syncthreads();
+        for (int o = nt / 2; o > 0; o >>= 1) {
+            if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m, red[0]);
+        __syncthreads();
+        float alpha = expf(m - m_new); // rescales running state when the max grows
+        // 3. probability for this thread's key.
+        float p = (t <= pos) ? expf(s - m_new) : 0.0f;
+        sp[tid] = p;
+        // 4. tile sum.
+        red[tid] = p;
+        __syncthreads();
+        for (int o = nt / 2; o > 0; o >>= 1) {
+            if (tid < o) red[tid] += red[tid + o];
+            __syncthreads();
+        }
+        l = l * alpha + red[0];
+        __syncthreads();
+        // 5. accumulate this tile's value-weighted contribution; each thread owns
+        //    a stride of head dims and loops the tile's keys.
+        int tile_count = (pos + 1 - tile < nt) ? (pos + 1 - tile) : nt;
+        for (int i = tid; i < head_size; i += nt) {
+            float a = acc[i] * alpha;
+            for (int j = 0; j < tile_count; j++) {
+                a += sp[j] * vcache[(long long)(tile + j) * kv_dim + kv_off + i];
+            }
+            acc[i] = a;
+        }
+        m = m_new;
+        __syncthreads(); // sp/acc consumed before the next tile overwrites sp
     }
+
+    float invl = 1.0f / l;
+    float* outh = out + (long long)r * dim + (long long)h * head_size;
+    for (int i = tid; i < head_size; i += nt) outh[i] = acc[i] * invl;
 }
 // Activation -> Q8_K (block-256). Mirrors quantize_activation_q8k (src/quant.rs:436)
 // EXACTLY (not llama.cpp's block-32 q8_1): per 256-elem super-block, signed-max
@@ -911,13 +922,15 @@ impl CudaBackend {
             seq_len as i32,
             kv_dim as i32,
         );
-        // One block per (row, head); 128 (power-of-two) threads cooperate.
-        // Shared: [ query head_size | scores seq_len | reduction 128 ] floats.
+        // One block per (row, head); 128 (power-of-two) threads cooperate, the
+        // keys streamed in tiles. Shared: [ query head_size | tile probs BLOCK |
+        // accumulator head_size | reduction BLOCK ] floats — no seq_len term, so
+        // context isn't bounded by shared memory.
         const BLOCK: u32 = 128;
         let cfg = LaunchConfig {
             grid_dim: ((rows * n_heads) as u32, 1, 1),
             block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: (head_size as u32 + seq_len as u32 + BLOCK) * 4,
+            shared_mem_bytes: (2 * head_size as u32 + 2 * BLOCK) * 4,
         };
         let mut b = self.stream.launch_builder(&self.kernels.attention);
         b.arg(out)
@@ -1868,6 +1881,42 @@ mod tests {
         let mut att = vec![0.0; n_heads * seq_len];
         CpuBackend.attention_batch(
             &mut want, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0,
+        );
+        close_approx(&got, &want, 1e-4, 1e-4);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device; run with --features cuda -- --ignored --nocapture"]
+    fn dev_attention_flash_long_context_parity() {
+        // seq_len far beyond one tile (BLOCK=128) AND beyond what the old
+        // shared-memory score buffer could hold ((head_size + seq_len + 128) * 4
+        // > 48 KB): proves the tiled online-softmax combine is correct and the
+        // context is no longer bounded by shared memory.
+        let Some(b) = cuda() else { return };
+        let (n_heads, n_kv_heads, head_size, seq_len) = (2usize, 1usize, 8usize, 16384usize);
+        let kv_dim = n_kv_heads * head_size;
+        let dim = n_heads * head_size;
+        let (rows, pos_base) = (2usize, 16000usize); // rows attend ~125 tiles
+        let q = noise(rows * dim, 11);
+        let kc = noise(seq_len * kv_dim, 12);
+        let vc = noise(seq_len * kv_dim, 13);
+
+        let qd = b.stream.clone_htod(&q).unwrap();
+        let kcd = b.stream.clone_htod(&kc).unwrap();
+        let vcd = b.stream.clone_htod(&vc).unwrap();
+        let mut outd = b.stream.alloc_zeros::<f32>(rows * dim).unwrap();
+        b.dev_attention(
+            &mut outd, &qd, &kcd, &vcd, rows, pos_base, n_heads, n_heads / n_kv_heads, head_size,
+            seq_len, kv_dim,
+        );
+        b.stream.synchronize().unwrap();
+        let got = b.stream.clone_dtoh(&outd).unwrap();
+
+        let mut want = vec![0.0; rows * dim];
+        let mut att = vec![0.0; n_heads * seq_len];
+        CpuBackend.attention_batch(
+            &mut want, &q, &kc, &vc, &mut att, pos_base, rows, n_heads, n_kv_heads, head_size,
+            seq_len, kv_dim, 0.0,
         );
         close_approx(&got, &want, 1e-4, 1e-4);
     }
