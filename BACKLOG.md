@@ -179,10 +179,17 @@ cool machine; numbers below are reasoned, not all freshly benched.
   likely hurts via work-stealing imbalance. Try a persistent/pinned pool or
   P-core-only; helps CPU decode (the 33 vs ~49 GB/s gap) + prefill broadly.
   UNVERIFIED (thermal killed the probe) — needs a cool-machine measurement.
-- [ ] **L3. Redundant activation re-quant.** q/k/v share the same normed input
-  (quantized 3×), gate/up share theirs (2×); decode (`forward`) and prefill
-  (`matmul_batch` re-quantizes shared `xb`) both pay it. Quantize once per shared
-  input. Bounded, ~few %.
+- [x] **L3. Redundant activation re-quant — DONE (+7% decode).** q/k/v share the
+  attention-norm'd input, gate/up share the ffn-norm'd input, yet each `matmul`
+  re-quantized it. Added `Backend::matmul_shared` (default = per-weight; CPU
+  override quantizes the shared activation once and reuses it across the weights)
+  and wired the single-token decode (`forward_with`). **Bit-exact** (same quant
+  bytes; `matmul_shared_bit_identical_to_per_weight` asserts `to_bits` equality).
+  Interleaved A/B: **decode 49 → 52.5 t/s (~7%)**, 4/4 rounds — bigger than the
+  work-ratio suggested because the serial quant is a larger share of *wall-clock*
+  than the ÷cores-parallel dots. Prefill unchanged (its per-row quant is already
+  parallel). `RUSTY_LLAMA_NO_SHARED_ACT` toggles it. Follow-up: the batched
+  server path (`Batch::decode_step` / `matmul_batch`) could share too (smaller win).
 - [✗] **L4. PGO + fat-LTO — SPIKED, RULED OUT.** Both regress this workload.
   `lto="fat"` (vs the current `"thin"`+`codegen-units=1`): no win, wash-to-slightly-worse.
   **PGO** (instrument → real-generation profile → `profile-use` rebuild), measured
@@ -208,7 +215,7 @@ cool machine; numbers below are reasoned, not all freshly benched.
 - [ ] **L10. wgpu megakernel** (collapse the ~300 serial compute passes/step) for
   the non-NVIDIA path (wgpu ~8× behind, overhead-bound not tensor-core-bound).
 
-Order: **L1 + L4 both ruled out** (occupancy regression; LTO/PGO disrupt the SIMD
-kernels). Two of the three "easy" GPU/build levers are dead — the codegen is already
-tuned. Next bounded: **L2 (CPU threading, needs a cool machine)**, else L3/L5/L6
-(small, bit-exact CPU tweaks), then the treadmill (L7-L10) only if worth it.
+Order: **L3 DONE (+7% decode, bit-exact); L1 + L4 ruled out** (occupancy regression;
+LTO/PGO disrupt the SIMD kernels). Remaining bounded: **L2 (CPU threading, needs a
+cool machine)** and L5/L6 (small, bit-exact CPU tweaks), then the treadmill (L7-L10)
+only if worth it.
