@@ -218,7 +218,8 @@ An autonomous execution pass. **Landed + merged (verified on this machine):**
 | #37 | 6.3 CUDA prefill shared f16 narrow | pp512 **4671 → ~5230 t/s (1.12×)**, coherence held | merged |
 | #38 | wgpu doc-drift fix + roadmap finalize | — | merged |
 | #39 | **6.2 CUDA-graph decode capture** | tg128 **206 → 289 t/s** (1.40× graph; 1.51× over original 191) | merged |
-| 6.1+ | **CPU tiled int8 GEMM (unpack-amortized)** | pp512 **113 → 141 t/s** (+25%; 45 → 141 = 3.1× over original per-row) | this PR |
+| #40 | **CPU unpack-amortized batched dots** | pp512 **113 → 141 t/s** (+25%) | merged |
+| 6.1++ | **CPU register-tiled GEMM (MR=4)** | pp512 **141 → 214 t/s** (+52%; 45 → 214 = ~4.75× over original per-row) | this PR |
 
 **Empirical corrections to this review's own estimates** (the value of actually
 running it):
@@ -254,13 +255,14 @@ each is a focused effort). Scoping is concrete so they're a cold start:
    f16 cuBLAS GEMM with on-device int8: `quantize_q8k` activation (kernel exists)
    + cuBLASLt IMMA (`CUDA_R_8I`/`COMPUTE_32I`) or a packed-weight `__dp4a` MMQ
    (the decode `gemv_q4_k`/`gemv_q6_k` + `weight_packed` cache already exist).
-3. **CPU tiled GEMM micro-kernel (6.1/6.4 cont.) — PARTIAL DONE (this PR).**
-   Unpack-amortized batched k-quant dots (`vec_dot_q4_k_batch`/`q6_k_batch`: each
-   weight super-block unpacked ONCE per token-block, reused across columns):
-   pp512 **113 → 141 t/s (+25%; 3.1× over the original per-row)**, bit-exact. The
-   residual ~43× to llama.cpp needs the full **register-tiled micro-kernel**
-   (multiple token outputs per loaded weight vector) + activation-locality
-   blocking — the hard part, deferred.
+3. **CPU register-tiled GEMM (6.1/6.4 cont.) — DONE (this PR).** MR=4 multi-row
+   tiled dots (`vec_dot_q4_k_tiled`/`q6_k_tiled`): process 4 output rows per task
+   so each activation sub-block is loaded ONCE and reused across the 4 rows
+   (prefill was L3-bound on activation reuse — each act otherwise re-read once per
+   output feature). pp512 **141 → 214 t/s (+52%; ~4.75× over the original
+   per-row)**, bit-exact. Now **~28× behind** llama.cpp (was ~43×). MR=8 spills
+   the deferred-hsum accumulators (16 YMM), so MR=4 is the sweet spot; the residual
+   is per-row weight unpack + madd/hsum throughput (kernel tuning).
 
 After 1–3, snapshot targets: CUDA decode ~1.1–1.2×, CUDA prefill ~1.6–2×, CPU
 prefill ~1.5–2× behind llama.cpp. Parity-as-a-maintained-property stays a

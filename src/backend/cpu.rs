@@ -12,7 +12,7 @@ use crate::backend::Backend;
 use crate::math::silu;
 use crate::quant::{
     dequant_block, dequantize_into, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0,
-    vec_dot_q4_k, vec_dot_q4_k_batch, vec_dot_q6_k, vec_dot_q6_k_batch, vec_dot_q8_0, GgmlType,
+    vec_dot_q4_k, vec_dot_q4_k_tiled, vec_dot_q6_k, vec_dot_q6_k_tiled, vec_dot_q8_0, GgmlType,
     Q8Activation, Q8KActivation, MAX_BLOCK,
 };
 use crate::tensor::QMatrix;
@@ -177,16 +177,23 @@ impl Backend for CpuBackend {
                             .into_par_iter()
                             .map(|r| quantize_activation_q8k(xr(r)))
                             .collect();
-                        // Unpack-amortized batched dot: each weight super-block is
-                        // unpacked ONCE per token-block and reused across columns,
-                        // vs the per-column path re-unpacking it per token.
-                        let batch: fn(&[u8], &[Q8KActivation], &mut [f32]) = match ty {
-                            GgmlType::Q4_K => vec_dot_q4_k_batch,
-                            _ => vec_dot_q6_k_batch,
+                        // Register-tiled GEMM: process MR=4 output rows per task so
+                        // each activation is loaded once and reused across the 4
+                        // rows (prefill is L3-bound on activation reuse), and each
+                        // weight super-block is unpacked once per token-block.
+                        let tiled: fn(&[&[u8]], &[Q8KActivation], &mut [f32]) = match ty {
+                            GgmlType::Q4_K => vec_dot_q4_k_tiled,
+                            _ => vec_dot_q6_k_tiled,
                         };
-                        tmp.par_chunks_mut(rows)
-                            .enumerate()
-                            .for_each(|(i, col)| batch(row(i), &acts, col));
+                        tmp.par_chunks_mut(4 * rows).enumerate().for_each(|(blk, out_block)| {
+                            let i0 = blk * 4;
+                            let nr = out_block.len() / rows;
+                            let mut wrows: [&[u8]; 4] = [&[]; 4];
+                            for (r, wr) in wrows[..nr].iter_mut().enumerate() {
+                                *wr = row(i0 + r);
+                            }
+                            tiled(&wrows[..nr], &acts, out_block);
+                        });
                     }
                     // F16 (block size 1): dequantize each weight row once and
                     // reuse it. A sequential dot over the dequantized row is
