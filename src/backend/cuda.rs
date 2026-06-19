@@ -1067,9 +1067,10 @@ impl Backend for CudaBackend {
     /// GEMVs (bandwidth-bound — where f16/quantized weights pay off). Mirrors
     /// [`crate::model::forward`] op-for-op; result must match the CPU path.
     fn forward_step(&self, model: &Model, state: &mut RunState, token: usize, pos: usize) {
-        // Non-Llama archs (Qwen2/Phi-3/Gemma2) run the generic per-op path; the
-        // resident fused decode below is the Llama-only fast path.
-        if !model.config.arch.uses_resident_decode() {
+        // Non-Llama archs (Qwen2/Phi-3/Gemma2) and MoE models run the generic
+        // per-op path; the resident fused decode below is the dense-Llama-only
+        // fast path.
+        if !model.config.uses_resident_decode() {
             crate::model::forward(model, state, self, token, pos);
             return;
         }
@@ -1198,7 +1199,7 @@ impl Backend for CudaBackend {
         tokens: &[usize],
         pos_base: usize,
     ) {
-        if pos_base != 0 || !model.config.arch.uses_resident_decode() {
+        if pos_base != 0 || !model.config.uses_resident_decode() {
             crate::model::forward_prefill(model, state, self, tokens, pos_base);
             return;
         }

@@ -3,12 +3,12 @@
 
 use rusty_llama::dummy::{
     synthetic_control_vector_gguf, synthetic_gguf, synthetic_gguf_arch, synthetic_gguf_gpt2,
-    synthetic_gguf_gpt2_special, synthetic_gguf_typed, synthetic_lora_gguf,
+    synthetic_gguf_gpt2_special, synthetic_gguf_moe, synthetic_gguf_typed, synthetic_lora_gguf,
 };
 use rusty_llama::quant::dequantize;
 use rusty_llama::{
-    forward, forward_prefill, generate, Arch, Config, ControlVector, CpuBackend, GgmlType, Gguf,
-    LoraAdapter, Model, RopeScaling, RunState, SamplerChain, Tokenizer,
+    forward, forward_prefill, generate, Arch, Batch, Config, ControlVector, CpuBackend, GgmlType,
+    Gguf, LoraAdapter, Model, RopeScaling, RunState, SamplerChain, Tokenizer,
 };
 
 fn cfg() -> Config {
@@ -484,4 +484,115 @@ fn gemma2_explicit_head_dim_q_dim_ne_dim_forward_finite() {
     forward_prefill(&model, &mut s, &backend, &[1, 2, 3], 0);
     assert_eq!(s.logits().len(), c.vocab_size);
     assert!(s.logits().iter().all(|v| v.is_finite()));
+}
+
+// --- Mixture-of-experts (Phase 3.2): Mixtral-style routed MoE -----------------
+
+fn moe_cfg() -> Config {
+    Config {
+        dim: 16,
+        hidden_dim: 32,
+        n_layers: 2,
+        n_heads: 4,
+        n_kv_heads: 2,
+        vocab_size: 32,
+        seq_len: 16,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn moe_loads_and_generates() {
+    let c = moe_cfg();
+    let bytes = synthetic_gguf_moe(&c, 8, 2);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+
+    // Mixtral is the `llama` graph plus expert counts; no dense FFN tensors.
+    assert_eq!(model.config.arch, Arch::Llama);
+    assert_eq!(model.config.n_expert, 8);
+    assert_eq!(model.config.n_expert_used, 2);
+    assert!(!model.config.uses_resident_decode());
+    assert_eq!(model.weights.ffn_gate_inp.len(), c.n_layers);
+    assert_eq!(model.weights.w1_exp[0].len(), 8);
+    assert!(model.weights.w1.is_empty());
+
+    // Finite prefill, and greedy generation runs and is reproducible.
+    let backend = CpuBackend::new();
+    let mut s = RunState::new(&model.config);
+    forward_prefill(&model, &mut s, &backend, &[1, 2, 3], 0);
+    assert_eq!(s.logits().len(), c.vocab_size);
+    assert!(s.logits().iter().all(|v| v.is_finite()));
+
+    let tok = Tokenizer::from_gguf(&gguf).unwrap();
+    let run = || {
+        let mut st = RunState::new(&model.config);
+        let mut sampler = SamplerChain::new(c.vocab_size, 0.0, 0.9, 1);
+        let mut out = Vec::new();
+        generate(&model, &mut st, &backend, &tok, &mut sampler, "hi", 6, |b| {
+            out.extend_from_slice(b)
+        });
+        out
+    };
+    assert_eq!(run(), run(), "MoE greedy generation must be reproducible");
+}
+
+#[test]
+fn moe_batched_decode_matches_independent_sequences() {
+    let c = moe_cfg();
+    let bytes = synthetic_gguf_moe(&c, 8, 2);
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    let backend = CpuBackend::new();
+    let argmax = |v: &[f32]| -> usize {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let prompts: [&[usize]; 3] = [&[1, 5, 3], &[2, 7], &[4, 6, 2, 1]];
+    let gen = 3usize;
+
+    // Reference: each sequence decoded independently, greedily.
+    let reference: Vec<Vec<usize>> = prompts
+        .iter()
+        .map(|prompt| {
+            let mut state = RunState::new(&model.config);
+            forward_prefill(&model, &mut state, &backend, prompt, 0);
+            let mut tok = argmax(state.logits());
+            let mut toks = Vec::new();
+            for step in 0..gen {
+                toks.push(tok);
+                forward(&model, &mut state, &backend, tok, prompt.len() + step);
+                tok = argmax(state.logits());
+            }
+            toks
+        })
+        .collect();
+
+    // Batched: prefill each prompt into its slot, then decode all together.
+    let mut batch = Batch::new(&model.config, prompts.len());
+    let mut states: Vec<RunState> =
+        (0..prompts.len()).map(|_| RunState::new(&model.config)).collect();
+    let (mut cur, mut positions) = (Vec::new(), Vec::new());
+    for (s, prompt) in prompts.iter().enumerate() {
+        forward_prefill(&model, &mut states[s], &backend, prompt, 0);
+        cur.push(argmax(states[s].logits()));
+        positions.push(prompt.len());
+    }
+    let slots: Vec<usize> = (0..prompts.len()).collect();
+    let mut batched: Vec<Vec<usize>> = vec![Vec::new(); prompts.len()];
+    for _ in 0..gen {
+        for (s, b) in batched.iter_mut().enumerate() {
+            b.push(cur[s]);
+        }
+        let logits = batch.decode_step(&model, &backend, &mut states, &slots, &cur, &positions);
+        for s in 0..prompts.len() {
+            cur[s] = argmax(&logits[s * model.config.vocab_size..(s + 1) * model.config.vocab_size]);
+            positions[s] += 1;
+        }
+    }
+
+    assert_eq!(batched, reference, "MoE batched decode must match independent runs");
 }

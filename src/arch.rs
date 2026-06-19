@@ -71,6 +71,13 @@ pub struct TensorNames {
     pub ffn_down: &'static str,
     /// Post-FFN "sandwich" norm (Gemma2).
     pub ffn_post_norm: &'static str,
+    /// MoE router (gates tokens to experts) — a `(n_expert, dim)` projection.
+    pub ffn_gate_inp: &'static str,
+    /// MoE expert weight stacks — 3-D `(n_expert, *, *)` tensors split per
+    /// expert at load. Present only when `config.n_expert > 0` (Mixtral).
+    pub ffn_gate_exps: &'static str,
+    pub ffn_up_exps: &'static str,
+    pub ffn_down_exps: &'static str,
 }
 
 /// The canonical GGUF tensor names (the literals previously inlined in
@@ -95,6 +102,10 @@ pub const TENSOR_NAMES: TensorNames = TensorNames {
     ffn_up: "ffn_up.weight",
     ffn_down: "ffn_down.weight",
     ffn_post_norm: "post_ffw_norm.weight",
+    ffn_gate_inp: "ffn_gate_inp.weight",
+    ffn_gate_exps: "ffn_gate_exps.weight",
+    ffn_up_exps: "ffn_up_exps.weight",
+    ffn_down_exps: "ffn_down_exps.weight",
 };
 
 impl Arch {
