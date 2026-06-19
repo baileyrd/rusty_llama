@@ -155,3 +155,51 @@ lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge 
   real-model CPU/wgpu benches in the rigorous harness; warmup+reps for the CPU
   baseline; hoist `RunState` out of the timed prefill region; fix stale
   "TF32"/"dequant-to-f32-on-host"/"no AVX2" doc claims. See the phase-6 doc.
+
+## Further performance levers (2026-06-19 survey)
+
+After PRs #35–#41 the big bounded wins are largely captured (CUDA decode ~1.31×,
+CUDA prefill ~3.0×, CPU prefill ~28×, CPU decode ~1.35× behind llama.cpp). What
+remains is small-but-real bounded levers + treadmill-class kernels. **Caveat:**
+the dev laptop thermally saturates under sustained load — re-measure CPU/GPU on a
+cool machine; numbers below are reasoned, not all freshly benched.
+
+**Bounded / accurate / lower-risk (do these before the int8 treadmill):**
+- [✗] **L1. CUDA attention coalescing — SPIKED, RULED OUT.** Staged each K tile in
+  padded shared for coalesced global reads (vs the strided per-thread dot).
+  Bit-exact (parity held), but **measured 1.8× SLOWER prefill (4927 → 2706 t/s)**:
+  the 34 KB/block shared tile collapses occupancy, and prefill launches ~16,384
+  attention blocks where high occupancy matters far more — the block-parallelism
+  already hides the uncoalesced-read latency. So the "uncoalesced attention" the
+  prefill review flagged is **not** a prefill bottleneck (the GEMMs are). Reverted.
+  (A warp-per-key variant would coalesce without the shared cost, but the same
+  occupancy/parallelism argument says the upside is small; not pursued.)
+- [ ] **L2. CPU threading.** rayon does a fork-join **per op** (~154/token); the
+  285H's 8 LP-E cores are far slower than the 6 P-cores, so oversubscription
+  likely hurts via work-stealing imbalance. Try a persistent/pinned pool or
+  P-core-only; helps CPU decode (the 33 vs ~49 GB/s gap) + prefill broadly.
+  UNVERIFIED (thermal killed the probe) — needs a cool-machine measurement.
+- [ ] **L3. Redundant activation re-quant.** q/k/v share the same normed input
+  (quantized 3×), gate/up share theirs (2×); decode (`forward`) and prefill
+  (`matmul_batch` re-quantizes shared `xb`) both pay it. Quantize once per shared
+  input. Bounded, ~few %.
+- [ ] **L4. PGO + fat-LTO build.** Profile-guided + `lto="fat"` often buys a few %
+  across every path for ~zero code risk. Cheapest experiment; try first.
+- [ ] **L5. CPU RoPE cos/sin recompute.** `CpuBackend::rope` recomputes cos/sin
+  per head (~32× redundant); precompute the `head_size/2` values per position.
+  Small (~1-2%), bit-exact.
+- [ ] **L6. Tune the packed dp4a decode GEMV** (rows/block, coalescing) to chip
+  the residual CUDA decode ~1.31×.
+
+**Treadmill-class / large / higher-risk:**
+- [ ] **L7. CUDA int8 tensor-core MMQ** (CUDA prefill ~3×). No cudarc int8 GEMM →
+  raw-sys cuBLASLt IMMA + lossy W8A8 (vs the exact f16 path). Spike with a
+  kill-criterion; likely no-merge. (= the proposed spike.)
+- [ ] **L8. Tensor-core flash attention** (GPU prefill + long context).
+- [ ] **L9. Aggressive CPU micro-kernel** (NR-tiling, software prefetch, drop the
+  hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
+- [ ] **L10. wgpu megakernel** (collapse the ~300 serial compute passes/step) for
+  the non-NVIDIA path (wgpu ~8× behind, overhead-bound not tensor-core-bound).
+
+Order: **L1 ruled out** (occupancy regression). Next bounded: **L4 (PGO/LTO) →
+L2 (CPU threading, needs a cool machine)**, then the treadmill (L7-L10) if worth it.
