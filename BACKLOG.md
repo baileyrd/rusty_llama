@@ -122,10 +122,16 @@ lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge 
   (1.77×)**, decode unchanged, bit-identical (parity tests pass). Far below the
   ~130× projection: prefill is compute-bound on the un-tuned `vec_dot` kernel, so
   the dominant CPU lever is 6.4 (kernel tuning) — they compound.
-- [ ] **6.2 CUDA-graph decode capture.** Decode issues ~445 launches/step with no
-  graph (`cuda.rs:1143-1197`); rusty hits 127 GB/s vs llama.cpp 252 (both far
-  below peak ⇒ launch-bound). Capture+replay one CUDA graph/token (needs
-  off-NULL-stream + device-resident position). Target 191 → ~300–330 t/s.
+- [x] **6.2 CUDA-graph decode capture — DONE.** Decode issued ~445 launches/step
+  with no graph (launch-bound: rusty 127 GB/s vs llama.cpp 252, both far below
+  peak). Switched to a capturable non-NULL stream, made `pos` device-resident
+  (rope/attention read `const int* pos`; a `kv_append` kernel replaces the
+  fixed-offset dtod memcpy), and capture the per-step kernel sequence once into a
+  `cudarc` `CudaGraph`, replayed per token (gated on all-k-quant weights; toggle
+  `RUSTY_LLAMA_CUDA_NO_GRAPH`). **Measured tg128 206 → 289 t/s (1.40× graph vs
+  direct; 1.51× over the original 191)** — gap to llama.cpp 378 now ~1.31× (was
+  ~1.98×). Coherence held (graph == direct path; rel L2 ≤0.04 vs CPU over greedy
+  decode; `decode_graph_coherent_real`).
 - [~] **6.3 CUDA prefill conversion-kill DONE; int8 MMQ remains.** Shared the
   per-norm f16 narrow across q/k/v and w1/w3 (split `gemm_dev`/`gemm_dev_f16`),
   ~66 fewer cvt passes+allocs/prefill: real-model `pp512` **4671 → ~5230 t/s
