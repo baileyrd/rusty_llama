@@ -635,6 +635,15 @@ impl KvCache {
         &mut self.v[b..b + self.kv_dim]
     }
 
+    /// Both the `kv_dim` key and value slots at `pos` as one disjoint borrow of
+    /// the separate `k`/`v` buffers — lets the q/k/v projections share a single
+    /// quantized activation through [`crate::backend::Backend::matmul_shared`].
+    fn kv_slots_mut(&mut self, layer: usize, pos: usize) -> (&mut [f32], &mut [f32]) {
+        let b = self.layer_base(layer) + pos * self.kv_dim;
+        let kd = self.kv_dim;
+        (&mut self.k[b..b + kd], &mut self.v[b..b + kd])
+    }
+
     /// The contiguous `n`-row key span from `pos_base` (what prefill writes).
     fn k_span_mut(&mut self, layer: usize, pos_base: usize, n: usize) -> &mut [f32] {
         let b = self.layer_base(layer) + pos_base * self.kv_dim;
@@ -962,9 +971,16 @@ pub fn forward_with(
             p.rms_eps,
         );
 
-        backend.matmul(&mut state.q[..q_dim], &state.xb[..dim], &w.wq[layer]);
-        backend.matmul(state.kv.k_slot_mut(layer, pos), &state.xb[..dim], &w.wk[layer]);
-        backend.matmul(state.kv.v_slot_mut(layer, pos), &state.xb[..dim], &w.wv[layer]);
+        {
+            // q/k/v all project the attention-norm'd `xb`: quantize it once.
+            let (k_slot, v_slot) = state.kv.kv_slots_mut(layer, pos);
+            let mut qkv: [&mut [f32]; 3] = [&mut state.q[..q_dim], k_slot, v_slot];
+            backend.matmul_shared(
+                &mut qkv,
+                &state.xb[..dim],
+                &[&w.wq[layer], &w.wk[layer], &w.wv[layer]],
+            );
+        }
         if bias {
             add_bias(&mut state.q[..q_dim], slice(&w.bq, layer, q_dim));
             add_bias(state.kv.k_slot_mut(layer, pos), slice(&w.bk, layer, kv_dim));
@@ -1031,8 +1047,11 @@ pub fn forward_with(
                 &mut state.router,
             );
         } else {
-            backend.matmul(&mut state.hb, &state.xb[..dim], &w.w1[layer]);
-            backend.matmul(&mut state.hb2, &state.xb[..dim], &w.w3[layer]);
+            {
+                // gate (w1) and up (w3) both project the ffn-norm'd `xb`.
+                let mut gu: [&mut [f32]; 2] = [&mut state.hb, &mut state.hb2];
+                backend.matmul_shared(&mut gu, &state.xb[..dim], &[&w.w1[layer], &w.w3[layer]]);
+            }
             match act {
                 FfnActivation::SwiGlu => backend.swiglu(&mut state.hb, &state.hb2),
                 FfnActivation::GeGlu => backend.geglu(&mut state.hb, &state.hb2),

@@ -35,6 +35,42 @@ fn dot_quant_row(ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
     acc
 }
 
+/// Parallel dot of every row of a `Q8_0`/`Q4_0` weight block against a
+/// pre-quantized [`Q8Activation`]. The shared core of [`CpuBackend::matmul`] and
+/// [`CpuBackend::matmul_shared`] so both are bit-identical by construction.
+fn dots_q8(out: &mut [f32], act: &Q8Activation, ty: GgmlType, data: &[u8], cols: usize) {
+    let rb = ty.bytes_for(cols);
+    let dot: fn(&[u8], &Q8Activation) -> f32 = match ty {
+        GgmlType::Q8_0 => vec_dot_q8_0,
+        _ => vec_dot_q4_0,
+    };
+    out.par_iter_mut()
+        .enumerate()
+        .for_each(|(i, o)| *o = dot(&data[i * rb..i * rb + rb], act));
+}
+
+/// Parallel dot of every row of a `Q4_K`/`Q6_K` weight block against a
+/// pre-quantized [`Q8KActivation`]; the k-quant counterpart to [`dots_q8`].
+fn dots_q8k(out: &mut [f32], act: &Q8KActivation, ty: GgmlType, data: &[u8], cols: usize) {
+    let rb = ty.bytes_for(cols);
+    let dot: fn(&[u8], &Q8KActivation) -> f32 = match ty {
+        GgmlType::Q4_K => vec_dot_q4_k,
+        _ => vec_dot_q6_k,
+    };
+    out.par_iter_mut()
+        .enumerate()
+        .for_each(|(i, o)| *o = dot(&data[i * rb..i * rb + rb], act));
+}
+
+/// Whether q/k/v and gate/up reuse one activation quant (default on). Opt out
+/// with `RUSTY_LLAMA_NO_SHARED_ACT` for honest before/after benchmarking, like
+/// the `RUSTY_LLAMA_NO_BLOCKED_GEMM` GEMM toggle.
+fn shared_act_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTY_LLAMA_NO_SHARED_ACT").is_none())
+}
+
 /// A stateless f32 CPU backend.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuBackend;
@@ -69,38 +105,62 @@ impl Backend for CpuBackend {
                     *o = row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum();
                 });
             }
-            QMatrix::Quant { ty, data, cols, .. } => {
-                let rb = ty.bytes_for(*cols);
-                let row = |i: usize| &data[i * rb..i * rb + rb];
-                match ty {
-                    // Q8 activation (32-block) for the simple formats.
-                    GgmlType::Q8_0 | GgmlType::Q4_0 => {
-                        let act = quantize_activation_q8(x);
-                        let dot: fn(&[u8], &Q8Activation) -> f32 = match ty {
-                            GgmlType::Q8_0 => vec_dot_q8_0,
-                            _ => vec_dot_q4_0,
-                        };
-                        out.par_iter_mut()
-                            .enumerate()
-                            .for_each(|(i, o)| *o = dot(row(i), &act));
-                    }
-                    // Q8_K activation (256-block) for the k-quants.
-                    GgmlType::Q4_K | GgmlType::Q6_K => {
-                        let act = quantize_activation_q8k(x);
-                        let dot: fn(&[u8], &Q8KActivation) -> f32 = match ty {
-                            GgmlType::Q4_K => vec_dot_q4_k,
-                            _ => vec_dot_q6_k,
-                        };
-                        out.par_iter_mut()
-                            .enumerate()
-                            .for_each(|(i, o)| *o = dot(row(i), &act));
-                    }
-                    // F16: no integer path; dequantize each block to f32.
-                    _ => {
-                        out.par_iter_mut()
-                            .enumerate()
-                            .for_each(|(i, o)| *o = dot_quant_row(*ty, row(i), x));
-                    }
+            QMatrix::Quant { ty, data, cols, .. } => match ty {
+                // Q8 activation (32-block) for the simple formats.
+                GgmlType::Q8_0 | GgmlType::Q4_0 => {
+                    dots_q8(out, &quantize_activation_q8(x), *ty, data, *cols);
+                }
+                // Q8_K activation (256-block) for the k-quants.
+                GgmlType::Q4_K | GgmlType::Q6_K => {
+                    dots_q8k(out, &quantize_activation_q8k(x), *ty, data, *cols);
+                }
+                // F16: no integer path; dequantize each block to f32.
+                _ => {
+                    let rb = ty.bytes_for(*cols);
+                    out.par_iter_mut()
+                        .enumerate()
+                        .for_each(|(i, o)| *o = dot_quant_row(*ty, &data[i * rb..i * rb + rb], x));
+                }
+            },
+        }
+    }
+
+    /// q/k/v (and gate/up) reuse one activation quant — see
+    /// [`Backend::matmul_shared`]. When every weight uses the same activation
+    /// format (all k-quant → `Q8_K`, or all `Q8_0`/`Q4_0` → `Q8`) the activation
+    /// `x` is quantized once and reused across the weights; any other mix falls
+    /// back to an independent [`Self::matmul`] per weight. The per-weight dots
+    /// call the same [`dots_q8k`]/[`dots_q8`] cores as [`Self::matmul`], so the
+    /// result is bit-identical to quantizing per weight.
+    fn matmul_shared(&self, outs: &mut [&mut [f32]], x: &[f32], ws: &[&QMatrix]) {
+        debug_assert_eq!(outs.len(), ws.len());
+        debug_assert!(ws.iter().all(|w| w.cols() == x.len()));
+        // 1 = Q8_K activation (Q4_K/Q6_K); 2 = Q8 activation (Q8_0/Q4_0); 0 = other.
+        let act_kind = |w: &QMatrix| match w {
+            QMatrix::Quant { ty: GgmlType::Q4_K | GgmlType::Q6_K, .. } => 1u8,
+            QMatrix::Quant { ty: GgmlType::Q8_0 | GgmlType::Q4_0, .. } => 2u8,
+            _ => 0u8,
+        };
+        let kind = ws.first().map_or(0, |w| act_kind(w));
+        if !shared_act_enabled() || kind == 0 || !ws.iter().all(|w| act_kind(w) == kind) {
+            // Mixed activation formats (or f32/f16): nothing to share.
+            for (out, w) in outs.iter_mut().zip(ws) {
+                self.matmul(out, x, w);
+            }
+            return;
+        }
+        if kind == 1 {
+            let act = quantize_activation_q8k(x);
+            for (out, w) in outs.iter_mut().zip(ws) {
+                if let QMatrix::Quant { ty, data, cols, .. } = *w {
+                    dots_q8k(out, &act, *ty, data, *cols);
+                }
+            }
+        } else {
+            let act = quantize_activation_q8(x);
+            for (out, w) in outs.iter_mut().zip(ws) {
+                if let QMatrix::Quant { ty, data, cols, .. } = *w {
+                    dots_q8(out, &act, *ty, data, *cols);
                 }
             }
         }
@@ -485,6 +545,74 @@ mod tests {
         let expect = vec_dot_q6_k(&q6k, &act);
         approx(out[0], expect);
         approx(out[1], expect);
+    }
+
+    #[test]
+    fn matmul_shared_bit_identical_to_per_weight() {
+        use crate::quant::{f32_to_f16, pack_scales_q4_k, quantize_q8_0};
+        let x: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
+        let b = CpuBackend::new();
+
+        // Valid Q4_K block (two identical rows).
+        let mut q4k = Vec::new();
+        q4k.extend_from_slice(&f32_to_f16(0.05).to_le_bytes());
+        q4k.extend_from_slice(&f32_to_f16(0.02).to_le_bytes());
+        q4k.extend_from_slice(&pack_scales_q4_k(
+            [10, 20, 5, 33, 41, 7, 18, 25],
+            [3, 9, 14, 1, 22, 6, 30, 11],
+        ));
+        (0..128u32).for_each(|i| q4k.push(((i * 7 + 3) % 256) as u8));
+        let q4k_rows = {
+            let mut v = q4k.clone();
+            v.extend_from_slice(&q4k);
+            v
+        };
+        let wq = QMatrix::quant(GgmlType::Q4_K, q4k_rows.clone().into(), 2, 256).unwrap();
+        let wk = QMatrix::quant(GgmlType::Q4_K, q4k_rows.into(), 2, 256).unwrap();
+
+        // Valid Q6_K block (two identical rows) — the Q4_K_M `wv` quant.
+        let mut q6k = Vec::new();
+        (0..128u32).for_each(|i| q6k.push(((i * 5 + 1) % 256) as u8));
+        (0..64u32).for_each(|i| q6k.push(((i * 9 + 2) % 256) as u8));
+        (0..16i32).for_each(|i| q6k.push((i - 8) as i8 as u8));
+        q6k.extend_from_slice(&f32_to_f16(0.03).to_le_bytes());
+        let q6k_rows = {
+            let mut v = q6k.clone();
+            v.extend_from_slice(&q6k);
+            v
+        };
+        let wv = QMatrix::quant(GgmlType::Q6_K, q6k_rows.into(), 2, 256).unwrap();
+
+        // Q8_0 weights from real f32 (the other shared-activation format).
+        let wf: Vec<f32> = (0..2 * 256).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect();
+        let w80 = QMatrix::quant(GgmlType::Q8_0, quantize_q8_0(&wf).into(), 2, 256).unwrap();
+
+        // `matmul_shared` must be byte-for-byte identical to a `matmul` per weight.
+        let check = |ws: &[&QMatrix]| {
+            let refs: Vec<Vec<f32>> = ws
+                .iter()
+                .map(|w| {
+                    let mut o = vec![0.0f32; w.rows()];
+                    b.matmul(&mut o, &x, w);
+                    o
+                })
+                .collect();
+            let mut shared: Vec<Vec<f32>> = ws.iter().map(|w| vec![0.0f32; w.rows()]).collect();
+            {
+                let mut outs: Vec<&mut [f32]> = shared.iter_mut().map(|v| v.as_mut_slice()).collect();
+                b.matmul_shared(&mut outs, &x, ws);
+            }
+            for (r, s) in refs.iter().zip(&shared) {
+                for (a, c) in r.iter().zip(s) {
+                    assert_eq!(a.to_bits(), c.to_bits(), "matmul_shared diverged from matmul");
+                }
+            }
+        };
+
+        check(&[&wq, &wk, &wv]); // q8k share: Q4_K+Q4_K+Q6_K (the q/k/v mix)
+        check(&[&wq, &wk]); // q8k share: both Q4_K (gate/up shape)
+        check(&[&w80, &w80]); // q8 share: Q8_0
+        check(&[&wq, &w80]); // mixed activation formats → fallback, still identical
     }
 
     #[test]

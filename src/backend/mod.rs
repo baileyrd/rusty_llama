@@ -41,6 +41,20 @@ pub trait Backend: Send + Sync {
     /// `w.cols()`, `out` has length `w.rows()`. This is *the* hot path.
     fn matmul(&self, out: &mut [f32], x: &[f32], w: &QMatrix);
 
+    /// Several matmuls that share the SAME input `x` — q/k/v off the attention
+    /// norm, gate/up off the FFN norm. Semantically identical to calling
+    /// [`Backend::matmul`] for each `(out, weight)` pair, but a backend may
+    /// quantize the shared activation `x` once instead of re-quantizing it per
+    /// weight (the CPU int8 path's redundancy). `outs[i] = ws[i] · x`; the two
+    /// slices have equal length. The default loops [`Backend::matmul`], so every
+    /// backend is correct for free and a backend overrides only to go faster.
+    fn matmul_shared(&self, outs: &mut [&mut [f32]], x: &[f32], ws: &[&QMatrix]) {
+        debug_assert_eq!(outs.len(), ws.len());
+        for (out, w) in outs.iter_mut().zip(ws) {
+            self.matmul(out, x, w);
+        }
+    }
+
     /// Apply rotary positional embeddings (RoPE) in place.
     ///
     /// Rotates the query vector `q` (length `n_heads * head_size`) and the key
