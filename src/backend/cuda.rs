@@ -309,22 +309,13 @@ __device__ __forceinline__ void gsmk4(int j, const unsigned char* q, int* sc, in
         *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
 }
-// Warp-cooperative packed Q4_K GEMV: out[row] = dequant(w[row]) . act, mirroring
-// vec_dot_q4_k_scalar (src/quant.rs:490) at the integer (dp4a) level. `w` is `oc`
-// rows of `nsb` 144-byte super-blocks; aq/ad/absums are the Q8_K activation. One
-// warp per row, NWARPS warps/block; lane l reads word l (qs[l*4..]) of each block,
-// so consecutive lanes touch consecutive 4-byte words = one coalesced 128-B
-// transaction per warp step. The per-super-block f32 fold is summed per-lane then
-// warp-reduced: integer cores exact, row output within a few ULP (reorder).
-extern "C" __global__ void gemv_q4_k(float* out, const unsigned char* w,
-        const signed char* aq, const float* ad, const int* absums, int oc, int nsb) {
-    const int NWARPS = 2;
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * NWARPS + warp;
-    if (row >= oc) return;
-    long long row_bytes = (long long)nsb * 144;
-    const unsigned char* wr = w + (long long)row * row_bytes;
+// Per-row Q4_K dot: dequant(w_row) . act at the dp4a level, warp-cooperative; the
+// shared core of gemv_q4_k and the fused gemv_qkv. `wr` = the row's nsb 144-byte
+// super-blocks. Lane l reads word l (qs[l*4..]) so consecutive lanes touch
+// consecutive 4-byte words = one coalesced 128-B transaction/warp step. Result is
+// warp-reduced (valid on lane 0). Mirrors vec_dot_q4_k_scalar (src/quant.rs:490).
+__device__ __forceinline__ float dot_q4_k_row(const unsigned char* wr,
+        const signed char* aq, const float* ad, const int* absums, int nsb, int lane) {
     int chunk = lane >> 3;          // 0..3: which 32-byte qs chunk
     int rem = (lane & 7) * 4;       // this lane's word offset within the chunk
     int jlo = 2 * chunk, jhi = 2 * chunk + 1;
@@ -356,28 +347,29 @@ extern "C" __global__ void gemv_q4_k(float* out, const unsigned char* w,
     }
     for (int off = 16; off > 0; off >>= 1)
         racc += __shfl_down_sync(0xffffffff, racc, off);
-    if (lane == 0) out[row] = racc;
+    return racc;  // valid on lane 0
+}
+// Warp-cooperative packed Q4_K GEMV: out[row] = dequant(w[row]) . act. One warp
+// per row; NWARPS = blockDim.x/32 rows per block (launch-set).
+extern "C" __global__ void gemv_q4_k(float* out, const unsigned char* w,
+        const signed char* aq, const float* ad, const int* absums, int oc, int nsb) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= oc) return;
+    float r = dot_q4_k_row(w + (long long)row * nsb * 144, aq, ad, absums, nsb, lane);
+    if (lane == 0) out[row] = r;
 }
 // Assemble a little-endian u32 from 4 unaligned bytes (Q6_K's 210-byte blocks are
 // only 2-aligned, so `*(int*)` would fault).
 __device__ __forceinline__ int ld4(const unsigned char* p) {
     return (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
 }
-// Warp-cooperative packed Q6_K GEMV: out[row] = dequant(w[row]) . act, mirroring
-// vec_dot_q6_k_scalar (src/quant.rs:544). Q6_K is symmetric: instead of forming
-// (q-32) per weight, we use the integer identity Σ(q-32)·x = Σq·x − 32·Σx, where
-// Σx over a 16-elem sub-block is absums[sub] — equal to the oracle exactly, and
-// it avoids a per-byte subtract. `w`: oc rows of nsb 210-byte super-blocks;
-// scales are signed i8; no dmin/min-scale. One warp per row, 2 runs of 4/lane.
-extern "C" __global__ void gemv_q6_k(float* out, const unsigned char* w,
-        const signed char* aq, const float* ad, const int* absums, int oc, int nsb) {
-    const int NWARPS = 2;
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * NWARPS + warp;
-    if (row >= oc) return;
-    long long row_bytes = (long long)nsb * 210;
-    const unsigned char* wr = w + (long long)row * row_bytes;
+// Per-row Q6_K dot: the shared core of gemv_q6_k and gemv_qkv. Q6_K is symmetric:
+// Σ(q-32)·x = Σq·x − 32·Σx, with Σx = absums[sub] (exact). `wr` = the row's nsb
+// 210-byte super-blocks; signed i8 scales, no min term. Mirrors
+// vec_dot_q6_k_scalar (src/quant.rs:544).
+__device__ __forceinline__ float dot_q6_k_row(const unsigned char* wr,
+        const signed char* aq, const float* ad, const int* absums, int nsb, int lane) {
     float racc = 0.0f;
     for (int sb = 0; sb < nsb; sb++) {
         const unsigned char* blk = wr + (long long)sb * 210;
@@ -412,7 +404,41 @@ extern "C" __global__ void gemv_q6_k(float* out, const unsigned char* w,
     }
     for (int off = 16; off > 0; off >>= 1)
         racc += __shfl_down_sync(0xffffffff, racc, off);
-    if (lane == 0) out[row] = racc;
+    return racc;  // valid on lane 0
+}
+// Warp-cooperative packed Q6_K GEMV: out[row] = dequant(w[row]) . act.
+extern "C" __global__ void gemv_q6_k(float* out, const unsigned char* w,
+        const signed char* aq, const float* ad, const int* absums, int oc, int nsb) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= oc) return;
+    float r = dot_q6_k_row(w + (long long)row * nsb * 210, aq, ad, absums, nsb, lane);
+    if (lane == 0) out[row] = r;
+}
+// Fused q/k/v decode GEMV: one launch computes all three projections (which share
+// the Q8_K activation) instead of three, absorbing the small under-saturating k/v
+// kernels (kv_oc rows each) into one saturating grid. Q4_K_M layout: q,k are Q4_K,
+// v is Q6_K. Rows [0,q_oc) -> q; [q_oc,q_oc+kv_oc) -> k; rest -> v. Same nsb (all
+// project the dim-length activation).
+extern "C" __global__ void gemv_qkv(float* out_q, float* out_k, float* out_v,
+        const unsigned char* wq, const unsigned char* wk, const unsigned char* wv,
+        const signed char* aq, const float* ad, const int* absums,
+        int q_oc, int kv_oc, int nsb) {
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= q_oc + 2 * kv_oc) return;
+    if (row < q_oc) {
+        float r = dot_q4_k_row(wq + (long long)row * nsb * 144, aq, ad, absums, nsb, lane);
+        if (lane == 0) out_q[row] = r;
+    } else if (row < q_oc + kv_oc) {
+        int lr = row - q_oc;
+        float r = dot_q4_k_row(wk + (long long)lr * nsb * 144, aq, ad, absums, nsb, lane);
+        if (lane == 0) out_k[lr] = r;
+    } else {
+        int lr = row - q_oc - kv_oc;
+        float r = dot_q6_k_row(wv + (long long)lr * nsb * 210, aq, ad, absums, nsb, lane);
+        if (lane == 0) out_v[lr] = r;
+    }
 }
 "#;
 
@@ -428,6 +454,7 @@ struct Kernels {
     quantize_q8k: CudaFunction,
     gemv_q4_k: CudaFunction,
     gemv_q6_k: CudaFunction,
+    gemv_qkv: CudaFunction,
     kv_append: CudaFunction,
 }
 
@@ -455,6 +482,7 @@ impl Kernels {
             quantize_q8k: f("quantize_q8k")?,
             gemv_q4_k: f("gemv_q4_k")?,
             gemv_q6_k: f("gemv_q6_k")?,
+            gemv_qkv: f("gemv_qkv")?,
             kv_append: f("kv_append")?,
         })
     }
@@ -835,6 +863,39 @@ impl CudaBackend {
         unsafe { b.launch(cfg) }.expect("launch gemv_q6_k");
     }
 
+    /// Fused q/k/v decode GEMV — one launch for all three projections (Q4_K_M
+    /// layout: q,k are Q4_K with 144-byte blocks, v is Q6_K with 210-byte blocks),
+    /// absorbing the small under-saturating k/v grids into one. See [`gemv_qkv`].
+    #[allow(clippy::too_many_arguments)]
+    fn dev_gemv_qkv(
+        &self,
+        out_q: &mut CudaSlice<f32>,
+        out_k: &mut CudaSlice<f32>,
+        out_v: &mut CudaSlice<f32>,
+        wq: &CudaSlice<u8>,
+        wk: &CudaSlice<u8>,
+        wv: &CudaSlice<u8>,
+        aq: &CudaSlice<i8>,
+        ad: &CudaSlice<f32>,
+        absums: &CudaSlice<i32>,
+        q_oc: usize,
+        kv_oc: usize,
+        nsb: usize,
+    ) {
+        const NWARPS: usize = 4;
+        let total = q_oc + 2 * kv_oc;
+        let (q_i, kv_i, nsb_i) = (q_oc as i32, kv_oc as i32, nsb as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(NWARPS) as u32, 1, 1),
+            block_dim: ((NWARPS * 32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.stream.launch_builder(&self.kernels.gemv_qkv);
+        b.arg(out_q).arg(out_k).arg(out_v).arg(wq).arg(wk).arg(wv).arg(aq).arg(ad).arg(absums)
+            .arg(&q_i).arg(&kv_i).arg(&nsb_i);
+        unsafe { b.launch(cfg) }.expect("launch gemv_qkv");
+    }
+
     /// Decode GEMV `out(oc) = w · x` (batch-1): the packed DP4A path for Q4_K/Q6_K
     /// when `quantized` (the activation scratch `aq/ad/absums` is current), else the
     /// f16 cuBLASLt GEMM. The dispatch that makes Phase 2 a clean, gated cutover.
@@ -1093,9 +1154,29 @@ impl CudaBackend {
             if q_dim_ok {
                 self.dev_quantize_q8k(&mut d.aq, &mut d.ad, &mut d.absums, &d.xb, dim);
             }
-            self.gemv_decode(&mut d.q, &d.xb, &d.aq, &d.ad, &d.absums, &w.wq[layer], q_dim_ok);
-            self.gemv_decode(&mut d.k_row, &d.xb, &d.aq, &d.ad, &d.absums, &w.wk[layer], q_dim_ok);
-            self.gemv_decode(&mut d.v_row, &d.xb, &d.aq, &d.ad, &d.absums, &w.wv[layer], q_dim_ok);
+            // q/k/v share the activation; fuse them into one launch when the layout
+            // is the gemv_qkv-supported Q4_K/Q4_K/Q6_K (the Q4_K_M shape), else run
+            // the three separate GEMVs. Absorbs the small k/v grids into q's.
+            if q_dim_ok
+                && qkv_fuse_enabled()
+                && matches!(&w.wq[layer], QMatrix::Quant { ty: GgmlType::Q4_K, .. })
+                && matches!(&w.wk[layer], QMatrix::Quant { ty: GgmlType::Q4_K, .. })
+                && matches!(&w.wv[layer], QMatrix::Quant { ty: GgmlType::Q6_K, .. })
+            {
+                let (wqp, wkp, wvp) = (
+                    self.weight_packed(&w.wq[layer]),
+                    self.weight_packed(&w.wk[layer]),
+                    self.weight_packed(&w.wv[layer]),
+                );
+                self.dev_gemv_qkv(
+                    &mut d.q, &mut d.k_row, &mut d.v_row, &wqp, &wkp, &wvp, &d.aq, &d.ad,
+                    &d.absums, n_heads * head_size, kv_dim, dim / 256,
+                );
+            } else {
+                self.gemv_decode(&mut d.q, &d.xb, &d.aq, &d.ad, &d.absums, &w.wq[layer], q_dim_ok);
+                self.gemv_decode(&mut d.k_row, &d.xb, &d.aq, &d.ad, &d.absums, &w.wk[layer], q_dim_ok);
+                self.gemv_decode(&mut d.v_row, &d.xb, &d.aq, &d.ad, &d.absums, &w.wv[layer], q_dim_ok);
+            }
             self.dev_rope(
                 &mut d.q, &mut d.k_row, &d.inv, 1, &d.pos_dev, head_size, kv_dim, dim, n_freqs,
                 mscale,
@@ -1144,6 +1225,15 @@ fn qgemv_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("RUSTY_LLAMA_CUDA_NO_QGEMV").is_err())
+}
+
+/// Whether the fused q/k/v decode GEMV is used (default on, when the layout is
+/// Q4_K/Q4_K/Q6_K). Opt out with `RUSTY_LLAMA_CUDA_NO_QKV_FUSE` to A/B against the
+/// three separate GEMVs.
+fn qkv_fuse_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTY_LLAMA_CUDA_NO_QKV_FUSE").is_err())
 }
 
 /// Whether the captured-CUDA-graph decode replay is enabled (default on). Opt out
@@ -2259,6 +2349,49 @@ mod tests {
             .map(|r| vec_dot_q6_k(&wbytes[r * rb..r * rb + rb], &act))
             .collect();
         close_approx(&got, &want, 1e-2, 2e-3);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device; run with --features cuda -- --ignored --nocapture"]
+    fn dev_gemv_qkv_parity() {
+        let Some(b) = cuda() else { return };
+        let st = &b.stream;
+        // Q4_K_M GQA shape: q large, k/v small; shared `ic` (one activation). q/k
+        // are Q4_K, v is Q6_K. Row counts cross warp/range boundaries.
+        let (q_oc, kv_oc, ic) = (20usize, 6usize, 512usize);
+        let nsb = ic / 256;
+        let wq = rand_q4_k(q_oc * nsb, 21);
+        let wk = rand_q4_k(kv_oc * nsb, 22);
+        let wv = rand_q6_k(kv_oc * nsb, 23);
+        let x = noise(ic, 24);
+        let act = quantize_activation_q8k(&x);
+
+        let wq_d = st.clone_htod(&wq).unwrap();
+        let wk_d = st.clone_htod(&wk).unwrap();
+        let wv_d = st.clone_htod(&wv).unwrap();
+        let aq_d = st.clone_htod(&act.qs).unwrap();
+        let ad_d = st.clone_htod(&act.d).unwrap();
+        let absums: Vec<i32> = act.bsums.iter().map(|&v| v as i32).collect();
+        let absums_d = st.clone_htod(&absums).unwrap();
+        let mut q_d = st.alloc_zeros::<f32>(q_oc).unwrap();
+        let mut k_d = st.alloc_zeros::<f32>(kv_oc).unwrap();
+        let mut v_d = st.alloc_zeros::<f32>(kv_oc).unwrap();
+        b.dev_gemv_qkv(
+            &mut q_d, &mut k_d, &mut v_d, &wq_d, &wk_d, &wv_d, &aq_d, &ad_d, &absums_d, q_oc,
+            kv_oc, nsb,
+        );
+        st.synchronize().unwrap();
+        let gq: Vec<f32> = st.clone_dtoh(&q_d).unwrap();
+        let gk: Vec<f32> = st.clone_dtoh(&k_d).unwrap();
+        let gv: Vec<f32> = st.clone_dtoh(&v_d).unwrap();
+
+        let (rb4, rb6) = (nsb * 144, nsb * 210);
+        let wantq: Vec<f32> = (0..q_oc).map(|r| vec_dot_q4_k(&wq[r * rb4..r * rb4 + rb4], &act)).collect();
+        let wantk: Vec<f32> = (0..kv_oc).map(|r| vec_dot_q4_k(&wk[r * rb4..r * rb4 + rb4], &act)).collect();
+        let wantv: Vec<f32> = (0..kv_oc).map(|r| vec_dot_q6_k(&wv[r * rb6..r * rb6 + rb6], &act)).collect();
+        close_approx(&gq, &wantq, 1e-2, 2e-3);
+        close_approx(&gk, &wantk, 1e-2, 2e-3);
+        close_approx(&gv, &wantv, 1e-2, 2e-3);
     }
 
     #[test]
