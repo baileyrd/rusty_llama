@@ -68,4 +68,25 @@ fn server_serves_openai_endpoints() {
     // A malformed body is a clean 400, not a panic / hang.
     let bad = post(&addr, "/v1/chat/completions", "{ not json");
     assert!(bad.contains("400"), "bad-request status: {bad}");
+
+    // Continuous batching: fire several requests at once; the scheduler batches
+    // their decode. All must complete with a valid OpenAI response.
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let addr = addr.clone();
+            thread::spawn(move || {
+                let body = format!(
+                    r#"{{"prompt":"Item {i}:","max_tokens":6,"temperature":0}}"#
+                );
+                post(&addr, "/v1/completions", &body)
+            })
+        })
+        .collect();
+    for h in handles {
+        let resp = h.join().expect("request thread");
+        assert!(resp.contains("200 OK"), "concurrent status: {resp}");
+        let json = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid concurrent JSON");
+        assert!(v["choices"][0]["text"].is_string());
+    }
 }

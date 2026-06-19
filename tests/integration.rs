@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use rusty_llama::dummy::{dummy_tokenizer, synthetic_checkpoint};
 use rusty_llama::{
-    forward, forward_embed, generate, AdapterBackend, Backend, Checkpoint, Config, ControlVector,
-    CpuBackend, Pooling, RunState, SamplerChain,
+    forward, forward_embed, generate, AdapterBackend, Backend, Batch, Checkpoint, Config,
+    ControlVector, CpuBackend, Pooling, RunState, SamplerChain,
 };
 
 /// A small but non-trivial config (grouped-query attention: 4 q heads, 2 kv).
@@ -221,5 +221,66 @@ fn control_vector_shifts_logits() {
     ab0.forward_step(&model, &mut s2, 1, 0);
     assert_eq!(plain, s2.logits(), "scale 0 ⇒ no-op");
 
+    let _ = std::fs::remove_file(path);
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap()
+}
+
+#[test]
+fn batched_decode_matches_independent_sequences() {
+    let config = test_config();
+    let (cp, path) = mapped_checkpoint(&config, "batch");
+    let model = cp.model().unwrap();
+    let backend = CpuBackend::new();
+    let prompts: [&[usize]; 3] = [&[1, 5, 3], &[2, 7], &[4, 6, 2, 1]];
+    let gen = 3usize;
+
+    // Reference: each sequence generated independently, greedily.
+    let reference: Vec<Vec<usize>> = prompts
+        .iter()
+        .map(|prompt| {
+            let mut state = RunState::new(&config);
+            backend.forward_prefill(&model, &mut state, prompt, 0);
+            let mut tok = argmax(state.logits());
+            let mut toks = Vec::new();
+            for step in 0..gen {
+                toks.push(tok);
+                forward(&model, &mut state, &backend, tok, prompt.len() + step);
+                tok = argmax(state.logits());
+            }
+            toks
+        })
+        .collect();
+
+    // Batched: prefill each prompt into its slot, then decode all together.
+    let mut batch = Batch::new(&config, prompts.len());
+    let mut states: Vec<RunState> = (0..prompts.len()).map(|_| RunState::new(&config)).collect();
+    let mut cur = Vec::new();
+    let mut positions = Vec::new();
+    for (s, prompt) in prompts.iter().enumerate() {
+        backend.forward_prefill(&model, &mut states[s], prompt, 0);
+        cur.push(argmax(states[s].logits()));
+        positions.push(prompt.len());
+    }
+    let slots: Vec<usize> = (0..prompts.len()).collect();
+    let mut batched: Vec<Vec<usize>> = vec![Vec::new(); prompts.len()];
+    for _ in 0..gen {
+        for (s, b) in batched.iter_mut().enumerate() {
+            b.push(cur[s]);
+        }
+        let logits = batch.decode_step(&model, &backend, &mut states, &slots, &cur, &positions);
+        for s in 0..prompts.len() {
+            cur[s] = argmax(&logits[s * config.vocab_size..(s + 1) * config.vocab_size]);
+            positions[s] += 1;
+        }
+    }
+
+    assert_eq!(batched, reference, "batched decode must match independent runs");
     let _ = std::fs::remove_file(path);
 }
