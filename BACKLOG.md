@@ -305,14 +305,24 @@ Ordered by ROI (value ÷ effort).
 
 ### R3 — CUDA prefill: cheap wins the docs miss (bit-identical, low effort)
 
-- [ ] **R3.1 On-device final rmsnorm + classifier.** Fused prefill downloads the entire
-  `n*dim` residual to host for the final norm + logits (cuda.rs:1525-1531). Only the last row
-  is needed — `dev_rmsnorm` against the resident weight + one GEMV on-device, download only
-  vocab-sized logits. Removes a ~4 MB D2H + host rmsnorm + sync per prompt.
-- [ ] **R3.2 `matmul_shared_batch`.** Batched prefill re-quantizes the shared q/k/v and
-  gate/up activation per weight matrix (model.rs:838-840, 903-904, 1190-1192, 1253-1254);
-  single-token forward already shares it via `matmul_shared`. A default-looping
-  `matmul_shared_batch` removes ~3 of 5 activation quantizations per layer.
+- [x] **R3.1 On-device final rmsnorm + classifier.** *(done 2026-06-20: the fused prefill
+  no longer downloads the whole `n*dim` residual + runs the rmsnorm/classifier on the host —
+  it copies the last residual row into the resident decode scratch (`d.x`) and reuses the exact
+  decode final-norm + packed-DP4A classifier (`dev_rmsnorm` → `gemv_decode` against `w.wcls`),
+  downloading only the vocab-sized logits. **Verified on the GPU**: `prefill_coherent_with_cpu`
+  + `prefill_then_decode_coherent` pass with argmax matching the CPU oracle and rel-L2 ~5e-4.
+  Also fixed a pre-existing debug-only papercut along the way: `gemm_dev_f16`'s
+  `debug_assert_eq!(c.len(), rows*oc)` was too strict — the K/V projections write `n` rows into
+  the `seq_len`-sized resident KV buffers, so it's now `>=` (release was always fine since
+  `debug_assert` is off there; this just unbreaks the prefill tests in debug).)*
+- [ ] **R3.2 `matmul_shared_batch`.** *(evaluated 2026-06-20 — NOT worth implementing.
+  The activation quantization it would dedup is O(input_cols), while the matmuls it feeds are
+  O(output_cols·input_cols), so a re-quant is ~1/output_cols of one matmul — ~0.05% each on
+  CPU. The main CUDA prefill is the **resident** path, which does its own device GEMMs and
+  never calls `matmul_batch`, AND already shares the narrowed f16 activation across q/k/v and
+  w1/w3 (cuda.rs gemm_dev comment). So this would be a trait method + 4 call sites + a CPU
+  override for a ~0.1% win on a non-hot path. Original estimate overstated it; skipping as
+  bloat. Revisit only if profiling shows activation quant is a real prefill cost.)*
 
 ### R4 — Robustness & cleanup
 
