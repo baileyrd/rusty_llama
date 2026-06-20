@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 920" font-family="Segoe UI, system-ui, -apple-system, Roboto, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b6b85"/></marker>
+    <marker id="arrG" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#2e7d4f"/></marker>
+  </defs>
+  <rect width="1320" height="920" fill="#ffffff"/>
+
+  <!-- header -->
+  <rect width="1320" height="66" fill="#16213e"/>
+  <text x="32" y="30" fill="#ffffff" font-size="22" font-weight="600">llama.cpp — inference architecture &amp; measured throughput</text>
+  <text x="32" y="52" fill="#9fb3d1" font-size="12.5">TinyLlama-1.1B Q4_K_M · RTX 5070 Ti (Blackwell sm_120) · Core Ultra 9 285H · llama-bench b9672 — the reference target</text>
+
+  <!-- legend -->
+  <g font-size="11" fill="#cdd9ec">
+    <rect x="876" y="14" width="13" height="13" rx="3" fill="#efe6f7" stroke="#7b3fa0"/><text x="894" y="24">tensor-core / packed-weight kernel</text>
+    <rect x="1086" y="14" width="13" height="13" rx="3" fill="#e2f4e8" stroke="#2e7d4f"/><text x="1104" y="24">fused / fast path</text>
+    <rect x="876" y="34" width="13" height="13" rx="3" fill="#e7edf7" stroke="#3d5a99"/><text x="894" y="44">neutral compute</text>
+    <rect x="1086" y="34" width="13" height="13" rx="3" fill="#eceef0" stroke="#7a8290"/><text x="1104" y="44">host / CPU</text>
+  </g>
+
+  <!-- ===================== LEFT: pipeline spine ===================== -->
+  <text x="40" y="98" font-size="14" font-weight="600" fill="#16213e">Pipeline</text>
+  <g font-size="12.5">
+    <rect x="40" y="110" width="200" height="34" rx="8" fill="#eceef0" stroke="#7a8290"/><text x="140" y="131" text-anchor="middle" fill="#2a3142">Prompt text</text>
+    <rect x="40" y="160" width="200" height="34" rx="8" fill="#e7edf7" stroke="#3d5a99"/><text x="140" y="181" text-anchor="middle" fill="#22324f">Tokenizer (BPE / SPM)</text>
+    <rect x="40" y="210" width="200" height="34" rx="8" fill="#e7edf7" stroke="#3d5a99"/><text x="140" y="231" text-anchor="middle" fill="#22324f">Token embeddings</text>
+
+    <!-- decoder layer stack -->
+    <rect x="34" y="262" width="212" height="58" rx="8" fill="#dfe7f5" stroke="#3d5a99" stroke-width="2"/>
+    <rect x="40" y="268" width="200" height="46" rx="7" fill="#e7edf7" stroke="#3d5a99"/>
+    <rect x="46" y="274" width="200" height="46" rx="7" fill="#e7edf7" stroke="#3d5a99"/>
+    <text x="146" y="296" text-anchor="middle" fill="#22324f" font-weight="600">Decoder layer × 22</text>
+    <text x="146" y="310" text-anchor="middle" fill="#5b6b85" font-size="10.5">(expanded →)</text>
+
+    <rect x="40" y="690" width="200" height="34" rx="8" fill="#e7edf7" stroke="#3d5a99"/><text x="140" y="711" text-anchor="middle" fill="#22324f">Final RMSNorm</text>
+    <rect x="40" y="740" width="200" height="34" rx="8" fill="#efe6f7" stroke="#7b3fa0"/><text x="140" y="761" text-anchor="middle" fill="#3f1d63">LM head (classifier GEMM)</text>
+    <rect x="40" y="790" width="200" height="34" rx="8" fill="#e2f4e8" stroke="#2e7d4f"/><text x="140" y="811" text-anchor="middle" fill="#1d5236">Sampler chain</text>
+  </g>
+  <!-- spine arrows -->
+  <g stroke="#5b6b85" stroke-width="1.6" fill="none">
+    <line x1="140" y1="144" x2="140" y2="158" marker-end="url(#arr)"/>
+    <line x1="140" y1="194" x2="140" y2="208" marker-end="url(#arr)"/>
+    <line x1="140" y1="244" x2="140" y2="260" marker-end="url(#arr)"/>
+    <line x1="140" y1="320" x2="140" y2="688" marker-end="url(#arr)" stroke-dasharray="5 4"/>
+    <line x1="140" y1="724" x2="140" y2="738" marker-end="url(#arr)"/>
+    <line x1="140" y1="774" x2="140" y2="788" marker-end="url(#arr)"/>
+  </g>
+
+  <!-- ===================== MIDDLE: inside one layer ===================== -->
+  <text x="300" y="98" font-size="14" font-weight="600" fill="#16213e">Inside one decoder layer</text>
+  <rect x="300" y="110" width="380" height="640" rx="10" fill="#f6f8fc" stroke="#c2cee2"/>
+  <g font-size="12">
+    <rect x="320" y="128" width="340" height="34" rx="7" fill="#e7edf7" stroke="#3d5a99"/><text x="490" y="149" text-anchor="middle" fill="#22324f">RMSNorm</text>
+    <rect x="320" y="176" width="340" height="40" rx="7" fill="#efe6f7" stroke="#7b3fa0"/><text x="490" y="194" text-anchor="middle" fill="#3f1d63" font-weight="600">Q · K · V projections</text><text x="490" y="208" text-anchor="middle" fill="#6d4796" font-size="10.5">GEMM (prefill) / GEMV (decode)</text>
+    <rect x="320" y="230" width="340" height="34" rx="7" fill="#e7edf7" stroke="#3d5a99"/><text x="490" y="251" text-anchor="middle" fill="#22324f">RoPE</text>
+    <rect x="320" y="278" width="340" height="56" rx="7" fill="#e2f4e8" stroke="#2e7d4f" stroke-width="2"/><text x="490" y="300" text-anchor="middle" fill="#1d5236" font-weight="600">Flash attention (fused)</text><text x="490" y="316" text-anchor="middle" fill="#2e7d4f" font-size="10.5">online softmax · 1 streaming pass · tensor cores</text><text x="490" y="329" text-anchor="middle" fill="#2e7d4f" font-size="10.5">no seq_len score buffer · GQA</text>
+    <rect x="320" y="348" width="340" height="36" rx="7" fill="#efe6f7" stroke="#7b3fa0"/><text x="490" y="370" text-anchor="middle" fill="#3f1d63">Output projection (GEMM/GEMV)</text>
+    <rect x="320" y="398" width="340" height="26" rx="7" fill="#eceef0" stroke="#7a8290"/><text x="490" y="415" text-anchor="middle" fill="#2a3142" font-size="11">+ residual</text>
+    <rect x="320" y="438" width="340" height="34" rx="7" fill="#e7edf7" stroke="#3d5a99"/><text x="490" y="459" text-anchor="middle" fill="#22324f">RMSNorm</text>
+    <rect x="320" y="486" width="340" height="58" rx="7" fill="#efe6f7" stroke="#7b3fa0"/><text x="490" y="508" text-anchor="middle" fill="#3f1d63" font-weight="600">FFN — SwiGLU</text><text x="490" y="524" text-anchor="middle" fill="#6d4796" font-size="10.5">gate · up · down (the large GEMMs)</text><text x="490" y="537" text-anchor="middle" fill="#6d4796" font-size="10.5">dominates prefill FLOPs &amp; decode bandwidth</text>
+    <rect x="320" y="558" width="340" height="26" rx="7" fill="#eceef0" stroke="#7a8290"/><text x="490" y="575" text-anchor="middle" fill="#2a3142" font-size="11">+ residual</text>
+
+    <text x="490" y="618" text-anchor="middle" font-size="11.5" fill="#5b6b85">Matmuls (QKV · O · gate/up/down · LM head)</text>
+    <text x="490" y="635" text-anchor="middle" font-size="11.5" fill="#5b6b85">are ~95% of the work — their kernel</text>
+    <text x="490" y="652" text-anchor="middle" font-size="11.5" fill="#5b6b85">strategy is what sets throughput ↓</text>
+    <rect x="346" y="668" width="288" height="64" rx="8" fill="#fff3d4" stroke="#c79100"/>
+    <text x="490" y="688" text-anchor="middle" font-size="11.5" fill="#7a5b00" font-weight="600">Weights never leave their quant format</text>
+    <text x="490" y="704" text-anchor="middle" font-size="11" fill="#7a5b00">Q4_K stays packed (~0.56 B/weight);</text>
+    <text x="490" y="719" text-anchor="middle" font-size="11" fill="#7a5b00">dequant happens in-register, inside the kernel</text>
+  </g>
+  <g stroke="#5b6b85" stroke-width="1.4" fill="none">
+    <line x1="490" y1="162" x2="490" y2="174" marker-end="url(#arr)"/>
+    <line x1="490" y1="216" x2="490" y2="228" marker-end="url(#arr)"/>
+    <line x1="490" y1="264" x2="490" y2="276" marker-end="url(#arr)"/>
+    <line x1="490" y1="334" x2="490" y2="346" marker-end="url(#arr)"/>
+    <line x1="490" y1="384" x2="490" y2="396" marker-end="url(#arr)"/>
+    <line x1="490" y1="424" x2="490" y2="436" marker-end="url(#arr)"/>
+    <line x1="490" y1="472" x2="490" y2="484" marker-end="url(#arr)"/>
+    <line x1="490" y1="544" x2="490" y2="556" marker-end="url(#arr)"/>
+  </g>
+  <!-- link from spine stack to middle -->
+  <path d="M246 291 C 274 291, 282 145, 318 145" stroke="#3d5a99" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- ===================== RIGHT: regimes + timings ===================== -->
+  <text x="720" y="98" font-size="14" font-weight="600" fill="#16213e">Two compute regimes &amp; measured tok/s</text>
+
+  <!-- PREFILL panel -->
+  <rect x="720" y="110" width="568" height="220" rx="10" fill="#efe6f7" stroke="#7b3fa0"/>
+  <text x="740" y="136" font-size="15" font-weight="600" fill="#3f1d63">PREFILL — batch = N prompt tokens (compute-bound)</text>
+  <text x="740" y="158" font-size="12" fill="#4f2c78">Strategy: <tspan font-weight="600">MMQ</tspan> — int8 tensor cores (<tspan font-family="monospace">mma.sync m16n8k32 s8</tspan>),</text>
+  <text x="740" y="174" font-size="12" fill="#4f2c78">weights stay packed. Large fused GEMMs. (cuBLAS f16 path is the avoided fallback.)</text>
+  <!-- bars pp512 -->
+  <g font-size="12">
+    <text x="740" y="200" fill="#33405a">CUDA</text>
+    <rect x="800" y="190" width="300" height="14" rx="3" fill="#7b3fa0"/><text x="1110" y="201" fill="#3f1d63" font-weight="600">19,637</text>
+    <text x="740" y="224" fill="#33405a">Vulkan</text>
+    <rect x="800" y="214" width="259" height="14" rx="3" fill="#9a6cc0"/><text x="1069" y="225" fill="#5b3d80">16,988</text>
+    <text x="740" y="248" fill="#33405a">CPU</text>
+    <rect x="800" y="238" width="90" height="14" rx="3" fill="#b9a0d6"/><text x="900" y="249" fill="#5b3d80">5,890</text>
+  </g>
+  <text x="740" y="280" font-size="11.5" fill="#6d4796">tok/s, pp512. Prefill amortizes weight reads across N rows → arithmetic-bound →</text>
+  <text x="740" y="296" font-size="11.5" fill="#6d4796">tensor-core GEMM throughput is what matters. This is rusty_llama's biggest gap.</text>
+  <text x="740" y="318" font-size="11.5" fill="#3f1d63" font-weight="600">Also: per-arch warp tables · ~30 quant formats · decade of kernel tuning.</text>
+
+  <!-- DECODE panel -->
+  <rect x="720" y="348" width="568" height="210" rx="10" fill="#e2f4e8" stroke="#2e7d4f"/>
+  <text x="740" y="374" font-size="15" font-weight="600" fill="#1d5236">DECODE — batch = 1 token (bandwidth-bound)</text>
+  <text x="740" y="396" font-size="12" fill="#235c3d">Strategy: <tspan font-weight="600">MMVQ</tspan> — packed-weight <tspan font-family="monospace">__dp4a</tspan> GEMV vs q8_1 activation,</text>
+  <text x="740" y="412" font-size="12" fill="#235c3d">warp-cooperative coalesced loads. Fused per-layer kernels + CUDA graphs.</text>
+  <g font-size="12">
+    <text x="740" y="438" fill="#33405a">CUDA</text>
+    <rect x="800" y="428" width="300" height="14" rx="3" fill="#2e7d4f"/><text x="1110" y="439" fill="#1d5236" font-weight="600">~415</text>
+    <text x="740" y="462" fill="#33405a">Vulkan</text>
+    <rect x="800" y="452" width="272" height="14" rx="3" fill="#4f9e72"/><text x="1082" y="463" fill="#235c3d">375.9</text>
+    <text x="740" y="486" fill="#33405a">CPU</text>
+    <rect x="800" y="476" width="53" height="14" rx="3" fill="#93c4aa"/><text x="863" y="487" fill="#235c3d">73.6</text>
+  </g>
+  <text x="740" y="516" font-size="11.5" fill="#2e7d4f">tok/s, tg128. Every weight is read exactly once → the lever is bytes-per-weight on</text>
+  <text x="740" y="532" font-size="11.5" fill="#2e7d4f">the wire. Packed Q4_K (~0.56 B/wt) beats f16 (~2 B/wt) by ~3.5×. rusty_llama</text>
+  <text x="740" y="548" font-size="11.5" fill="#2e7d4f">now matches this kernel class → its decode gap is small (~1.3–1.5×).</text>
+
+  <!-- key takeaway strip -->
+  <rect x="720" y="576" width="568" height="174" rx="10" fill="#16213e"/>
+  <text x="740" y="602" font-size="14" font-weight="600" fill="#ffffff">Why llama.cpp is the target to beat</text>
+  <g font-size="12" fill="#cdd9ec">
+    <text x="740" y="626">• Prefill: int8 tensor-core MMQ — weights packed, no f16 round-trip.</text>
+    <text x="740" y="648">• Decode: packed-weight DP4A MMVQ — minimal weight bandwidth.</text>
+    <text x="740" y="670">• Attention: fused flash (online softmax), tensor-core tiles.</text>
+    <text x="740" y="692">• CUDA graphs collapse per-op launch overhead to near zero.</text>
+    <text x="740" y="714">• 132 arch registry · ~30 quant formats · per-arch micro-tuning.</text>
+  </g>
+  <text x="740" y="738" font-size="11.5" fill="#8fb0e0" font-style="italic">The one structural lever rusty_llama still lacks is int8-MMQ prefill (purple, top-right).</text>
+
+  <text x="40" y="868" font-size="11" fill="#7a8290">Numbers: PERFORMANCE.md (llama-bench, -ngl 99 -p 512 -n 128 -r 5). Diagram is schematic — op order simplified; GQA/KV-cache omitted for clarity.</text>
+  <text x="40" y="886" font-size="11" fill="#7a8290">Compare with: rusty-llama-architecture.svg (same model/machine) and gap-and-levers.svg (review 2026-06-20).</text>
+</svg>

@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 1010" font-family="Segoe UI, system-ui, -apple-system, Roboto, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b6b85"/></marker>
+  </defs>
+  <rect width="1320" height="1010" fill="#ffffff"/>
+
+  <!-- header -->
+  <rect width="1320" height="66" fill="#16213e"/>
+  <text x="32" y="30" fill="#ffffff" font-size="22" font-weight="600">rusty_llama — inference architecture &amp; measured throughput</text>
+  <text x="32" y="52" fill="#9fb3d1" font-size="12.5">Same model / machine as the llama.cpp diagram · one Backend trait, three impls · ~8 K LOC · figures from BACKLOG.md (2026-06-19)</text>
+  <g font-size="11" fill="#cdd9ec">
+    <rect x="980" y="14" width="13" height="13" rx="3" fill="#e2f4e8" stroke="#2e7d4f"/><text x="998" y="24">strength / near-parity</text>
+    <rect x="1140" y="14" width="13" height="13" rx="3" fill="#fce4df" stroke="#c0392b"/><text x="1158" y="24">bottleneck (→ R# in backlog)</text>
+  </g>
+
+  <!-- ===================== Section A: load & dispatch ===================== -->
+  <text x="32" y="92" font-size="14" font-weight="600" fill="#16213e">Load &amp; dispatch — the forward pass only ever calls Backend trait ops</text>
+  <g font-size="12">
+    <rect x="32" y="104" width="150" height="46" rx="8" fill="#eceef0" stroke="#7a8290"/><text x="107" y="123" text-anchor="middle" fill="#2a3142">GGUF file</text><text x="107" y="139" text-anchor="middle" fill="#5b6b85" font-size="10.5">mmap, zero-copy</text>
+    <rect x="212" y="104" width="226" height="46" rx="8" fill="#e7edf7" stroke="#3d5a99"/><text x="325" y="123" text-anchor="middle" fill="#22324f">Model { Config, Weights }</text><text x="325" y="139" text-anchor="middle" fill="#5b6b85" font-size="10.5">QMatrix: F32/F16/Q4_0/Q8_0/Q4_K/Q6_K</text>
+    <rect x="468" y="104" width="160" height="46" rx="8" fill="#e7edf7" stroke="#3d5a99"/><text x="548" y="123" text-anchor="middle" fill="#22324f">Tokenizer</text><text x="548" y="139" text-anchor="middle" fill="#5b6b85" font-size="10.5">SPM + GPT-2 BPE</text>
+    <rect x="658" y="104" width="232" height="46" rx="8" fill="#dfe7f5" stroke="#3d5a99" stroke-width="2"/><text x="774" y="123" text-anchor="middle" fill="#22324f" font-weight="600">forward(token, pos)</text><text x="774" y="139" text-anchor="middle" fill="#5b6b85" font-size="10.5">rmsnorm·matmul·rope·attention·swiglu·add</text>
+    <rect x="920" y="104" width="160" height="46" rx="8" fill="#eceef0" stroke="#7a8290"/><text x="1000" y="123" text-anchor="middle" fill="#2a3142">KV cache</text><text x="1000" y="139" text-anchor="middle" fill="#5b6b85" font-size="10.5">single sequence, contiguous</text>
+    <rect x="1110" y="104" width="178" height="46" rx="8" fill="#e2f4e8" stroke="#2e7d4f"/><text x="1199" y="123" text-anchor="middle" fill="#1d5236">Sampler + GBNF</text><text x="1199" y="139" text-anchor="middle" fill="#2e7d4f" font-size="10.5">greedy/temp/top-p/top-k/min-p</text>
+  </g>
+  <g stroke="#5b6b85" stroke-width="1.5" fill="none">
+    <line x1="182" y1="127" x2="210" y2="127" marker-end="url(#arr)"/>
+    <line x1="438" y1="127" x2="466" y2="127" marker-end="url(#arr)"/>
+    <line x1="628" y1="127" x2="656" y2="127" marker-end="url(#arr)"/>
+    <line x1="890" y1="127" x2="918" y2="127" marker-end="url(#arr)"/>
+    <line x1="1080" y1="127" x2="1108" y2="127" marker-end="url(#arr)"/>
+  </g>
+  <!-- dispatch down to 3 backends -->
+  <text x="660" y="178" font-size="12" fill="#5b6b85" font-style="italic">dispatch (--backend) → one of three Backend impls:</text>
+  <path d="M774 150 C 774 168, 232 178, 232 198" stroke="#3d5a99" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+  <path d="M774 150 L 774 198" stroke="#3d5a99" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+  <path d="M774 150 C 774 168, 1086 178, 1086 198" stroke="#3d5a99" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- ===================== Section B: three backend cards ===================== -->
+  <!-- CPU card -->
+  <rect x="32" y="200" width="400" height="476" rx="10" fill="#f4f6f9" stroke="#7a8290"/>
+  <rect x="32" y="200" width="400" height="40" rx="10" fill="#eceef0" stroke="#7a8290"/>
+  <text x="48" y="218" font-size="14.5" font-weight="600" fill="#2a3142">CpuBackend  (default)</text>
+  <text x="48" y="233" font-size="11" fill="#5b6b85">rayon + AVX2 / AVX-512-VNNI integer dot</text>
+  <g font-size="11.5" fill="#33405a">
+    <text x="48" y="262">▸ Weights stay mmap'd in quant format</text>
+    <text x="48" y="282">▸ Activation quantized once (Q8 / Q8_K)</text>
+    <text x="48" y="302">▸ Integer dot: VNNI <tspan font-family="monospace" font-size="10.5">vpdpbusd</tspan> → AVX2</text>
+    <text x="62" y="318" font-size="10.5"><tspan font-family="monospace">vpmaddubsw</tspan> → scalar; <tspan font-weight="600">bit-exact</tspan> across all 3</text>
+    <text x="48" y="338">▸ Cache-blocked GEMM (MR=4) for prefill</text>
+  </g>
+  <rect x="48" y="352" width="368" height="40" rx="7" fill="#e2f4e8" stroke="#2e7d4f"/>
+  <text x="60" y="369" font-size="11" fill="#1d5236" font-weight="600">Strength</text>
+  <text x="60" y="384" font-size="10.8" fill="#235c3d">bit-exact SIMD swap · ~3× over per-block dequant</text>
+  <rect x="48" y="402" width="368" height="206" rx="7" fill="#fce4df" stroke="#c0392b"/>
+  <text x="60" y="420" font-size="11" fill="#a02718" font-weight="600">Bottlenecks</text>
+  <g font-size="10.8" fill="#8c2316">
+    <text x="60" y="440">• prefill ~28× behind — un-tuned <tspan font-family="monospace" font-size="10">vec_dot</tspan></text>
+    <text x="74" y="455">micro-kernel <tspan font-weight="600">(R5 / L9)</tspan></text>
+    <text x="60" y="476">• QK dot + rmsnorm reduction still scalar</text>
+    <text x="74" y="491">f32 — long-context cost <tspan font-weight="600">(R5.2)</tspan></text>
+    <text x="60" y="512">• decode DDR5-bandwidth-bound</text>
+    <text x="74" y="527">(~33 of 70 GB/s; no AVX-512 on this CPU)</text>
+    <text x="60" y="552" font-style="italic">Bounded levers documented as exhausted;</text>
+    <text x="60" y="567" font-style="italic">prefill micro-kernel is the one real lever.</text>
+    <text x="60" y="592" font-weight="600" fill="#a02718">Hot-loop allocs to remove (R4.2)</text>
+  </g>
+  <rect x="48" y="620" width="368" height="42" rx="7" fill="#16213e"/>
+  <text x="60" y="640" font-size="12" fill="#ffffff" font-weight="600">prefill ~210 t/s · decode ~53 t/s</text>
+  <text x="60" y="656" font-size="10.5" fill="#9fb3d1">vs llama.cpp 5,890 / 73.6 → ~28× / ~1.4×</text>
+
+  <!-- wgpu card -->
+  <rect x="456" y="200" width="400" height="476" rx="10" fill="#f2f6fb" stroke="#3d5a99"/>
+  <rect x="456" y="200" width="400" height="40" rx="10" fill="#e7edf7" stroke="#3d5a99"/>
+  <text x="472" y="218" font-size="14.5" font-weight="600" fill="#22324f">GpuBackend — wgpu</text>
+  <text x="472" y="233" font-size="11" fill="#5b6b85">Vulkan / DX12 / Metal · f32 + int8 Q8_0 decode</text>
+  <g font-size="11.5" fill="#33405a">
+    <text x="472" y="262">▸ WGSL compute shaders, weights resident</text>
+    <text x="472" y="282">▸ Dequant-in-shader (Q8_0/Q4_K/Q6_K)</text>
+    <text x="472" y="302">▸ Cooperative GEMV decode (1 WG/row)</text>
+    <text x="472" y="322">▸ Batched prefill + fused decode encoder</text>
+  </g>
+  <rect x="472" y="336" width="368" height="40" rx="7" fill="#e2f4e8" stroke="#2e7d4f"/>
+  <text x="484" y="353" font-size="11" fill="#1d5236" font-weight="600">Strength</text>
+  <text x="484" y="368" font-size="10.8" fill="#235c3d">portable · byte-identical greedy output vs CPU</text>
+  <rect x="472" y="386" width="368" height="222" rx="7" fill="#fce4df" stroke="#c0392b"/>
+  <text x="484" y="404" font-size="11" fill="#a02718" font-weight="600">Bottlenecks</text>
+  <g font-size="10.8" fill="#8c2316">
+    <text x="484" y="424" font-weight="600">• prefill matmul: NO weight reuse across</text>
+    <text x="498" y="439" font-weight="600">batch rows — streams weights ×N (R5.1)</text>
+    <text x="498" y="454" font-style="italic">biggest un-captured perf lever in the review</text>
+    <text x="484" y="476">• no tensor cores — wgpu coopmat ruled</text>
+    <text x="498" y="491">out (silent all-zero output on this driver)</text>
+    <text x="484" y="513">• int8 Stage-2 kernels kept but unwired</text>
+    <text x="498" y="528">→ dead weight, candidate to delete</text>
+    <text x="484" y="550">• dispatch &gt; 65535 breaks vocab 128256</text>
+    <text x="498" y="565">on DX12 / Metal (OK on Vulkan/NVIDIA)</text>
+    <text x="484" y="587" font-style="italic">Overhead-bound; least-important path.</text>
+  </g>
+  <rect x="472" y="620" width="368" height="42" rx="7" fill="#16213e"/>
+  <text x="484" y="640" font-size="12" fill="#ffffff" font-weight="600">prefill ~735 t/s · decode ~46 t/s</text>
+  <text x="484" y="656" font-size="10.5" fill="#9fb3d1">vs llama.cpp Vulkan 16,988 / 375.9 → ~23× / ~8×</text>
+
+  <!-- CUDA card -->
+  <rect x="880" y="200" width="408" height="476" rx="10" fill="#f3f1f9" stroke="#7b3fa0"/>
+  <rect x="880" y="200" width="408" height="40" rx="10" fill="#efe6f7" stroke="#7b3fa0"/>
+  <text x="896" y="218" font-size="14.5" font-weight="600" fill="#3f1d63">CudaBackend  (cudarc / nvrtc)</text>
+  <text x="896" y="233" font-size="11" fill="#6d4796">resident + CUDA graph · no nvcc/CUDA at build time</text>
+  <g font-size="11.5" fill="#33405a">
+    <text x="896" y="262" font-weight="600" fill="#7b3fa0">Prefill:</text><text x="952" y="262">dequant → f16 → cuBLASLt TF32/f16</text>
+    <text x="910" y="278" font-size="10.8" fill="#a02718" font-weight="600">GEMM — NOT int8 tensor cores ←</text>
+    <text x="896" y="300" font-weight="600" fill="#2e7d4f">Decode:</text><text x="954" y="300">packed Q4_K/Q6_K <tspan font-family="monospace" font-size="10">__dp4a</tspan> GEMV,</text>
+    <text x="910" y="316" font-size="10.8" fill="#235c3d">resident, captured into a CUDA graph</text>
+    <text x="896" y="338">▸ Flash (online-softmax) tiled attention</text>
+    <text x="896" y="356" font-size="10.8">▸ device-resident pos + KV (no host round-trip)</text>
+  </g>
+  <rect x="896" y="368" width="376" height="54" rx="7" fill="#e2f4e8" stroke="#2e7d4f"/>
+  <text x="908" y="385" font-size="11" fill="#1d5236" font-weight="600">Strengths</text>
+  <text x="908" y="400" font-size="10.6" fill="#235c3d">graphed + fused decode → only ~1.3–1.5× behind;</text>
+  <text x="908" y="414" font-size="10.6" fill="#235c3d">int dot cores bit-exact vs CPU oracle (parity-tested)</text>
+  <rect x="896" y="432" width="376" height="176" rx="7" fill="#fce4df" stroke="#c0392b"/>
+  <text x="908" y="450" font-size="11" fill="#a02718" font-weight="600">Bottlenecks &amp; cheap wins</text>
+  <g font-size="10.6" fill="#8c2316">
+    <text x="908" y="470" font-weight="600">• prefill ~3–3.8× — f16-cuBLASLt vs int8-MMQ</text>
+    <text x="922" y="484">the one structural lever left (L7)</text>
+    <text x="908" y="505">• final rmsnorm+classifier downloads the whole</text>
+    <text x="922" y="519"><tspan font-family="monospace" font-size="10">n*dim</tspan> residual to host — only last row needed <tspan font-weight="600">(R3.1)</tspan></text>
+    <text x="908" y="540">• batched prefill re-quantizes shared activation —</text>
+    <text x="922" y="554">add <tspan font-family="monospace" font-size="10">matmul_shared_batch</tspan> <tspan font-weight="600">(R3.2)</tspan></text>
+    <text x="908" y="575">• dead <tspan font-family="monospace" font-size="10">seq_len</tspan> kernel param to delete <tspan font-weight="600">(R4.2)</tspan></text>
+    <text x="908" y="595" font-style="italic">Reported pp512 ~4–8% understated by bench (R1.1)</text>
+  </g>
+  <rect x="896" y="620" width="376" height="42" rx="7" fill="#16213e"/>
+  <text x="908" y="640" font-size="12" fill="#ffffff" font-weight="600">prefill ~5,230 t/s · decode ~275 t/s</text>
+  <text x="908" y="656" font-size="10.5" fill="#cdb8e6">vs llama.cpp 19,637 / ~415 → ~3.8× / ~1.5×</text>
+
+  <!-- ===================== Section C: gap bars ===================== -->
+  <text x="32" y="712" font-size="14" font-weight="600" fill="#16213e">Gap to llama.cpp — CUDA path (the meaningful comparison)</text>
+
+  <!-- prefill chart -->
+  <text x="32" y="742" font-size="12.5" font-weight="600" fill="#3f1d63">Prefill (pp512, tok/s)</text>
+  <g font-size="11.5">
+    <text x="40" y="768" fill="#33405a">rusty</text>
+    <rect x="92" y="758" width="96" height="15" rx="3" fill="#c0392b"/><text x="196" y="770" fill="#a02718" font-weight="600">~5,230</text>
+    <text x="40" y="792" fill="#33405a">llama</text>
+    <rect x="92" y="782" width="360" height="15" rx="3" fill="#16213e"/><text x="460" y="794" fill="#16213e" font-weight="600">19,637</text>
+  </g>
+  <text x="92" y="822" font-size="13" fill="#c0392b" font-weight="700">~3.0–3.8× behind</text>
+  <text x="230" y="822" font-size="11" fill="#5b6b85">→ int8-MMQ tensor cores (L7) is the swing</text>
+
+  <!-- decode chart -->
+  <text x="700" y="742" font-size="12.5" font-weight="600" fill="#1d5236">Decode (tg128, tok/s)</text>
+  <g font-size="11.5">
+    <text x="708" y="768" fill="#33405a">rusty</text>
+    <rect x="760" y="758" width="239" height="15" rx="3" fill="#2e7d4f"/><text x="1007" y="770" fill="#1d5236" font-weight="600">~275</text>
+    <text x="708" y="792" fill="#33405a">llama</text>
+    <rect x="760" y="782" width="360" height="15" rx="3" fill="#16213e"/><text x="1128" y="794" fill="#16213e" font-weight="600">~415</text>
+  </g>
+  <text x="760" y="822" font-size="13" fill="#2e7d4f" font-weight="700">~1.3–1.5× behind</text>
+  <text x="900" y="822" font-size="11" fill="#5b6b85">→ near structural limit (graph + fused + packed)</text>
+
+  <!-- free recovery callout -->
+  <rect x="32" y="848" width="1256" height="58" rx="10" fill="#fff3d4" stroke="#c79100"/>
+  <text x="52" y="872" font-size="13.5" font-weight="700" fill="#7a5b00">⚑ Free recovery (R1.1):</text>
+  <text x="232" y="872" font-size="12.5" fill="#7a5b00">the CUDA bench allocates + zeros a ~92 MB <tspan font-family="monospace" font-size="11.5">RunState</tspan> INSIDE the timed region (the CPU bench already hoists it out).</text>
+  <text x="52" y="893" font-size="12.5" fill="#7a5b00">Reported pp512 is ~4–8% understated vs <tspan font-family="monospace" font-size="11.5">llama-bench</tspan> (one-time KV alloc). Fixing it recovers points off the headline gap for zero engineering cost.</text>
+
+  <text x="32" y="938" font-size="11" fill="#7a8290">Numbers: BACKLOG.md (2026-06-19) — supersede PERFORMANCE.md's older 4.4×/2.0× headline. Schematic; KV/GQA detail omitted. See gap-and-levers.svg for the ranked levers.</text>
+</svg>

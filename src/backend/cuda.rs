@@ -1898,22 +1898,29 @@ mod tests {
         let c = &model.config;
         let steps = 128usize;
 
-        let decode = |backend: &dyn Backend| {
-            let mut s = crate::RunState::new(&model.config);
+        // llama-bench parity: the RunState (KV cache + scratch) is allocated ONCE,
+        // outside the timed region, and reused across reps — exactly as llama.cpp
+        // keeps its KV cache resident. Each rep rewrites KV slots 0..steps in order
+        // before reading them, so no per-rep reset is needed. (Previously
+        // RunState::new lived inside the closure, so its ~tens-of-MB alloc+zero was
+        // timed on every rep and understated tok/s; the CPU benches never did this.)
+        let decode = |backend: &dyn Backend, s: &mut crate::RunState| {
             for pos in 0..steps {
-                backend.forward_step(&model, &mut s, (pos * 13 + 1) % c.vocab_size, pos);
+                backend.forward_step(&model, s, (pos * 13 + 1) % c.vocab_size, pos);
             }
         };
 
-        // llama-bench protocol: one untimed warmup (builds the resident decode
+        // bench_stat's first call is the untimed warmup (builds the resident decode
         // state + weight cache on device), then `-r` timed reps as mean ± stddev.
         let reps = crate::bench_util::bench_reps();
-        let (cuda_tps, cuda_sd) =
-            crate::bench_util::bench_stat(steps, reps, std::time::Duration::from_secs(6), || decode(&b));
+        let mut state = crate::RunState::new(&model.config);
+        let (cuda_tps, cuda_sd) = crate::bench_util::bench_stat(
+            steps, reps, std::time::Duration::from_secs(6), || decode(&b, &mut state));
 
         let cpu_backend = CpuBackend::new();
-        let (cpu_tps, _) =
-            crate::bench_util::bench_stat(steps, 1, std::time::Duration::ZERO, || decode(&cpu_backend));
+        let mut cpu_state = crate::RunState::new(&model.config);
+        let (cpu_tps, _) = crate::bench_util::bench_stat(
+            steps, 1, std::time::Duration::ZERO, || decode(&cpu_backend, &mut cpu_state));
 
         eprintln!(
             "real decode tg{steps} (r={reps}): cuda {cuda_tps:.0} ± {cuda_sd:.0} tok/s  \
@@ -1950,19 +1957,22 @@ mod tests {
         let model = crate::Model::from_gguf(&gguf).unwrap();
         let tokens: Vec<usize> = (0..256).map(|i| (i * 7) % c.vocab_size).collect();
 
-        let prefill = |backend: &dyn Backend| {
-            let mut s = crate::RunState::new(&model.config);
-            backend.forward_prefill(&model, &mut s, &tokens, 0);
+        // RunState allocated once, outside timing, and reused (each call rewrites
+        // KV slots 0..n before reading them) — so the timed region is pure compute.
+        let prefill = |backend: &dyn Backend, s: &mut crate::RunState| {
+            backend.forward_prefill(&model, s, &tokens, 0);
         };
+        let mut state = crate::RunState::new(&model.config);
 
-        prefill(&b); // warm up: dequant + upload weights, make them resident
+        prefill(&b, &mut state); // warm up: dequant + upload weights, make them resident
         let t = Instant::now();
-        prefill(&b);
+        prefill(&b, &mut state);
         let cuda = t.elapsed();
 
         let cpu_backend = CpuBackend::new();
+        let mut cpu_state = crate::RunState::new(&model.config);
         let t = Instant::now();
-        prefill(&cpu_backend);
+        prefill(&cpu_backend, &mut cpu_state);
         let cpu = t.elapsed();
 
         eprintln!(
@@ -2011,20 +2021,26 @@ mod tests {
             c.dim, c.hidden_dim, c.n_layers, c.n_heads, c.n_kv_heads, c.vocab_size, c.seq_len,
         );
 
-        let prefill = |backend: &dyn Backend| {
-            let mut s = crate::RunState::new(&model.config);
-            backend.forward_prefill(&model, &mut s, &tokens, 0);
+        // RunState (~92 MB for this model) allocated ONCE, outside the timed
+        // region, and reused across reps — like llama.cpp's resident KV cache.
+        // Each rep rewrites KV positions 0..n before reading them, so no reset is
+        // needed. (Previously RunState::new was inside the closure, so the
+        // alloc+zero was timed every rep and understated pp512 by ~4-8%.)
+        let prefill = |backend: &dyn Backend, s: &mut crate::RunState| {
+            backend.forward_prefill(&model, s, &tokens, 0);
         };
 
-        // llama-bench protocol: one untimed warmup (dequant + upload weights,
+        // bench_stat's first call is the untimed warmup (dequant + upload weights,
         // make them resident), then `-r` timed reps as mean ± stddev.
         let reps = crate::bench_util::bench_reps();
-        let (cuda_tps, cuda_sd) =
-            crate::bench_util::bench_stat(n, reps, std::time::Duration::from_secs(6), || prefill(&b));
+        let mut state = crate::RunState::new(&model.config);
+        let (cuda_tps, cuda_sd) = crate::bench_util::bench_stat(
+            n, reps, std::time::Duration::from_secs(6), || prefill(&b, &mut state));
 
         let cpu_backend = CpuBackend::new();
-        let (cpu_tps, _) =
-            crate::bench_util::bench_stat(n, 1, std::time::Duration::ZERO, || prefill(&cpu_backend));
+        let mut cpu_state = crate::RunState::new(&model.config);
+        let (cpu_tps, _) = crate::bench_util::bench_stat(
+            n, 1, std::time::Duration::ZERO, || prefill(&cpu_backend, &mut cpu_state));
 
         eprintln!(
             "real prefill pp{n} (r={reps}): cuda {cuda_tps:.0} ± {cuda_sd:.0} tok/s  \

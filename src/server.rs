@@ -469,7 +469,12 @@ fn admit(
         let table = pieces.get_or_insert_with(|| {
             Arc::new((0..tokenizer.vocab_size()).map(|i| tokenizer.token_piece(i)).collect())
         });
-        sampler.prepend(Box::new(GrammarStage::new(grammar, table.clone(), eog.to_vec())));
+        sampler.prepend(Box::new(GrammarStage::new(
+            grammar,
+            table.clone(),
+            eog.to_vec(),
+            tokenizer.special_ids(),
+        )));
     }
     let cur = sampler.sample(state.logits());
     Some(Slot {
@@ -497,7 +502,23 @@ fn resolve_template(gguf: &Gguf, override_name: Option<&str>) -> Option<ChatTemp
 // HTTP/1.1 (hand-rolled) + routing.
 // ---------------------------------------------------------------------------
 
+/// Reject request bodies larger than this — a memory-exhaustion guard. 16 MiB is
+/// far above any real chat/completion payload.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Per-connection socket read/write timeout — a slowloris guard.
+const SOCKET_TIMEOUT_SECS: u64 = 30;
+
+fn body_within_limit(content_length: usize) -> bool {
+    content_length <= MAX_BODY_BYTES
+}
+
 fn handle_connection(stream: TcpStream, jobs: &Sender<Job>, model_id: &str) -> io::Result<()> {
+    // Bound how long one (stalled or slowloris) client can pin this worker thread:
+    // without read/write timeouts a client that opens a socket and never finishes
+    // its request would block the thread forever.
+    let timeout = Some(std::time::Duration::from_secs(SOCKET_TIMEOUT_SECS));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut stream = stream;
 
@@ -522,6 +543,12 @@ fn handle_connection(stream: TcpStream, jobs: &Sender<Job>, model_id: &str) -> i
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
         }
+    }
+    // Cap the body so a single request can't make us allocate an unbounded buffer
+    // (a one-line memory-exhaustion DoS): reject oversized bodies with 413 rather
+    // than `vec![0u8; client_supplied_len]`.
+    if !body_within_limit(content_length) {
+        return write_json(&mut stream, 413, &error_json("request body too large"));
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
@@ -824,6 +851,7 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
     };
@@ -905,5 +933,15 @@ mod tests {
         assert_eq!(v["object"], "chat.completion.chunk");
         assert_eq!(v["choices"][0]["delta"]["role"], "assistant");
         assert!(v["choices"][0]["delta"].get("content").is_none());
+    }
+
+    #[test]
+    fn body_limit_rejects_oversized() {
+        // The clamp that guards `vec![0u8; content_length]` against an unbounded
+        // client-supplied length. At-limit is allowed; one byte over is rejected.
+        assert!(body_within_limit(0));
+        assert!(body_within_limit(MAX_BODY_BYTES));
+        assert!(!body_within_limit(MAX_BODY_BYTES + 1));
+        assert!(!body_within_limit(usize::MAX));
     }
 }

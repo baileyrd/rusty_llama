@@ -264,3 +264,84 @@ CPU decode is bandwidth-bound and CUDA decode is graph + fused near its structur
 limit; remaining gains need the **treadmill** — L7 (CUDA int8 MMQ), L8 (TC flash
 attn), L9 (CPU micro-kernel, the 33→49 GB/s access-pattern gap), L10 (wgpu) — all
 large/higher-risk.
+
+---
+
+## Review follow-ups (2026-06-20 deep review)
+
+Full report: [`docs/Reviews/2026-06-20-deep-review.md`](docs/Reviews/2026-06-20-deep-review.md).
+18-agent whole-repo review; 72 findings, all high-severity ones adversarially verified
+(0 hallucinated). **No correctness bug on the benchmark path** — the gap numbers are real.
+Ordered by ROI (value ÷ effort).
+
+### R1 — Free / trivial (do first)
+
+- [x] **R1.1 Hoist `RunState::new` out of the CUDA bench timed region.** *(done 2026-06-20: all three benches — `bench_decode_real`, `bench_prefill_real`, `bench_prefill_cuda_vs_cpu` — now allocate `RunState` once and reuse it across reps.)* `bench_decode_real`
+  / `bench_prefill_real` (cuda.rs:1901-1906, 2014-2017) allocate + zero a ~92 MB `RunState`
+  *inside* the closure `bench_stat` times. Inflates pp512 by ~4–8% (~1% for tg128) vs
+  `llama-bench` (one-time KV alloc). The **CPU** bench already hoists it — so CPU/CUDA
+  aren't measured the same way. Build once in warmup, reset cheap fields. *Recovers a few %
+  of the reported prefill gap for free and makes the comparison honest.*
+- [x] **R1.2 Server: clamp HTTP `Content-Length` + set socket timeouts.** *(done 2026-06-20: `MAX_BODY_BYTES` 16 MiB → 413; 30 s read/write timeouts on every connection. Unit-tested `body_within_limit`.)* server.rs:526 does
+  `vec![0u8; content_length]` from an unbounded client length (single-request memory DoS);
+  no `set_read_timeout`/`set_write_timeout` so a stalled client pins a worker (slowloris).
+  Two one-liners → 413 / timeout. Required before any `--host 0.0.0.0`.
+
+### R2 — Correctness one-liners (break llama.cpp parity on breadth archs; not the benchmark path)
+
+- [x] **R2.1 Gemma2-27B attention scale.** *(done 2026-06-20: `Config.attn_scale_correction` = √(head_size/query_pre_attn_scalar), read in `from_gguf`; q is pre-scaled at the 3 per-op attention sites so the effective scale is 1/√qpas. No-op (==1.0) for every other model. Unit-tested the correction identity. Note: kept the q-prescale seam rather than threading a `scale` param through all backends, because Gemma2 always runs attention on the CPU per-op path — its softcap forces it off the resident CUDA/wgpu kernels. To make that load-bearing invariant explicit instead of incidental, `Config::uses_resident_decode()` now also requires `attn_scale_correction == 1.0`, so any corrected model falls back to the per-op path on both CUDA and wgpu regardless of softcap. Tested by `corrected_attn_scale_disables_resident_decode`.)* Read `query_pre_attn_scalar` (or assert
+  `== head_dim`) instead of hardcoded `1/sqrt(head_size)`; `from_gguf` never reads it
+  (model.rs:241-247, cpu.rs:384 + 4 sites). 27B: scalar 144 ≠ head_dim 128 → silent ~1.06×
+  corruption. Thread a single `Config.attn_scale` to also de-dup the 5 call sites.
+- [x] **R2.2 BPE `ignore_merges`.** *(done 2026-06-20: `Bpe.ignore_merges` (true for the llama-bpe/llama3 family via `pre_ignore_merges`); `encode_chunk` emits a whole pre-token directly when it is itself a vocab token. Behavior-tested.)* `llama-bpe`/`llama3` pre-tokenizer misses the
+  `ignore_merges` rank rule (tokenizer.rs:664-707) → tokenization diverges from llama.cpp on
+  Llama-3-family models, breaking the byte-exact-parity claim.
+- [x] **R2.3 Grammar control-token leak.** *(done 2026-06-20: `GrammarStage` now masks non-EOG control/special tokens (`Tokenizer::special_ids()`), so they can't satisfy a grammar. Wired into both the CLI (`from_source`) and server paths. Behavior-tested.)* Non-EOG control tokens aren't masked by
+  `GrammarStage` (grammar.rs:210-225; tokenizer.rs:107-113) → can leak into constrained
+  ("JSON") output.
+- [x] **R2.4 Unify prefill-path EOG check.** *(done 2026-06-20: `generate_prefilled`'s prompt-echo loop now breaks on `next == 1 || tokenizer.is_eog(next)`, matching the generation/sequential paths.)* `generate_prefilled`'s prompt-echo sub-loop
+  (model.rs:1441) omits `is_eog` that the generation loop (model.rs:1455) and sequential
+  path (model.rs:1404) have. Narrow (EOG embedded mid-prompt) but a one-line consistency fix.
+
+### R3 — CUDA prefill: cheap wins the docs miss (bit-identical, low effort)
+
+- [ ] **R3.1 On-device final rmsnorm + classifier.** Fused prefill downloads the entire
+  `n*dim` residual to host for the final norm + logits (cuda.rs:1525-1531). Only the last row
+  is needed — `dev_rmsnorm` against the resident weight + one GEMV on-device, download only
+  vocab-sized logits. Removes a ~4 MB D2H + host rmsnorm + sync per prompt.
+- [ ] **R3.2 `matmul_shared_batch`.** Batched prefill re-quantizes the shared q/k/v and
+  gate/up activation per weight matrix (model.rs:838-840, 903-904, 1190-1192, 1253-1254);
+  single-token forward already shares it via `matmul_shared`. A default-looping
+  `matmul_shared_batch` removes ~3 of 5 activation quantizations per layer.
+
+### R4 — Robustness & cleanup
+
+- [ ] **R4.1 Harden GGUF parser (4 untrusted scalars).** `tensor_count`/`kv_count` →
+  `with_capacity` (cap to `.min(file_len/min_entry)`); `alignment` `is_power_of_two`;
+  `rows*cols` `checked_mul`; dup keys/tensor-names `insert().is_some()` → error
+  (gguf.rs:130-142). Fail cleanly on corrupt/malicious GGUF per the "untrusted mmap" mandate.
+- [ ] **R4.2 Delete dead code** (legibility): CUDA `attention_kernel`'s unused `seq_len`
+  param + inconsistent callers (cuda.rs:160, 1013/1021/1044, 1188, 1507); the F16 matmul
+  arm / `dot_quant_row` if no loader produces `QMatrix::Quant{F16}` (cpu.rs:22-36, 127-132,
+  271-280); gate `Q8Activation.block_sums` on `vnni_supported()` (quant.rs:326-332); cache
+  resolved wgpu pipelines in `LayerBinds` (gpu.rs:1850); single-pass `grammar.rs` parser
+  (grammar.rs:317-350).
+
+### R5 — Larger levers
+
+- [ ] **R5.1 wgpu prefill tiling** *(medium; only if wgpu/portability matters)*.
+  `WGSL_MATMUL_BATCH` + 3 quant variants re-stream every weight per batch row with zero
+  reuse (gpu.rs:233-252, 427, 579, 679). Tile (one workgroup per weight row × shared-mem tile
+  of N activation rows) → amortize weight DRAM by ~N. Plausibly several-× wgpu prefill,
+  independent of the (ruled-out) tensor-core gap. Biggest un-captured perf lever in the review.
+- [ ] **R5.2 CPU long-context attention SIMD.** QK dot (cpu.rs:403) and `v·v` rmsnorm
+  (cpu.rs:99) are scalar f32 — negligible at pp/tg128, measurable at long context.
+
+### R6 — Documentation (open item 6.x — confirmed)
+
+- [ ] **R6.1 Refresh stale Architecture/Research docs** to current code: `04` (12 kernels,
+  `new_stream`, resident DP4A decode + CUDA graph — not 7-kernel/default-stream/CPU-decode);
+  `02` (flash/online-softmax, not materialized); `08` (decode ~275/~1.4×, not 123/3.4×); `06`
+  (F16 accepted, not rejected); `01` (MoE exists; drop nonexistent `store_prefill_kv`). Fix
+  the in-code comment cuda.rs:1248-1251 ("decode runs entirely on the CPU"). Reconcile
+  `PERFORMANCE.md` headline (4.4×/2.0×) with latest measured (~3.0–3.8× / ~1.3–1.5×).

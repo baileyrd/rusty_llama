@@ -112,6 +112,17 @@ impl Tokenizer {
         [eos, eot].into_iter().flatten().map(|i| i as u32).collect()
     }
 
+    /// Control / user-defined token ids (e.g. `<|im_start|>`, `<s>`, added
+    /// markers). A grammar constraint masks these so they can't leak into
+    /// constrained output the way a normal text token would.
+    pub fn special_ids(&self) -> Vec<u32> {
+        let ids = match self {
+            Tokenizer::Spm(t) => &t.specials.ids,
+            Tokenizer::Bpe(t) => &t.specials.ids,
+        };
+        ids.iter().map(|&i| i as u32).collect()
+    }
+
     /// Decode `token` (preceded by `prev_token`) into the bytes to emit.
     pub fn decode(&self, prev_token: usize, token: usize) -> Vec<u8> {
         match self {
@@ -521,6 +532,10 @@ pub struct Bpe {
     byte_encoder: [char; 256],
     /// Pre-tokenizer (splitting regex) selected by the model's `pre` name.
     pre: PreTokenizer,
+    /// llama.cpp's `ignore_merges` (Llama-3 family): emit a whole pre-token
+    /// directly when it is itself a vocab token, rather than rebuilding it from
+    /// merges. False for every other tokenizer.
+    ignore_merges: bool,
     /// Control / user-defined tokens recognized verbatim during encode.
     specials: SpecialTokens,
     bos: Option<usize>,
@@ -528,6 +543,13 @@ pub struct Bpe {
     eot: Option<usize>,
     /// Whether to prepend BOS on encode (GGUF `add_bos_token`, default true).
     add_bos: bool,
+}
+
+/// llama.cpp sets `ignore_merges` for the Llama-3 family: if a whole pre-token is
+/// already a vocab token, emit it directly instead of rebuilding it from merges
+/// (the greedy merge order can otherwise produce a different split).
+fn pre_ignore_merges(pre: &str) -> bool {
+    matches!(pre, "llama-bpe" | "llama3" | "llama-v3" | "llama-bpe-v3")
 }
 
 impl Bpe {
@@ -580,6 +602,7 @@ impl Bpe {
             merge_ranks,
             byte_encoder,
             pre: PreTokenizer::new(pre),
+            ignore_merges: pre_ignore_merges(pre),
             specials,
             bos,
             eos,
@@ -669,6 +692,18 @@ impl Bpe {
             .collect();
         if symbols.is_empty() {
             return;
+        }
+
+        // llama.cpp's `ignore_merges` (Llama-3 family): if the whole pre-token is
+        // already a single vocab token, emit it directly. The greedy merge order
+        // below can otherwise build a *different* tokenization than the direct
+        // vocab entry, diverging from llama.cpp on Llama-3-family models.
+        if self.ignore_merges {
+            let whole: String = symbols.concat();
+            if let Some(&id) = self.token_to_id.get(&whole) {
+                out.push(id);
+                return;
+            }
         }
 
         // Repeatedly merge the lowest-rank adjacent pair.
@@ -938,6 +973,32 @@ mod tests {
             merges.push((l.clone(), r.clone()));
         }
         Tokenizer::from_bpe(tokens, merges, Some(1), Some(2))
+    }
+
+    #[test]
+    fn bpe_ignore_merges_emits_whole_word() {
+        let enc = bytes_to_unicode();
+        let s = |b: u8| enc[b as usize].to_string();
+        // 256 byte tokens + the whole word "hi" (id 256), but deliberately NO h+i merge.
+        let mut tokens = gpt2_byte_tokens();
+        tokens.push(format!("{}{}", s(b'h'), s(b'i')));
+        let merges: Vec<(String, String)> = Vec::new();
+
+        // gpt-2 pre (ignore_merges = false): with no merge, "hi" stays two byte tokens.
+        let gpt2 = Tokenizer::from_bpe(tokens.clone(), merges.clone(), Some(1), Some(2));
+        assert_eq!(gpt2.encode("hi", false, false), vec![b'h' as usize, b'i' as usize]);
+
+        // llama-bpe pre (ignore_merges = true): the whole pre-token is a vocab token,
+        // so it is emitted directly (matching llama.cpp) instead of the byte fallback.
+        let llama = Tokenizer::Bpe(Box::new(Bpe::build(
+            tokens,
+            merges,
+            Some(1),
+            Some(2),
+            "llama-bpe",
+            SpecialTokens::default(),
+        )));
+        assert_eq!(llama.encode("hi", false, false), vec![256]);
     }
 
     #[test]

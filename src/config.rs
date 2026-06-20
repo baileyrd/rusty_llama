@@ -100,6 +100,11 @@ pub struct Config {
     pub attn_logit_softcap: f32,
     /// tanh softcap on the final output logits (`0.0` = off; Gemma2 = 30).
     pub final_logit_softcap: f32,
+    /// Pre-multiplier applied to the query before attention so the score scale
+    /// becomes `1/sqrt(query_pre_attn_scalar)` instead of the backends' baked-in
+    /// `1/sqrt(head_size)`. `1.0` for every model where they coincide; differs
+    /// only on Gemma2-27B (`query_pre_attn_scalar` 144 vs `head_dim` 128).
+    pub attn_scale_correction: f32,
     /// Number of mixture-of-experts experts per FFN block. `0` = a dense FFN
     /// (every arch so far); `> 0` selects the routed MoE path (Mixtral).
     pub n_expert: usize,
@@ -137,6 +142,7 @@ impl Default for Config {
             embd_scale: 1.0,
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
+            attn_scale_correction: 1.0,
             n_expert: 0,
             n_expert_used: 0,
             n_ff_exp: 0,
@@ -185,7 +191,15 @@ impl Config {
     /// archs fall back to the generic per-op path.
     #[inline]
     pub fn uses_resident_decode(&self) -> bool {
-        self.arch.uses_resident_decode() && self.n_expert == 0
+        self.arch.uses_resident_decode()
+            && self.n_expert == 0
+            // The resident CUDA/wgpu attention kernels bake in a 1/sqrt(head_size)
+            // score scale. A model needing a per-query correction (only Gemma2-27B,
+            // where query_pre_attn_scalar != head_dim) must take the per-op path,
+            // where model.rs pre-scales q instead (see attn_scale_correction / R2.1).
+            // Today such models already fall back via logit-softcap, but this makes
+            // the invariant explicit rather than relying on that coincidence.
+            && self.attn_scale_correction == 1.0
     }
 
     /// Number of dimensions RoPE rotates per head (`rope_dim`, or the full
@@ -373,6 +387,18 @@ fn nonneg(v: i32, name: &str) -> Result<usize> {
     }
 }
 
+/// Query pre-scale that turns the backends' baked-in `1/sqrt(head_size)` attention
+/// score scale into `1/sqrt(query_pre_attn_scalar)`. These differ only on Gemma2-27B
+/// (qpas 144 vs head_dim 128); the result is exactly `1.0` whenever they coincide,
+/// so this is a no-op for every other model.
+pub fn attn_scale_correction(head_size: usize, query_pre_attn_scalar: f32) -> f32 {
+    if query_pre_attn_scalar > 0.0 {
+        (head_size as f32 / query_pre_attn_scalar).sqrt()
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +486,40 @@ mod tests {
         c.rope_dim = 4;
         let t = c.rope_table();
         approx_slice(&t.inv_freq, &[1.0, 0.01]);
+    }
+
+    #[test]
+    fn gemma2_27b_attn_scale_correction() {
+        // Gemma2-27B: head_dim 128 but query_pre_attn_scalar 144. The backends bake
+        // in 1/sqrt(head_size), so the correction must bend the *effective* scale to
+        // exactly 1/sqrt(144).
+        let corr = attn_scale_correction(128, 144.0);
+        let effective = corr / (128f32).sqrt();
+        assert!(
+            (effective - 1.0 / (144f32).sqrt()).abs() < 1e-6,
+            "effective scale {effective} != 1/sqrt(144)"
+        );
+        // Every other model: query_pre_attn_scalar == head_size -> exact no-op.
+        assert_eq!(attn_scale_correction(128, 128.0), 1.0);
+        assert_eq!(attn_scale_correction(256, 256.0), 1.0);
+        // Missing/zero key falls back to a no-op rather than NaN.
+        assert_eq!(attn_scale_correction(128, 0.0), 1.0);
+    }
+
+    #[test]
+    fn corrected_attn_scale_disables_resident_decode() {
+        // A dense Llama model is eligible for the resident fast path...
+        let mut c = Config {
+            arch: Arch::Llama,
+            n_expert: 0,
+            attn_scale_correction: 1.0,
+            ..Default::default()
+        };
+        assert!(c.uses_resident_decode());
+        // ...but a Gemma2-27B-style per-query correction must force the per-op path
+        // (where model.rs pre-scales q), since the resident kernels bake in
+        // 1/sqrt(head_size). Otherwise the correction would be silently dropped.
+        c.attn_scale_correction = attn_scale_correction(128, 144.0);
+        assert!(!c.uses_resident_decode());
     }
 }
