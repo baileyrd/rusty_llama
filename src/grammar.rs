@@ -180,6 +180,9 @@ pub struct GrammarStage {
     state: Vec<Stack>,
     pieces: std::sync::Arc<Vec<Vec<u8>>>,
     eog: Vec<u32>,
+    /// Control / special token ids that are always masked (except EOG, handled
+    /// above) so they can't leak into grammar-constrained output.
+    control: std::collections::HashSet<u32>,
 }
 
 impl GrammarStage {
@@ -187,9 +190,20 @@ impl GrammarStage {
     /// shared (`Arc`) so a server can reuse one table across requests; `eog`
     /// lists end-of-generation token ids (allowed only once the grammar is in an
     /// accepting state, so a constrained run can still stop).
-    pub fn new(grammar: Grammar, pieces: std::sync::Arc<Vec<Vec<u8>>>, eog: Vec<u32>) -> Self {
+    pub fn new(
+        grammar: Grammar,
+        pieces: std::sync::Arc<Vec<Vec<u8>>>,
+        eog: Vec<u32>,
+        control: Vec<u32>,
+    ) -> Self {
         let state = grammar.start();
-        GrammarStage { grammar, state, pieces, eog }
+        GrammarStage {
+            grammar,
+            state,
+            pieces,
+            eog,
+            control: control.into_iter().collect(),
+        }
     }
 
     /// Build a stage from GBNF source + a tokenizer, computing the shared piece
@@ -202,7 +216,12 @@ impl GrammarStage {
                 .map(|i| tokenizer.token_piece(i))
                 .collect::<Vec<_>>(),
         );
-        Ok(GrammarStage::new(grammar, pieces, tokenizer.eog_ids()))
+        Ok(GrammarStage::new(
+        grammar,
+        pieces,
+        tokenizer.eog_ids(),
+        tokenizer.special_ids(),
+    ))
     }
 }
 
@@ -212,6 +231,11 @@ impl SamplerStage for GrammarStage {
         for c in cur.data[..cur.size].iter_mut() {
             let allowed = if self.eog.contains(&c.id) {
                 accepting
+            } else if self.control.contains(&c.id) {
+                // Non-EOG control / special tokens (e.g. <|im_start|>, BOS) must
+                // never satisfy a grammar — their literal pieces could otherwise
+                // advance it and leak into constrained output.
+                false
             } else {
                 match self.pieces.get(c.id as usize) {
                     Some(p) if !p.is_empty() => self.grammar.advance_bytes(&self.state, p).is_some(),
@@ -700,7 +724,7 @@ mod tests {
         // Tokens: 0="a", 1="b", 2="c", 3 = EOG (empty piece).
         let g = Grammar::parse(r#"root ::= "ab""#).unwrap();
         let pieces = std::sync::Arc::new(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), Vec::new()]);
-        let mut stage = GrammarStage::new(g, pieces, vec![3]);
+        let mut stage = GrammarStage::new(g, pieces, vec![3], vec![]);
 
         let mut cur = arr();
         stage.apply(&mut cur);
@@ -720,6 +744,28 @@ mod tests {
         stage.apply(&mut cur);
         assert!(cur.data[3].logit.is_finite()); // EOG allowed (accepting)
         assert_eq!(cur.data[0].logit, f32::NEG_INFINITY); // no more chars
+    }
+
+    #[test]
+    fn grammar_stage_masks_non_eog_control_tokens() {
+        use crate::sampler::{SamplerStage, TokenData, TokenDataArray};
+        let arr = || TokenDataArray {
+            data: (0..4).map(|i| TokenData { id: i, logit: 0.0, p: 0.0 }).collect(),
+            size: 4,
+            selected: None,
+            sorted: false,
+        };
+        // Same "ab" grammar, but token 1 ("b") is marked CONTROL. Even though the
+        // grammar wants 'b' next (the previous test shows it would be allowed), a
+        // control token must never satisfy a grammar — else it leaks into output.
+        let g = Grammar::parse(r#"root ::= "ab""#).unwrap();
+        let pieces =
+            std::sync::Arc::new(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), Vec::new()]);
+        let mut stage = GrammarStage::new(g, pieces, vec![3], vec![1]); // 1 = control
+        stage.accept(0); // consume "a" → grammar now wants 'b'
+        let mut cur = arr();
+        stage.apply(&mut cur);
+        assert_eq!(cur.data[1].logit, f32::NEG_INFINITY); // masked despite matching
     }
 
     #[test]

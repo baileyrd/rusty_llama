@@ -246,6 +246,25 @@ impl<'a> Model<'a> {
         let attn_logit_softcap = gguf.meta_f32(&key("attn_logit_softcapping")).unwrap_or(0.0);
         let final_logit_softcap = gguf.meta_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
 
+        // Gemma2 divides the attention scores by sqrt(query_pre_attn_scalar),
+        // which differs from sqrt(head_size) on Gemma2-27B (144 vs 128). The
+        // backends bake in 1/sqrt(head_size), so we pre-scale q by
+        // sqrt(head_size / query_pre_attn_scalar); this collapses to 1.0 whenever
+        // the key is absent or equals head_size (i.e. every other model). The key
+        // is a float in some GGUFs and a uint in others, so accept either.
+        let query_pre_attn_scalar = gguf
+            .meta_f32(&key("attention.query_pre_attn_scalar"))
+            .ok()
+            .or_else(|| {
+                gguf.meta_u64(&key("attention.query_pre_attn_scalar"))
+                    .ok()
+                    .map(|v| v as f32)
+            })
+            .filter(|&s| s > 0.0)
+            .unwrap_or(head_size as f32);
+        let attn_scale_correction =
+            crate::config::attn_scale_correction(head_size, query_pre_attn_scalar);
+
         // Vocabulary size = second (row) dimension of the embedding tensor.
         let tok_embd = gguf
             .tensor(names.token_embd)
@@ -276,6 +295,7 @@ impl<'a> Model<'a> {
             embd_scale,
             attn_logit_softcap,
             final_logit_softcap,
+            attn_scale_correction,
             n_expert,
             n_expert_used,
             n_ff_exp,
@@ -859,6 +879,14 @@ impl Batch {
                     .copy_from_slice(&self.kbuf[r * kv_dim..r * kv_dim + kv_dim]);
                 kv.v_slot_mut(layer, pos)
                     .copy_from_slice(&self.vbuf[r * kv_dim..r * kv_dim + kv_dim]);
+                // Gemma2-27B: bend the score scale from 1/sqrt(head_size) (baked
+                // into every backend) to 1/sqrt(query_pre_attn_scalar) by pre-scaling
+                // q. No-op for every model where the two coincide (correction == 1.0).
+                if p.attn_scale_correction != 1.0 {
+                    for v in self.q[r * q_dim..r * q_dim + q_dim].iter_mut() {
+                        *v *= p.attn_scale_correction;
+                    }
+                }
                 backend.attention(
                     &mut self.ao[r * q_dim..r * q_dim + q_dim],
                     &self.q[r * q_dim..r * q_dim + q_dim],
@@ -997,6 +1025,12 @@ pub fn forward_with(
             model.rope.mscale,
         );
 
+        // Gemma2-27B attention-scale correction (see decode_step); no-op == 1.0.
+        if p.attn_scale_correction != 1.0 {
+            for v in state.q[..q_dim].iter_mut() {
+                *v *= p.attn_scale_correction;
+            }
+        }
         backend.attention(
             &mut state.xb[..q_dim],
             &state.q[..q_dim],
@@ -1208,6 +1242,13 @@ fn prefill_residual<B: Backend + ?Sized>(
             model.rope.mscale,
         );
 
+        // Gemma2-27B attention-scale correction (see decode_step). Scales the whole
+        // prefill query block; no-op when correction == 1.0.
+        if p.attn_scale_correction != 1.0 {
+            for v in q.iter_mut() {
+                *v *= p.attn_scale_correction;
+            }
+        }
         backend.attention_batch(
             &mut ao,
             &q,
@@ -1438,8 +1479,8 @@ fn generate_prefilled(
     // streams them (decode(prev, cur) renders `cur`'s piece).
     for r in 0..n - 1 {
         let next = prompt_tokens[r + 1];
-        if next == 1 {
-            return generated; // BOS-as-EOS mid-prompt (matches the loop's break)
+        if next == 1 || tokenizer.is_eog(next) {
+            return generated; // BOS/EOG mid-prompt (matches the generation loop's break)
         }
         on_piece(&tokenizer.decode(prompt_tokens[r], next));
         generated += 1;

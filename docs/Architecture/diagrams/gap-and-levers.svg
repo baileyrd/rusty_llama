@@ -1,0 +1,177 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 960" font-family="Segoe UI, system-ui, -apple-system, Roboto, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b6b85"/></marker>
+  </defs>
+  <rect width="1320" height="960" fill="#ffffff"/>
+
+  <!-- header -->
+  <rect width="1320" height="66" fill="#16213e"/>
+  <text x="32" y="30" fill="#ffffff" font-size="22" font-weight="600">Where the gap is, and the lever that closes each</text>
+  <text x="32" y="52" fill="#9fb3d1" font-size="12.5">Deep review 2026-06-20 · ranked by ROI (value ÷ effort) · backlog IDs in [brackets] · TinyLlama-1.1B Q4_K_M / RTX 5070 Ti</text>
+
+  <!-- ① do-first free strip -->
+  <rect x="32" y="84" width="1256" height="86" rx="10" fill="#fff3d4" stroke="#c79100" stroke-width="1.5"/>
+  <text x="50" y="110" font-size="15" font-weight="700" fill="#7a5b00">① Do first — free / trivial, no kernel work</text>
+  <g font-size="12.2" fill="#7a5b00">
+    <rect x="50" y="122" width="610" height="38" rx="7" fill="#ffffff" stroke="#d4a017"/>
+    <text x="64" y="138" font-weight="600">[R1.1] Hoist RunState out of the CUDA bench timed region</text>
+    <text x="64" y="153">~92 MB alloc+zero is timed → reported pp512 understated ~4–8%. Recovers gap for free.</text>
+    <rect x="678" y="122" width="592" height="38" rx="7" fill="#ffffff" stroke="#d4a017"/>
+    <text x="692" y="138" font-weight="600">[R1.2] Server: clamp Content-Length + socket timeouts</text>
+    <text x="692" y="153">unbounded body alloc (DoS) + slowloris. Two one-liners; required before --host 0.0.0.0.</text>
+  </g>
+
+  <!-- ② performance levers -->
+  <text x="32" y="200" font-size="15" font-weight="700" fill="#16213e">② Performance levers — closing the throughput gap</text>
+  <!-- column headers -->
+  <g font-size="11" fill="#7a8290" font-weight="600">
+    <text x="36" y="222">PATH</text>
+    <text x="196" y="222">CURRENT GAP · DIAGNOSED CAUSE</text>
+    <text x="506" y="222">LEVER</text>
+    <text x="966" y="222">EFFORT / ROI · OUTCOME</text>
+  </g>
+
+  <!-- Lane 1: CUDA prefill (highest value) -->
+  <g>
+    <rect x="32" y="230" width="148" height="100" rx="8" fill="#efe6f7" stroke="#7b3fa0" stroke-width="2"/>
+    <text x="106" y="272" text-anchor="middle" font-size="13.5" font-weight="700" fill="#3f1d63">CUDA</text>
+    <text x="106" y="290" text-anchor="middle" font-size="12" fill="#3f1d63">prefill</text>
+    <rect x="192" y="230" width="296" height="100" rx="8" fill="#fce4df" stroke="#c0392b"/>
+    <text x="206" y="256" font-size="15" font-weight="700" fill="#c0392b">~3.0–3.8×</text>
+    <text x="206" y="278" font-size="11.5" fill="#8c2316">dequant → f16 → cuBLASLt GEMM —</text>
+    <text x="206" y="294" font-size="11.5" fill="#8c2316">exactly the path llama.cpp's MMQ</text>
+    <text x="206" y="310" font-size="11.5" fill="#8c2316">avoids. Weights round-trip to f16.</text>
+    <rect x="500" y="230" width="448" height="100" rx="8" fill="#f6f8fc" stroke="#3d5a99"/>
+    <text x="514" y="252" font-size="12.5" font-weight="700" fill="#22324f">[L7] int8-MMQ tensor-core prefill</text>
+    <text x="514" y="270" font-size="11.3" fill="#33405a">keep weights packed, mma.sync s8 — the structural swing.</text>
+    <text x="514" y="290" font-size="11.3" fill="#235c3d" font-weight="600">Cheap wins first (bit-identical, no cuBLAS rewrite):</text>
+    <text x="514" y="306" font-size="11.3" fill="#235c3d">[R3.1] on-device final rmsnorm+classifier (skip n·dim D2H)</text>
+    <text x="514" y="322" font-size="11.3" fill="#235c3d">[R3.2] matmul_shared_batch (cut ~3/5 activation re-quant)</text>
+    <rect x="960" y="230" width="328" height="100" rx="8" fill="#16213e"/>
+    <text x="976" y="254" font-size="11.5" fill="#ffd98a" font-weight="600">L7: high effort · high value</text>
+    <text x="976" y="272" font-size="11.5" fill="#9ee0b8" font-weight="600">R3.x: low effort · real points</text>
+    <text x="976" y="296" font-size="11.3" fill="#cdd9ec">Closes most of the prefill gap;</text>
+    <text x="976" y="312" font-size="11.3" fill="#cdd9ec">the only lever with a proven ceiling.</text>
+  </g>
+
+  <!-- Lane 2: CUDA decode -->
+  <g>
+    <rect x="32" y="338" width="148" height="86" rx="8" fill="#e2f4e8" stroke="#2e7d4f" stroke-width="2"/>
+    <text x="106" y="376" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1d5236">CUDA</text>
+    <text x="106" y="394" text-anchor="middle" font-size="12" fill="#1d5236">decode</text>
+    <rect x="192" y="338" width="296" height="86" rx="8" fill="#e2f4e8" stroke="#2e7d4f"/>
+    <text x="206" y="364" font-size="15" font-weight="700" fill="#2e7d4f">~1.3–1.5×</text>
+    <text x="206" y="386" font-size="11.5" fill="#235c3d">packed DP4A GEMV, resident,</text>
+    <text x="206" y="402" font-size="11.5" fill="#235c3d">captured into a CUDA graph —</text>
+    <text x="206" y="416" font-size="11.5" fill="#235c3d">near its structural limit.</text>
+    <rect x="500" y="338" width="448" height="86" rx="8" fill="#f6f8fc" stroke="#7a8290"/>
+    <text x="514" y="362" font-size="12.5" font-weight="700" fill="#2a3142">GEMV micro-tuning only</text>
+    <text x="514" y="382" font-size="11.3" fill="#33405a">per-arch warp tables vs llama.cpp — diminishing returns.</text>
+    <text x="514" y="402" font-size="11.3" fill="#33405a">Flash attention already landed (decode-neutral). Nothing new.</text>
+    <rect x="960" y="338" width="328" height="86" rx="8" fill="#16213e"/>
+    <text x="976" y="364" font-size="11.5" fill="#aab8d0" font-weight="600">high effort · low value</text>
+    <text x="976" y="388" font-size="11.3" fill="#cdd9ec">Marginal. Leave it — this path is</text>
+    <text x="976" y="404" font-size="11.3" fill="#cdd9ec">effectively done.</text>
+  </g>
+
+  <!-- Lane 3: CPU -->
+  <g>
+    <rect x="32" y="432" width="148" height="100" rx="8" fill="#eceef0" stroke="#7a8290" stroke-width="2"/>
+    <text x="106" y="476" text-anchor="middle" font-size="13.5" font-weight="700" fill="#2a3142">CPU</text>
+    <text x="106" y="494" text-anchor="middle" font-size="11" fill="#5b6b85">(default backend)</text>
+    <rect x="192" y="432" width="296" height="100" rx="8" fill="#fdeee0" stroke="#d4881f"/>
+    <text x="206" y="458" font-size="14" font-weight="700" fill="#b5650f">~28× prefill · ~1.4× decode</text>
+    <text x="206" y="480" font-size="11.5" fill="#8a5410">prefill: un-tuned vec_dot kernel.</text>
+    <text x="206" y="496" font-size="11.5" fill="#8a5410">decode: DDR5 bandwidth-bound</text>
+    <text x="206" y="512" font-size="11.5" fill="#8a5410">(~33/70 GB/s; no AVX-512 here).</text>
+    <rect x="500" y="432" width="448" height="100" rx="8" fill="#f6f8fc" stroke="#3d5a99"/>
+    <text x="514" y="456" font-size="12.5" font-weight="700" fill="#22324f">[L9/R5] real packed prefill micro-kernel</text>
+    <text x="514" y="475" font-size="11.3" fill="#33405a">register-blocked, prefetch-tuned — close the 33→49 GB/s</text>
+    <text x="514" y="491" font-size="11.3" fill="#33405a">access-pattern gap.</text>
+    <text x="514" y="513" font-size="11.3" fill="#33405a">[R5.2] SIMD the scalar-f32 QK dot &amp; rmsnorm (long-context).</text>
+    <rect x="960" y="432" width="328" height="100" rx="8" fill="#16213e"/>
+    <text x="976" y="458" font-size="11.5" fill="#ffd98a" font-weight="600">high effort · medium value</text>
+    <text x="976" y="480" font-size="11.3" fill="#cdd9ec">Decode is near the memory floor —</text>
+    <text x="976" y="496" font-size="11.3" fill="#cdd9ec">prefill micro-kernel is the one</text>
+    <text x="976" y="512" font-size="11.3" fill="#cdd9ec">bounded CPU lever left.</text>
+  </g>
+
+  <!-- Lane 4: wgpu -->
+  <g>
+    <rect x="32" y="540" width="148" height="100" rx="8" fill="#e7edf7" stroke="#3d5a99" stroke-width="2"/>
+    <text x="106" y="584" text-anchor="middle" font-size="13.5" font-weight="700" fill="#22324f">wgpu</text>
+    <text x="106" y="602" text-anchor="middle" font-size="11" fill="#5b6b85">(portable GPU)</text>
+    <rect x="192" y="540" width="296" height="100" rx="8" fill="#fce4df" stroke="#c0392b"/>
+    <text x="206" y="566" font-size="14" font-weight="700" fill="#c0392b">~23× prefill · ~8× decode</text>
+    <text x="206" y="588" font-size="11.5" fill="#8c2316">batched matmul streams every</text>
+    <text x="206" y="604" font-size="11.5" fill="#8c2316">weight ONCE PER batch row —</text>
+    <text x="206" y="620" font-size="11.5" fill="#8c2316">zero reuse. No tensor cores.</text>
+    <rect x="500" y="540" width="448" height="100" rx="8" fill="#f6f8fc" stroke="#3d5a99"/>
+    <text x="514" y="564" font-size="12.5" font-weight="700" fill="#22324f">[R5.1] tile the batched (prefill) matmul</text>
+    <text x="514" y="583" font-size="11.3" fill="#33405a">one workgroup per weight row × shared-mem tile of N</text>
+    <text x="514" y="599" font-size="11.3" fill="#33405a">activation rows → amortize weight DRAM traffic by ~N.</text>
+    <text x="514" y="621" font-size="11.3" fill="#7b3fa0" font-weight="600">Biggest un-captured perf lever in the whole review.</text>
+    <rect x="960" y="540" width="328" height="100" rx="8" fill="#16213e"/>
+    <text x="976" y="566" font-size="11.5" fill="#9ee0b8" font-weight="600">medium effort · high value*</text>
+    <text x="976" y="588" font-size="11.3" fill="#cdd9ec">Plausibly several-× wgpu prefill,</text>
+    <text x="976" y="604" font-size="11.3" fill="#cdd9ec">independent of the (ruled-out)</text>
+    <text x="976" y="620" font-size="11.3" fill="#8fb0e0">*only if wgpu / portability matters.</text>
+  </g>
+
+  <!-- arrows between columns -->
+  <g stroke="#5b6b85" stroke-width="1.6" fill="none">
+    <line x1="180" y1="280" x2="190" y2="280" marker-end="url(#arr)"/><line x1="488" y1="280" x2="498" y2="280" marker-end="url(#arr)"/><line x1="948" y1="280" x2="958" y2="280" marker-end="url(#arr)"/>
+    <line x1="180" y1="381" x2="190" y2="381" marker-end="url(#arr)"/><line x1="488" y1="381" x2="498" y2="381" marker-end="url(#arr)"/><line x1="948" y1="381" x2="958" y2="381" marker-end="url(#arr)"/>
+    <line x1="180" y1="482" x2="190" y2="482" marker-end="url(#arr)"/><line x1="488" y1="482" x2="498" y2="482" marker-end="url(#arr)"/><line x1="948" y1="482" x2="958" y2="482" marker-end="url(#arr)"/>
+    <line x1="180" y1="590" x2="190" y2="590" marker-end="url(#arr)"/><line x1="488" y1="590" x2="498" y2="590" marker-end="url(#arr)"/><line x1="948" y1="590" x2="958" y2="590" marker-end="url(#arr)"/>
+  </g>
+
+  <!-- ③ correctness band -->
+  <text x="32" y="676" font-size="15" font-weight="700" fill="#16213e">③ Correctness — doesn't move the benchmark, but breaks llama.cpp parity on breadth archs</text>
+  <g font-size="11.5">
+    <rect x="32" y="688" width="306" height="64" rx="8" fill="#fce4df" stroke="#c0392b"/>
+    <text x="46" y="710" font-weight="700" fill="#a02718">[R2.1] Gemma2-27B attention scale</text>
+    <text x="46" y="728" fill="#8c2316">hardcoded 1/√head_size; never reads</text>
+    <text x="46" y="744" fill="#8c2316">query_pre_attn_scalar → silent corruption.</text>
+
+    <rect x="350" y="688" width="306" height="64" rx="8" fill="#fce4df" stroke="#c0392b"/>
+    <text x="364" y="710" font-weight="700" fill="#a02718">[R2.2] BPE ignore_merges</text>
+    <text x="364" y="728" fill="#8c2316">llama-bpe/llama3 pre-tokenizer diverges</text>
+    <text x="364" y="744" fill="#8c2316">from llama.cpp on Llama-3 vocabs.</text>
+
+    <rect x="668" y="688" width="306" height="64" rx="8" fill="#fce4df" stroke="#c0392b"/>
+    <text x="682" y="710" font-weight="700" fill="#a02718">[R2.3] grammar control-token leak</text>
+    <text x="682" y="728" fill="#8c2316">non-EOG control tokens unmasked →</text>
+    <text x="682" y="744" fill="#8c2316">can leak into constrained JSON output.</text>
+
+    <rect x="986" y="688" width="302" height="64" rx="8" fill="#fdeee0" stroke="#d4881f"/>
+    <text x="1000" y="710" font-weight="700" fill="#b5650f">[R2.4] prefill-path EOG check</text>
+    <text x="1000" y="728" fill="#8a5410">prompt-echo sub-loop omits is_eog —</text>
+    <text x="1000" y="744" fill="#8a5410">narrow (EOG mid-prompt); one-line fix.</text>
+  </g>
+
+  <!-- ④ robustness + docs -->
+  <text x="32" y="784" font-size="15" font-weight="700" fill="#16213e">④ Robustness &amp; honesty</text>
+  <g font-size="11.5">
+    <rect x="32" y="796" width="406" height="58" rx="8" fill="#f4f6f9" stroke="#7a8290"/>
+    <text x="46" y="818" font-weight="700" fill="#2a3142">[R4.1] Harden GGUF parser (4 untrusted scalars)</text>
+    <text x="46" y="836" fill="#33405a">count→with_capacity (OOM), alignment, dim overflow, dup keys.</text>
+    <text x="46" y="850" fill="#5b6b85">Fail cleanly on corrupt input per the "untrusted mmap" mandate.</text>
+
+    <rect x="450" y="796" width="406" height="58" rx="8" fill="#f4f6f9" stroke="#7a8290"/>
+    <text x="464" y="818" font-weight="700" fill="#2a3142">[R4.2] Delete dead code (legibility)</text>
+    <text x="464" y="836" fill="#33405a">CUDA dead seq_len param · F16 matmul arm · unwired int8</text>
+    <text x="464" y="850" fill="#5b6b85">Stage-2 kernels · cached wgpu pipelines · single-pass grammar.</text>
+
+    <rect x="868" y="796" width="420" height="58" rx="8" fill="#fff3d4" stroke="#c79100"/>
+    <text x="882" y="818" font-weight="700" fill="#7a5b00">[R6] Refresh stale docs (open item 6.x)</text>
+    <text x="882" y="836" fill="#7a5b00">04/02/08/06/01 describe a superseded era; cuda.rs:1248</text>
+    <text x="882" y="850" fill="#7a5b00">comment says "decode on CPU." Reconcile PERFORMANCE.md numbers.</text>
+  </g>
+
+  <!-- bottom line -->
+  <rect x="32" y="876" width="1256" height="56" rx="10" fill="#16213e"/>
+  <text x="52" y="901" font-size="13" font-weight="700" fill="#ffffff">Bottom line:</text>
+  <text x="148" y="901" font-size="12.5" fill="#cdd9ec">the gap is genuine and a few points of it are free (R1.1). The one real speed lever with a proven ceiling is int8-MMQ prefill (L7);</text>
+  <text x="52" y="921" font-size="12.5" fill="#cdd9ec">everything else is correctness, honesty-of-measurement, and cleanup. Where rusty_llama silently disagrees with llama.cpp is the breadth archs — not the path it benchmarks.</text>
+</svg>
