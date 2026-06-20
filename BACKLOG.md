@@ -225,9 +225,17 @@ cool machine; numbers below are reasoned, not all freshly benched.
   rmsnorm+quantize), a separate, bigger item. GEMV micro-tuning can't move it.
 
 **Treadmill-class / large / higher-risk:**
-- [ ] **L7. CUDA int8 tensor-core MMQ** (CUDA prefill ~3×). No cudarc int8 GEMM →
-  raw-sys cuBLASLt IMMA + lossy W8A8 (vs the exact f16 path). Spike with a
-  kill-criterion; likely no-merge. (= the proposed spike.)
+- [~] **L7. CUDA int8 tensor-core MMQ — SPIKED: GEMM feasible + 2.49×, but lossy.**
+  Feasibility microbench (`bench_int8_gemm_feasibility`, raw-sys cuBLASLt): int8
+  **works with ordinary col-major layout** on Blackwell sm_120 / CUDA 13.3 — no
+  COL32/IMMA transform needed (the feared layout pain doesn't apply), and it's
+  **2.49× faster than the f16 GEMM** at 2048×2048×512. *However* cuBLASLt int8 uses
+  one **per-row/per-col scale**, while Q4_K has per-32-sub-block scales — so adopting
+  it means requantizing Q4_K → uniform per-row int8 (W8A8), **lossier than the exact
+  Q4_K→f16 path**; quality is the open risk. The *non-lossy* path (llama.cpp-style
+  per-sub-block accumulation) needs a hand-written tiled int8-TC **MMQ** kernel — the
+  real treadmill. So: speed/feasibility GO; mergeability hinges on whether per-row
+  int8 holds quality, or on writing the big MMQ kernel.
 - [ ] **L8. Tensor-core flash attention** (GPU prefill + long context).
 - [ ] **L9. Aggressive CPU micro-kernel** (NR-tiling, software prefetch, drop the
   hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
