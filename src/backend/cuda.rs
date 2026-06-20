@@ -2439,4 +2439,131 @@ mod tests {
         }
     }
 
+    /// L7 feasibility spike: can an int8 cuBLASLt GEMM (IMMA) beat the f16
+    /// tensor-core GEMM at a prefill shape with **ordinary col-major layout** (no
+    /// COL32 transform)? Random int8 data — timing only. This is the kill gate for
+    /// the int8 MMQ treadmill: if ordinary layout is unsupported (needs COL32
+    /// transforms) or int8 isn't meaningfully faster, the integration isn't worth it.
+    #[test]
+    #[ignore = "L7 spike; run with --features cuda -- --ignored --nocapture"]
+    fn bench_int8_gemm_feasibility() {
+        use cudarc::cublaslt::{result, sys, MatmulShared};
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use std::ffi::c_void;
+        use std::time::Instant;
+        let Some(b) = cuda() else { return };
+        let st = &b.stream;
+        let iters = 100;
+        // Prefill GEMM shape: D[oc x rows] = W[oc x ic] · xᵀ (mirrors gemm_dev_f16).
+        let (oc, ic, rows) = (2048usize, 2048usize, 512usize);
+        let (m, n, k) = (oc as u64, rows as u64, ic as u64);
+
+        let a8 = st.alloc_zeros::<i8>(oc * ic).unwrap();
+        let b8 = st.alloc_zeros::<i8>(ic * rows).unwrap();
+        let mut c32 = st.alloc_zeros::<i32>(oc * rows).unwrap();
+        let ws_size = 33_554_432usize;
+        let ws = unsafe { st.alloc::<u8>(ws_size) }.unwrap();
+        let handle = *MatmulShared::handle(&b.blas);
+
+        let desc = match result::create_matmul_desc(
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32I,
+            sys::cudaDataType_t::CUDA_R_32I,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("INT8 SPIKE: create_matmul_desc(32I) failed: {e:?} -> KILL");
+                return;
+            }
+        };
+        let (op_t, op_n): (i32, i32) = (1, 0); // CUBLAS_OP_T, CUBLAS_OP_N
+        unsafe {
+            result::set_matmul_desc_attribute(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&op_t) as *const _ as *const c_void,
+                4,
+            )
+            .unwrap();
+            result::set_matmul_desc_attribute(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&op_n) as *const _ as *const c_void,
+                4,
+            )
+            .unwrap();
+        }
+        let a_l = result::create_matrix_layout(sys::cudaDataType_t::CUDA_R_8I, k, m, ic as i64).unwrap();
+        let b_l = result::create_matrix_layout(sys::cudaDataType_t::CUDA_R_8I, k, n, ic as i64).unwrap();
+        let c_l = result::create_matrix_layout(sys::cudaDataType_t::CUDA_R_32I, m, n, oc as i64).unwrap();
+        let pref = result::create_matmul_pref().unwrap();
+        unsafe {
+            result::set_matmul_pref_attribute(
+                pref,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws_size) as *const _ as *const c_void,
+                std::mem::size_of::<usize>(),
+            )
+            .unwrap();
+        }
+        let heur = match unsafe {
+            result::get_matmul_algo_heuristic(handle, desc, a_l, b_l, c_l, c_l, pref)
+        } {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("INT8 SPIKE: no int8 algo for ordinary col-major layout: {e:?} -> needs COL32 transforms -> KILL");
+                return;
+            }
+        };
+        eprintln!("INT8 SPIKE: ordinary-layout int8 algo found (heuristic ok)");
+
+        let (alpha, beta): (i32, i32) = (1, 0);
+        macro_rules! i8gemm {
+            () => {unsafe {
+                let (pa, _a) = a8.device_ptr(st);
+                let (pb, _b) = b8.device_ptr(st);
+                let (pc, _c) = c32.device_ptr_mut(st);
+                let (pw, _w) = ws.device_ptr(st);
+                result::matmul(handle, desc,
+                    (&alpha) as *const _ as *const c_void, (&beta) as *const _ as *const c_void,
+                    pa as *const c_void, a_l, pb as *const c_void, b_l,
+                    pc as *const c_void, c_l, pc as *mut c_void, c_l,
+                    (&heur.algo) as *const _, pw as *mut c_void, ws_size, st.cu_stream() as *mut _)
+            }};
+        }
+        if let Err(e) = i8gemm!() {
+            eprintln!("INT8 SPIKE: matmul failed (scale/layout): {e:?} -> KILL");
+            return;
+        }
+        st.synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            i8gemm!().unwrap();
+        }
+        st.synchronize().unwrap();
+        let i8t = t0.elapsed();
+
+        // f16 reference at the same shape via the safe API.
+        let a16 = st.alloc_zeros::<f16>(oc * ic).unwrap();
+        let b16 = st.alloc_zeros::<f16>(ic * rows).unwrap();
+        let mut c16 = st.alloc_zeros::<f16>(oc * rows).unwrap();
+        let cfg = MatmulConfig {
+            transa: true, transb: false, transc: false, m, n, k, alpha: 1.0,
+            lda: ic as i64, ldb: ic as i64, beta: 0.0, ldc: oc as i64,
+            stride_a: None, stride_b: None, stride_c: None, stride_bias: None, batch_size: None,
+        };
+        unsafe { b.blas.matmul(cfg, &a16, &b16, &mut c16, None, None).unwrap() };
+        st.synchronize().unwrap();
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            unsafe { b.blas.matmul(cfg, &a16, &b16, &mut c16, None, None).unwrap() };
+        }
+        st.synchronize().unwrap();
+        let f16t = t1.elapsed();
+
+        eprintln!(
+            "INT8 SPIKE {oc}x{ic}x{rows} x{iters}: int8 {i8t:?}  f16 {f16t:?}  int8 {:.2}x f16",
+            f16t.as_secs_f64() / i8t.as_secs_f64()
+        );
+    }
+
 }
