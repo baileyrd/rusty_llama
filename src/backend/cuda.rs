@@ -717,7 +717,15 @@ impl CudaBackend {
     fn gemm_dev_f16(&self, c: &mut CudaSlice<f32>, x16: &CudaSlice<f16>, w: &QMatrix, rows: usize) {
         let (oc, ic) = (w.rows(), w.cols());
         debug_assert_eq!(x16.len(), rows * ic);
-        debug_assert_eq!(c.len(), rows * oc);
+        // `c` may be LONGER than rows*oc: the K/V projections write their n rows
+        // into the seq_len-sized resident KV-cache buffers. `dev_cvt_to_f32` below
+        // only writes the first rows*oc, so a larger destination is fine.
+        debug_assert!(
+            c.len() >= rows * oc,
+            "gemm output {} < rows*oc {}",
+            c.len(),
+            rows * oc
+        );
         let w_dev = self.weight_f16(w);
         // `c16` is fully written by the GEMM (beta = 0, C not read), so skip the
         // memset. SAFETY: written in full before read.
@@ -1522,13 +1530,29 @@ impl Backend for CudaBackend {
         // with no upload (kv_filled = n).
         d.kv_filled = n;
 
-        // Final RMSNorm of the last position + classifier, via the host path.
-        let x_host: Vec<f32> = st.clone_dtoh(&x).expect("download residual");
+        // Final RMSNorm of the last position + classifier, on-device: copy the last
+        // residual row into the resident decode scratch (d.x) and reuse the exact
+        // decode final-norm + packed-DP4A classifier (d.rms_final / d.xb / d.aq.. /
+        // gemv_decode against w.wcls). Only the vocab-sized logits come back, versus
+        // pulling the whole n*dim residual to the host and running the rmsnorm +
+        // classifier GEMV there. Same kernels the decode path uses, so prefill->decode
+        // logit coherence holds (and the last-token logits now match decode's
+        // classifier exactly).
         let last = (n - 1) * dim;
-        let mut xb_last = vec![0.0f32; dim];
-        self.cpu
-            .rmsnorm(&mut xb_last, &x_host[last..last + dim], &w.rms_final_weight, eps);
-        self.gemm(state.logits_mut(), &xb_last, &w.wcls, 1);
+        st.memcpy_dtod(&x.slice(last..last + dim), &mut d.x)
+            .expect("copy last residual row to decode scratch");
+        let q_dim_ok = qgemv_enabled() && dim % 256 == 0;
+        // Normalize into a dim-length scratch (NOT the shared d.xb, which is sized to
+        // hidden_dim): gemv_decode's gemm_dev fallback for a non-packable classifier
+        // asserts the input is exactly `cols` long.
+        let mut xbn = st.alloc_zeros::<f32>(dim).expect("alloc normed last row");
+        self.dev_rmsnorm(&mut xbn, &d.x, &d.rms_final, 1, dim, eps);
+        if q_dim_ok {
+            self.dev_quantize_q8k(&mut d.aq, &mut d.ad, &mut d.absums, &xbn, dim);
+        }
+        self.gemv_decode(&mut d.logits, &xbn, &d.aq, &d.ad, &d.absums, &w.wcls, q_dim_ok);
+        let logits_host: Vec<f32> = st.clone_dtoh(&d.logits).expect("download logits");
+        state.logits_mut().copy_from_slice(&logits_host);
     }
 }
 
