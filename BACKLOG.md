@@ -225,17 +225,21 @@ cool machine; numbers below are reasoned, not all freshly benched.
   rmsnorm+quantize), a separate, bigger item. GEMV micro-tuning can't move it.
 
 **Treadmill-class / large / higher-risk:**
-- [~] **L7. CUDA int8 tensor-core MMQ — SPIKED: GEMM feasible + 2.49×, but lossy.**
-  Feasibility microbench (`bench_int8_gemm_feasibility`, raw-sys cuBLASLt): int8
-  **works with ordinary col-major layout** on Blackwell sm_120 / CUDA 13.3 — no
-  COL32/IMMA transform needed (the feared layout pain doesn't apply), and it's
-  **2.49× faster than the f16 GEMM** at 2048×2048×512. *However* cuBLASLt int8 uses
-  one **per-row/per-col scale**, while Q4_K has per-32-sub-block scales — so adopting
-  it means requantizing Q4_K → uniform per-row int8 (W8A8), **lossier than the exact
-  Q4_K→f16 path**; quality is the open risk. The *non-lossy* path (llama.cpp-style
-  per-sub-block accumulation) needs a hand-written tiled int8-TC **MMQ** kernel — the
-  real treadmill. So: speed/feasibility GO; mergeability hinges on whether per-row
-  int8 holds quality, or on writing the big MMQ kernel.
+- [✗] **L7. CUDA int8 prefill — SPIKE GO, but integration RULED OUT (too lossy).**
+  *Spike (#49, kept):* int8 cuBLASLt works with ordinary col-major layout on
+  Blackwell sm_120 / CUDA 13.3 (no COL32/IMMA transform) and is **2.49× faster than
+  f16** at 2048×2048×512. *Integration (built + quality-gated, then reverted):* wired
+  a gated per-row-int8 prefill (weight_int8 cache + activation int8 quant + int32→f32
+  dequant, behind `RUSTY_LLAMA_CUDA_INT8`). End-to-end it was **+18% prefill** (5139
+  → 6075 t/s — the 2.49× GEMM heavily diluted by per-call cuBLASLt descriptor/
+  heuristic overhead + quant/dequant + unchanged non-GEMM work) and the GEMM is
+  numerically right (rel L2 0.012). **But quality failed:** cuBLASLt int8's per-row
+  scale vs Q4_K's per-32-sub-block scale gives ~10% logit error (prefill coherence
+  rel L2 0.098, *at* the bound), and real greedy generation **degenerates on some
+  prompts** (coherent on others) — e.g. "…Paris. 2. C - D - E - F - G…". Reverted:
+  per-row int8 is fundamentally too coarse for Q4_K; the only quality path is the
+  **per-sub-block MMQ kernel** (hand-written tiled int8-TC — the real treadmill, not
+  attempted). +18% lossy prefill isn't worth a generation footgun.
 - [ ] **L8. Tensor-core flash attention** (GPU prefill + long context).
 - [ ] **L9. Aggressive CPU micro-kernel** (NR-tiling, software prefetch, drop the
   hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
