@@ -73,8 +73,12 @@ data pointer). Q8_0/Q4_K/Q6_K weights stay in their **quantized** GGUF blocks
 on the device and are dequantized *in the matmul shader* (like the CPU's
 per-block path), so the device streams ~4–7× less weight data per token than
 expanding to f32 would; other formats are dequantized to f32 on the host at
-upload. Greedy output is **byte-identical** to the CPU backend (verified on
-`stories15M` and a quantized TinyLlama-1.1B Q4_K_M; see `tests/gpu_parity.rs`).
+upload. On **f32 and Q8_0** models greedy output matches the CPU backend (see
+`tests/gpu_parity.rs`). On **k-quant** models (Q4_K/Q6_K) the two backends can pick
+different greedy tokens: the GPU computes exact f32 dequant dots, while the CPU's int8
+fast path quantizes activations to Q8_K (per-256-block), losing ~0.3% per matmul which
+compounds over depth. The GPU side is the accurate one — `wgpu_kquant_matmul_matches_f32`
+asserts its k-quant matmul equals the f32 reference exactly.
 
 **Prompt prefill is batched.** The whole prompt runs in one set of *large*
 matmuls (`forward_prefill`) rather than one tiny pass per token, via batched
@@ -177,7 +181,7 @@ and that greedy generation reproduces.
 - [x] Byte-exact pretokenizer regex (`gpt-2`/`llama-bpe`/`qwen2` via `fancy-regex`) + special-token handling
 - [x] RoPE long-context scaling (`linear`/`yarn`/`llama3`)
 - [x] Explicit AVX-512 VNNI (`vpdpbusd`) integer dot products for Q8_0/Q4_0/Q4_K/Q6_K (~2.2–2.5×, bit-identical to scalar)
-- [x] GPU backend (`wgpu`) behind the existing `Backend` trait — per-op parity + byte-identical e2e output; decode currently latency-bound (honest verdict above)
+- [x] GPU backend (`wgpu`) behind the existing `Backend` trait — per-op parity + matching e2e output on f32/Q8_0 (k-quant greedy can differ; GPU is the f32-exact side, CPU int8 is the approximation — see above); decode currently latency-bound (honest verdict above)
 - [x] Architecture breadth beyond Llama: **Qwen2** (QKV bias), **Phi-3** (fused qkv / gate-up), **Gemma 2** (GeGLU, sandwich norms, logit softcap, explicit head-dim) via an `Arch` registry seam — greedy output validated against `llama-cli`
 - [x] NeoX vs NORM RoPE handled by a load-time Q/K permute (one rope kernel); built-in chat templates (chatml / llama-3 / qwen2 / gemma / phi-3) + EOS/turn-end stop
 - [x] CUDA packed-weight DP4A decode GEMV — Q4_K/Q6_K weights stay packed, `__dp4a` against an on-device Q8_K activation: **2.4× decode** (86 → 207 tok/s on TinyLlama Q4_K_M), default-on
