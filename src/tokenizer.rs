@@ -271,6 +271,11 @@ pub struct Spm {
     /// End-of-turn token id (GGUF `eot_token_id`), if the model declares a chat
     /// turn-end distinct from `eos` (e.g. Gemma's `<end_of_turn>`).
     eot: Option<usize>,
+    /// Whether to prepend the SentencePiece dummy leading space (GGUF
+    /// `add_space_prefix`, default true). Some SPM GGUFs disable it; honoring the
+    /// flag keeps token ids byte-identical to llama.cpp instead of always adding
+    /// the prefix.
+    add_space_prefix: bool,
 }
 
 impl Spm {
@@ -293,6 +298,7 @@ impl Spm {
             bos: 1,
             eos: Some(2),
             eot: None,
+            add_space_prefix: true,
         }
     }
 
@@ -384,6 +390,10 @@ impl Spm {
             .meta_u64("tokenizer.ggml.eot_token_id")
             .ok()
             .map(|v| v as usize);
+        tk.add_space_prefix = gguf
+            .meta_u64("tokenizer.ggml.add_space_prefix")
+            .map(|v| v != 0)
+            .unwrap_or(true);
         Ok(tk)
     }
 
@@ -397,8 +407,9 @@ impl Spm {
         if bos {
             tokens.push(self.bos);
         }
-        // The dummy leading space is added only to the first ordinary span.
-        let mut first = true;
+        // The dummy leading space is added only to the first ordinary span, and
+        // only when the model enables it (SPM `add_space_prefix`, default true).
+        let mut first = self.add_space_prefix;
         self.specials.split(text, |seg| match seg {
             Segment::Gap(g) => {
                 self.encode_piece(g, first, &mut tokens);
@@ -910,6 +921,32 @@ mod tests {
     fn spm_encode_merges_into_single_token() {
         let tk = hello_tokenizer();
         assert_eq!(tk.encode("hello", true, false), vec![1, 11]);
+    }
+
+    #[test]
+    fn spm_add_space_prefix_toggles_dummy_space() {
+        // Minimal vocab where the dummy space never merges, so its presence is
+        // directly observable as a leading token id.
+        let entries: &[(&[u8], f32)] = &[
+            (b"<unk>", 0.0),    // 0
+            (b"\n<s>\n", 0.0),  // 1 BOS
+            (b"\n</s>\n", 0.0), // 2 EOS
+            (b" ", -1.0),       // 3 (the SPM `_` marker normalizes to this)
+            (b"a", -2.0),       // 4
+        ];
+        let vocab: Vec<Vec<u8>> = entries.iter().map(|(p, _)| p.to_vec()).collect();
+        let scores: Vec<f32> = entries.iter().map(|(_, s)| *s).collect();
+
+        // Default add_space_prefix=true (matches llama.cpp's default): a dummy
+        // leading space is prepended.
+        let mut tk = Spm::from_vocab(vocab, scores);
+        assert!(tk.add_space_prefix);
+        assert_eq!(tk.encode("a", false, false), vec![3, 4]);
+
+        // GGUF add_space_prefix=false: no leading space, keeping token ids
+        // byte-identical to llama.cpp on such models.
+        tk.add_space_prefix = false;
+        assert_eq!(tk.encode("a", false, false), vec![4]);
     }
 
     #[test]

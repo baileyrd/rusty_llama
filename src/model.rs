@@ -176,6 +176,15 @@ impl<'a> Model<'a> {
     pub fn from_gguf(gguf: &Gguf<'a>) -> Result<Self> {
         let arch_str = gguf.meta_str("general.architecture")?.to_owned();
         let arch = Arch::from_name(&arch_str);
+        if !Arch::is_known(&arch_str) {
+            // Permissive load (as Llama) is deliberate, but make it loud: an
+            // unrecognized NeoX-RoPE arch gets NORM rope with no Q/K permute and
+            // silently produces garbage. llama.cpp dispatches rope-type per arch.
+            eprintln!(
+                "rusty_llama: warning: unrecognized architecture '{arch_str}', loading as \
+                 Llama — RoPE/normalization may be wrong unless this model is Llama-compatible"
+            );
+        }
         let names = arch.tensor_names();
         let key = |k: &str| format!("{arch_str}.{k}");
 

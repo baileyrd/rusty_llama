@@ -412,3 +412,28 @@ Ordered by ROI (value ÷ effort).
   `store_prefill_kv`); refreshed line refs. Fixed the in-code comment falsely claiming decode
   "runs entirely on the CPU". `PERFORMANCE.md` reconciled to measured (~3.0–3.8× prefill /
   ~1.3–1.5× decode) and given explicit CUDA rows in the headline decode/prefill tables.
+
+---
+
+## Divergence audit follow-ups (2026-06-21)
+
+Full report: [`docs/Reviews/2026-06-21-divergence-audit.md`](docs/Reviews/2026-06-21-divergence-audit.md).
+10-subsystem audit mapping every place rusty diverges from llama.cpp (139 findings → 52
+confirmed, 7 refuted, ~30 confirmed *non*-divergences). The perf divergences are all
+already tracked (A1 = int8 MMQ = L7); the new value is the silent-correctness bucket, all
+on breadth archs (never the TinyLlama path).
+
+- [x] **D1 (C1) Warn on unrecognized architecture.** `Arch::from_name` silently mapped any
+  unknown `general.architecture` to `Arch::Llama` (NORM rope, no NeoX permute) → a NeoX-rope
+  model rusty doesn't recognize loaded silently and rotated Q/K wrong. Added `Arch::is_known`;
+  `Model::from_gguf` now warns (still loads permissively). Tested.
+- [x] **D2 (C2) Honor SPM `add_space_prefix`.** `Spm::from_gguf` ignored
+  `tokenizer.ggml.add_space_prefix` and always prepended the dummy space → different token
+  ids than llama.cpp on GGUFs that disable it. Added the field (default true) + GGUF read +
+  encode gate. Tested.
+- [ ] **D3 (C3) Gemma2 interleaved sliding-window attention (iSWA).** `cpu.rs` attention
+  always attends `0..=pos`; Gemma2 even layers cap at the last 4096 keys. Bit-identical
+  &lt;4096 tokens, divergent beyond. Needs a per-layer `n_swa` window mask. Documented as a
+  known long-context divergence; short-context Gemma2 unaffected.
+- [ ] **D4 Breadth gaps (not silent):** missing quant types (Q5_K/Q3_K/Q2_K/Q5_0/Q5_1/Q4_1/
+  IQ/MXFP4/TQ — hard error at load), sharded-GGUF loading, non-hardcoded chat templates.
