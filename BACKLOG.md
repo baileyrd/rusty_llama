@@ -359,14 +359,19 @@ Ordered by ROI (value ÷ effort).
   pipelines, not worth it for the least-important backend; A/B via `git stash`.)*
 - [ ] **R5.2 CPU long-context attention SIMD.** QK dot (cpu.rs:403) and `v·v` rmsnorm
   (cpu.rs:99) are scalar f32 — negligible at pp/tg128, measurable at long context.
-- [ ] **R5.3 wgpu batched-prefill diverges from CPU on real k-quants** *(found during R5.1)*.
-  `forward_prefill` on the GPU gives a different argmax than the CPU on TinyLlama Q4_K_M
-  (rel-L2 ~3.5%); present on `main`, independent of tiling. F32/Q8_0 synthetic prefill matches
-  fine and the GEMV *decode* path is byte-identical, so the suspect is the **dequant-in-shader
-  Q4_K/Q6_K batch matmul** numerics (or a subtle index/scale bug) vs the CPU int8 path.
-  `prefill_matches_cpu_real_kquant` currently only bounds rel-L2; tighten to argmax parity once
-  fixed. Means GPU-backed prompt processing may pick a different first token than CPU on
-  k-quant models.
+- [x] **R5.3 wgpu/CPU divergence on real k-quants — investigated; NOT a GPU bug** *(found
+  during R5.1, resolved 2026-06-20)*. The wgpu backend disagrees with the CPU on TinyLlama
+  Q4_K_M (rel-L2 ~3.5%, different greedy token) — but the divergence is general (decode too,
+  not prefill-specific: `gpu_prefill==gpu_seq` and `cpu_prefill==cpu_seq` to rel-L2 0.0). A
+  direct single-matmul check against the **true f32 dequant dot** (`wgpu_kquant_matmul_matches_f32`)
+  settled it: **GPU vs f32-ref = 0.00000, CPU vs f32-ref = 0.0030–0.0032.** The GPU is *exact*;
+  the CPU's int8 fast path quantizes activations to **Q8_K (per-256-block)**, losing ~0.3% per
+  matmul which compounds over 22 layers to flip the argmax. (Q8_0 matched because it uses fine
+  per-32-block Q8.) So the README's "byte-identical" cross-backend claim was wrong (fixed); the
+  GPU side has a proper exactness test now. **Real residual (separate, optional):** the CPU
+  int8 path is ~0.3%/matmul less accurate than f32 on k-quants — a deliberate speed tradeoff
+  (llama.cpp makes the same choice); finer activation blocking would tighten it if CPU k-quant
+  accuracy ever matters.
 
 ### R6 — Documentation (open item 6.x — confirmed)
 

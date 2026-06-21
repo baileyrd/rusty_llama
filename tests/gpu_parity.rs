@@ -150,14 +150,13 @@ fn prefill_matches_cpu_real_kquant() {
         argmax(&cpu),
         argmax(&gpu_l)
     );
-    // Regression guard for the tiled Q4_K/Q6_K batch shaders. NOTE: the wgpu *batched
-    // prefill* already diverges from the CPU on real k-quant models (rel-L2 ~3.5%,
-    // and the greedy token can differ) — a PRE-EXISTING issue, not caused by tiling.
-    // (Verified: tiling preserves per-output FMA order, so tiled output is bit-
-    // identical to the untiled shader — same rel-L2 to 8 sig figs.) So we can't
-    // assert CPU argmax parity here; instead bound rel-L2 so a gross tiling bug
-    // (NaN / wrong index / ~50% error) is still caught. Tightening this to argmax
-    // parity is blocked on fixing the pre-existing wgpu k-quant prefill divergence.
+    // The wgpu prefill legitimately differs from the CPU on real k-quant models by a
+    // few % (greedy token can differ): the GPU computes exact f32 dequant dots while
+    // the CPU uses a Q8_K per-256-block int8 activation that loses ~0.3%/matmul,
+    // compounding over depth (see R5.3 + `wgpu_kquant_matmul_matches_f32`, which proves
+    // the GPU side is exact). So this asserts the strong, backend-agnostic facts —
+    // finite, and bounded rel-L2 (a gross tiling/index bug would blow past it) — not
+    // CPU argmax parity (which they don't share, and which isn't a GPU defect).
     assert!(gpu_l.iter().all(|v| v.is_finite()));
     assert!(rel < 0.05, "real Q4_K_M prefill rel-L2 {rel} — tiling regression?");
 }
@@ -193,6 +192,59 @@ fn bench_prefill_gpu_real() {
         n as f64 / dt.as_secs_f64()
     );
 }
+
+/// Proves the wgpu **Q4_K/Q6_K matmul is numerically exact**: it matches the true f32
+/// dequant dot (`dequant_row` + f32 dot — the same dequant the shader does) to f32
+/// precision. This is the R5.3 resolution — the GPU is correct; the GPU-vs-CPU
+/// prefill divergence on real k-quant models is the CPU's Q8_K (per-256-block)
+/// int8-activation approximation (~0.3% per matmul, compounding over depth to flip
+/// the greedy token), NOT a GPU bug. Gated on the GGUF + a GPU.
+#[test]
+#[ignore = "needs the GGUF + a GPU"]
+fn wgpu_kquant_matmul_matches_f32() {
+    let path = std::env::var("RUSTY_LLAMA_GGUF")
+        .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".into());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skip: {path} not found");
+        return;
+    }
+    let Some(g) = gpu() else { return };
+    let bytes = std::fs::read(&path).unwrap();
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    let cpu = CpuBackend::new();
+    let rel = |a: &[f32], b: &[f32]| {
+        let n: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let d: f32 = a.iter().map(|x| x * x).sum::<f32>().max(1e-12);
+        (n / d).sqrt()
+    };
+    for w in [&model.weights.wq[0], &model.weights.w2[0]] {
+        let (oc, ic) = (w.rows(), w.cols());
+        let x: Vec<f32> = (0..ic).map(|i| ((i * 7 % 17) as f32 - 8.0) * 0.05).collect();
+        let mut og = vec![0.0f32; oc];
+        g.matmul(&mut og, &x, w);
+        let mut oc_cpu = vec![0.0f32; oc];
+        cpu.matmul(&mut oc_cpu, &x, w);
+        let mut wf = vec![0.0f32; ic];
+        let oref: Vec<f32> = (0..oc)
+            .map(|j| {
+                w.dequant_row(j, &mut wf);
+                wf.iter().zip(&x).map(|(a, b)| a * b).sum()
+            })
+            .collect();
+        let g_err = rel(&oref, &og);
+        let c_err = rel(&oref, &oc_cpu);
+        eprintln!("matmul {oc}x{ic}: gpu-vs-f32ref={g_err:.5}  cpu-vs-f32ref={c_err:.5}");
+        // The GPU dequant-in-shader matmul must equal the f32 reference (only the
+        // parallel-reduction order differs). The CPU's int8 path legitimately differs
+        // more (Q8_K activation) — we don't bound it, just record it.
+        assert!(
+            g_err < 1e-3,
+            "wgpu k-quant matmul should match the f32 reference, got rel-L2 {g_err}"
+        );
+    }
+}
+
 
 /// The fused on-device decode step (with the prefill→decode KV sync) must track
 /// the CPU forward and pick the same next token, for F32 and Q8_0.
