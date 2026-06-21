@@ -151,10 +151,11 @@ lands ~1.5–2×. Work items, ROI order (branch → test+bench → PR → merge 
   spills the deferred-hsum accumulators (16 YMM), so MR=4 is the sweet spot; the
   residual is per-row unpack + madd/hsum throughput. Decode stays bandwidth-bound
   (~33 of ~70 GB/s DDR5) — a separate lever.
-- [ ] **6.x Bench-methodology + doc-drift fixes** (fold into the PRs above):
-  real-model CPU/wgpu benches in the rigorous harness; warmup+reps for the CPU
-  baseline; hoist `RunState` out of the timed prefill region; fix stale
-  "TF32"/"dequant-to-f32-on-host"/"no AVX2" doc claims. See the phase-6 doc.
+- [x] **6.x Bench-methodology + doc-drift fixes** *(done across this session's PRs)*:
+  `RunState` hoisted out of the timed prefill region (R1.1, #51); real-model CPU/wgpu/CUDA
+  benches with warmup + r=8 reps in the rigorous harness (`bench_*_real_tinyllama`,
+  `bench_prefill_gpu_real`); stale "TF32"/"dequant-to-f32-on-host"/"no AVX2" doc claims
+  fixed (R6, #57) and headline numbers reconciled (#58).
 
 ## Further performance levers (2026-06-19 survey)
 
@@ -329,7 +330,7 @@ Ordered by ROI (value ÷ effort).
   `debug_assert_eq!(c.len(), rows*oc)` was too strict — the K/V projections write `n` rows into
   the `seq_len`-sized resident KV buffers, so it's now `>=` (release was always fine since
   `debug_assert` is off there; this just unbreaks the prefill tests in debug).)*
-- [ ] **R3.2 `matmul_shared_batch`.** *(evaluated 2026-06-20 — NOT worth implementing.
+- [x] **R3.2 `matmul_shared_batch`** — *closed: evaluated 2026-06-20, NOT worth implementing.
   The activation quantization it would dedup is O(input_cols), while the matmuls it feeds are
   O(output_cols·input_cols), so a re-quant is ~1/output_cols of one matmul — ~0.05% each on
   CPU. The main CUDA prefill is the **resident** path, which does its own device GEMMs and
