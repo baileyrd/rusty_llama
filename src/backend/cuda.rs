@@ -2568,6 +2568,110 @@ extern "C" __global__ void mma_i8(const signed char* A, const signed char* B, in
         eprintln!("GATE PASSED: inline-PTX int8 mma.sync.m16n8k32 runs correctly on sm_120");
     }
 
+    /// Phase 7 / Stage A: generalize the proven m16n8k32 fragment (probe above)
+    /// into a TILED, K-accumulating int8 GEMM `C[M,N] = scale * (A[M,K] · Bᵀ)`,
+    /// where `A` is the activation (M×K row-major) and `B` is the weight (N×K
+    /// row-major, the `W[oc][ic]` prefill layout — i.e. K×N column-major, what
+    /// `mma.row.col` wants). One warp owns one 16×8 output tile and loops K in
+    /// steps of 32, chaining the s32 accumulator across mma.sync calls; the final
+    /// accumulator is scaled to f32. No shared-memory reuse yet (Stage B adds it
+    /// with the Q8_0 quant) — this only proves the tiling/fragment/accumulation.
+    #[test]
+    #[ignore = "L7 Stage A; run with --features cuda -- --ignored --nocapture"]
+    fn mmq_stage_a_tiled_int8_gemm() {
+        let Some(b) = cuda() else {
+            eprintln!("no CUDA device");
+            return;
+        };
+        // C[m][n] = scale * sum_k A[m*K+k] * B[n*K+k]. One warp per 16x8 tile;
+        // grid.x over N/8 col-tiles, grid.y over M/16 row-tiles. Fragment layout
+        // identical to probe_int8_mma_ptx, generalized to (row_base, col_base, kk).
+        const SRC: &str = r#"
+extern "C" __global__ void mmq_a(
+    const signed char* A, const signed char* B, float* C,
+    int M, int N, int K, float scale)
+{
+    int row_base = blockIdx.y * 16;
+    int col_base = blockIdx.x * 8;
+    int lane = threadIdx.x & 31;
+    int gid = lane >> 2;   // 0..7
+    int tig = lane & 3;    // 0..3
+    int c0=0, c1=0, c2=0, c3=0;
+    for (int kk = 0; kk < K; kk += 32) {
+        unsigned a0=0,a1=0,a2=0,a3=0,b0=0,b1=0;
+        for (int t = 0; t < 4; t++) {
+            a0 |= ((unsigned)(unsigned char)A[(row_base+gid)*K   + kk + tig*4 + t])      << (8*t);
+            a1 |= ((unsigned)(unsigned char)A[(row_base+gid+8)*K + kk + tig*4 + t])      << (8*t);
+            a2 |= ((unsigned)(unsigned char)A[(row_base+gid)*K   + kk + 16 + tig*4 + t]) << (8*t);
+            a3 |= ((unsigned)(unsigned char)A[(row_base+gid+8)*K + kk + 16 + tig*4 + t]) << (8*t);
+            b0 |= ((unsigned)(unsigned char)B[(col_base+gid)*K   + kk + tig*4 + t])      << (8*t);
+            b1 |= ((unsigned)(unsigned char)B[(col_base+gid)*K   + kk + 16 + tig*4 + t]) << (8*t);
+        }
+        int d0,d1,d2,d3;
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "=r"(d0),"=r"(d1),"=r"(d2),"=r"(d3)
+            : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(c0),"r"(c1),"r"(c2),"r"(c3));
+        c0=d0; c1=d1; c2=d2; c3=d3;
+    }
+    C[(row_base+gid)*N   + col_base + tig*2]     = scale * (float)c0;
+    C[(row_base+gid)*N   + col_base + tig*2 + 1] = scale * (float)c1;
+    C[(row_base+gid+8)*N + col_base + tig*2]     = scale * (float)c2;
+    C[(row_base+gid+8)*N + col_base + tig*2 + 1] = scale * (float)c3;
+}
+"#;
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_120"),
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(SRC, opts).expect("nvrtc compile");
+        let st = &b.stream;
+        let m = b.ctx.load_module(ptx).expect("load module");
+        let f = m.load_function("mmq_a").expect("load fn");
+
+        // 2x2 output tiles, 2 K-steps: exercises tiling in all three dims.
+        let (mm, nn, kk) = (32usize, 16usize, 64usize);
+        let scale = 0.0125f32;
+        let ah: Vec<i8> = (0..mm * kk).map(|i| ((i % 11) as i32 - 5) as i8).collect();
+        let bh: Vec<i8> = (0..nn * kk).map(|i| ((i * 3 % 13) as i32 - 6) as i8).collect();
+        let ad = st.clone_htod(&ah).unwrap();
+        let bd = st.clone_htod(&bh).unwrap();
+        let mut cd = st.alloc_zeros::<f32>(mm * nn).unwrap();
+        {
+            let mut lb = st.launch_builder(&f);
+            let (mi, ni, ki) = (mm as i32, nn as i32, kk as i32);
+            lb.arg(&ad).arg(&bd).arg(&mut cd).arg(&mi).arg(&ni).arg(&ki).arg(&scale);
+            let cfg = LaunchConfig {
+                grid_dim: ((nn / 8) as u32, (mm / 16) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.expect("launch");
+        }
+        let c: Vec<f32> = st.clone_dtoh(&cd).unwrap();
+        let mut bad = 0;
+        let mut maxerr = 0.0f32;
+        for i in 0..mm {
+            for j in 0..nn {
+                let mut acc = 0i32;
+                for k in 0..kk {
+                    acc += ah[i * kk + k] as i32 * bh[j * kk + k] as i32;
+                }
+                let want = scale * acc as f32;
+                let err = (c[i * nn + j] - want).abs();
+                maxerr = maxerr.max(err);
+                if err > 1e-3 {
+                    if bad < 8 {
+                        eprintln!("[{i}][{j}] gpu={} ref={want}", c[i * nn + j]);
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "tiled int8 GEMM mismatch in {bad}/{} cells", mm * nn);
+        eprintln!("STAGE A PASSED: tiled int8 mma GEMM {mm}x{nn}x{kk} exact (maxerr {maxerr:.2e})");
+    }
+
     #[test]
     #[ignore = "L7 spike; run with --features cuda -- --ignored --nocapture"]
     fn bench_int8_gemm_feasibility() {
