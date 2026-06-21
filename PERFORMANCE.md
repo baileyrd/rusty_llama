@@ -24,23 +24,34 @@ and the prioritized list of work it points to. Measured 2026-06-16.
 
 ### Decode (tok/s) — the clean apples-to-apples
 
-| Path | Decode | vs rusty_llama |
+| Path | Decode | Gap |
 | --- | ---: | --- |
 | rusty_llama — CPU (autovectorized scalar) | 36.7 | — |
-| rusty_llama — CPU (**AVX2 integer kernels**, roadmap #1) | **49.8** | — |
-| llama.cpp — CPU | 73.6 | **1.48× faster** (was 2.1× before #1) |
-| rusty_llama — GPU (wgpu) | 45.9 | — |
-| llama.cpp — Vulkan (same GPU, same API class) | 375.9 | **8.2× faster** |
-| llama.cpp — CUDA (NVIDIA-native) | 397.5 | **8.7× faster** |
+| rusty_llama — CPU (**AVX2/VNNI int8 kernels**, roadmap #1) | **49.8** | **1.48× behind** llama.cpp CPU (was 2.1× before #1) |
+| rusty_llama — GPU (wgpu, portable f32, no tensor cores) | 45.9 | ~8× behind — the portability path, not the flagship |
+| rusty_llama — **CUDA (resident decode: packed DP4A + CUDA graph)** | **307** | **1.29× behind** llama.cpp CUDA |
+| llama.cpp — CPU | 73.6 | baseline |
+| llama.cpp — Vulkan (same GPU, same API class) | 375.9 | baseline |
+| llama.cpp — CUDA (NVIDIA-native) | 397.5 | baseline |
+
+*rusty_llama CUDA rows re-measured 2026-06-20 (release, r=8, standalone). Decode is
+thermal-sensitive: ~307 cold, dipping to ~233 when chained immediately after a prefill run.*
 
 ### Prefill (tok/s)
 
-llama.cpp: **CPU 5,890 · Vulkan 16,988 · CUDA 18,457**. rusty_llama's batched
-prefill helps but uses no tensor cores, so it is one to two orders of magnitude
-behind. The batched prefill matmul is now register-tiled (each thread computes
-TN=4 output rows, every weight read once), lifting the synthetic f32 prefill bench
-~728 → ~2,170 tok/s (~3.0×) and real TinyLlama Q4_K_M prefill ~42 → ~207 tok/s
-(~4.9×) — still far below llama.cpp's tensor-core Vulkan/CUDA regardless.
+| Path | Prefill (pp512) | Gap |
+| --- | ---: | --- |
+| rusty_llama — CPU (cache-blocked GEMM) | ~182 | ~32× behind llama.cpp CPU |
+| rusty_llama — GPU (wgpu, register-tiled f32, no tensor cores) | ~207 (Q4_K_M) | ~82× behind llama.cpp Vulkan |
+| rusty_llama — **CUDA (f16 cuBLASLt tensor cores)** | **~5,070** | **3.6× behind** llama.cpp CUDA |
+| llama.cpp — CPU · Vulkan · CUDA | 5,890 · 16,988 · 18,457 | baseline |
+
+The wgpu prefill matmul is register-tiled (each thread computes TN=4 output rows, every
+weight read once), which lifted the synthetic f32 bench ~728 → ~2,170 tok/s (~3.0×) and
+real Q4_K_M ~42 → ~207 tok/s (~4.9×) — but with no tensor cores it stays ~2 orders behind.
+The **CUDA prefill gap (~3.6×)** is the int8 tensor-core MMQ gap (L7): llama.cpp keeps
+weights int8 and multiplies them on tensor cores; rusty uses f16 cuBLASLt. The L7 gate
+(header-free int8 `mma.sync.m16n8k32`) is proven; the full MMQ is the path to close it.
 
 ## Why the gaps
 
