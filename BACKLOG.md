@@ -255,6 +255,10 @@ cool machine; numbers below are reasoned, not all freshly benched.
   unproven until ~70% built), and prefill is the less-important regime (decode is only
   ~1.4× behind). Staged plan when revisited: tiled int8 GEMM → Q8_0 MMQ (measure the
   e2e ceiling here) → Q4_K MMQ → wire into `forward_prefill`, each GPU-verifiable.
+  **Full cold-start plan: [`docs/Architecture/plans/phase-7-int8-mmq.md`](docs/Architecture/plans/phase-7-int8-mmq.md)**
+  — grounds each stage in existing assets (`probe_int8_mma_ptx`, `weight_packed`,
+  `dot_q4_k_row`, `quantize_q8k`) and puts the GO/NO-GO ceiling measurement at the Q8_0
+  stage, before the expensive Q4_K kernel.
 - [ ] **L8. Tensor-core flash attention** (GPU prefill + long context).
 - [ ] **L9. Aggressive CPU micro-kernel** (NR-tiling, software prefetch, drop the
   hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
