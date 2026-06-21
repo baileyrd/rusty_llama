@@ -2484,6 +2484,92 @@ mod tests {
     /// COL32 transform)? Random int8 data — timing only. This is the kill gate for
     /// the int8 MMQ treadmill: if ordinary layout is unsupported (needs COL32
     /// transforms) or int8 isn't meaningfully faster, the integration isn't worth it.
+    /// L7 gate: can nvrtc compile + run an int8 TENSOR-CORE op for sm_120, HEADER-FREE
+    /// (no <mma.h>, which nvrtc can't find here)? cuBLASLt int8 is proven fast but can't
+    /// do the per-sub-block scaling MMQ needs, so MMQ requires a hand-written tensor-core
+    /// kernel. This probes raw inline-PTX `mma.sync.m16n8k32.s8` with a hand-laid-out
+    /// 16x8x32 fragment, the same header-free convention used for cvt/dp4a.
+    #[test]
+    #[ignore = "L7 feasibility probe; run with --features cuda -- --ignored --nocapture"]
+    fn probe_int8_mma_ptx() {
+        let Some(b) = cuda() else {
+            eprintln!("no CUDA device");
+            return;
+        };
+        // D[16x8] = A[16x32] * B[32x8], int8 inputs, int32 accumulate. One warp.
+        // Fragment layout for m16n8k32 (PTX ISA): gid=lane/4, tig=lane%4.
+        const SRC: &str = r#"
+extern "C" __global__ void mma_i8(const signed char* A, const signed char* B, int* D) {
+    int lane = threadIdx.x & 31;
+    int gid = lane >> 2;      // 0..7
+    int tig = lane & 3;       // 0..3
+    unsigned a0=0,a1=0,a2=0,a3=0,b0=0,b1=0;
+    for (int t=0; t<4; t++) {
+        a0 |= ((unsigned)(unsigned char)A[gid*32      + tig*4 + t])      << (8*t);
+        a1 |= ((unsigned)(unsigned char)A[(gid+8)*32  + tig*4 + t])      << (8*t);
+        a2 |= ((unsigned)(unsigned char)A[gid*32      + tig*4 + 16 + t]) << (8*t);
+        a3 |= ((unsigned)(unsigned char)A[(gid+8)*32  + tig*4 + 16 + t]) << (8*t);
+        b0 |= ((unsigned)(unsigned char)B[(tig*4 + t)*8      + gid])     << (8*t);
+        b1 |= ((unsigned)(unsigned char)B[(tig*4 + 16 + t)*8 + gid])     << (8*t);
+    }
+    int c0=0,c1=0,c2=0,c3=0, d0,d1,d2,d3;
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+        : "=r"(d0),"=r"(d1),"=r"(d2),"=r"(d3)
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(c0),"r"(c1),"r"(c2),"r"(c3));
+    D[gid*8 + tig*2]         = d0;
+    D[gid*8 + tig*2 + 1]     = d1;
+    D[(gid+8)*8 + tig*2]     = d2;
+    D[(gid+8)*8 + tig*2 + 1] = d3;
+}
+"#;
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_120"),
+            ..Default::default()
+        };
+        let ptx = match cudarc::nvrtc::compile_ptx_with_opts(SRC, opts) {
+            Ok(p) => p,
+            Err(e) => panic!("int8 mma.sync nvrtc compile FAILED (gate): {e:?}"),
+        };
+        let st = &b.stream;
+        let m = b.ctx.load_module(ptx).expect("load module");
+        let f = m.load_function("mma_i8").expect("load fn");
+        let ah: Vec<i8> = (0..512).map(|i| ((i % 7) as i32 - 3) as i8).collect(); // 16x32
+        let bh: Vec<i8> = (0..256).map(|i| ((i % 5) as i32 - 2) as i8).collect(); // 32x8
+        let ad = st.clone_htod(&ah).unwrap();
+        let bd = st.clone_htod(&bh).unwrap();
+        let mut dd = st.alloc_zeros::<i32>(128).unwrap(); // 16x8
+        {
+            let mut lb = st.launch_builder(&f);
+            lb.arg(&ad).arg(&bd).arg(&mut dd);
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.expect("launch");
+        }
+        let d: Vec<i32> = st.clone_dtoh(&dd).unwrap();
+        // D[i][j] = sum_k A[i*32+k] * B[k*8+j]
+        let mut bad = 0;
+        for i in 0..16 {
+            for j in 0..8 {
+                let mut acc = 0i32;
+                for k in 0..32 {
+                    acc += ah[i * 32 + k] as i32 * bh[k * 8 + j] as i32;
+                }
+                if d[i * 8 + j] != acc {
+                    if bad < 8 {
+                        eprintln!("[{i}][{j}] gpu={} ref={}", d[i * 8 + j], acc);
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "int8 mma.sync mismatch in {bad}/128 cells");
+        eprintln!("GATE PASSED: inline-PTX int8 mma.sync.m16n8k32 runs correctly on sm_120");
+    }
+
     #[test]
     #[ignore = "L7 spike; run with --features cuda -- --ignored --nocapture"]
     fn bench_int8_gemm_feasibility() {
