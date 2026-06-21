@@ -141,6 +141,20 @@ impl Arch {
         }
     }
 
+    /// Whether [`from_name`](Arch::from_name) recognizes this
+    /// `general.architecture` string as one whose graph **and RoPE convention**
+    /// rusty implements correctly. Unknown archs still load (as [`Arch::Llama`])
+    /// but may be silently wrong — RoPE pairing especially, since rusty unifies
+    /// on the NORM kernel and only permutes Q/K for the NeoX archs it knows — so
+    /// [`Model::from_gguf`] warns. `llama`/`mistral` are NORM-RoPE and load
+    /// correctly as [`Arch::Llama`].
+    pub fn is_known(arch: &str) -> bool {
+        matches!(
+            arch,
+            "llama" | "mistral" | "qwen2" | "phi3" | "gemma2" | "qwen2moe"
+        )
+    }
+
     /// The canonical tensor-name table (shared across archs).
     pub fn tensor_names(&self) -> &'static TensorNames {
         &TENSOR_NAMES
@@ -224,6 +238,20 @@ mod tests {
         // Unknown / unsupported archs stay permissive (Llama tensor layout).
         for a in ["mistral", "gemma", "totally-unknown"] {
             assert_eq!(Arch::from_name(a), Arch::Llama, "arch {a}");
+        }
+    }
+
+    #[test]
+    fn is_known_flags_only_implemented_archs() {
+        // `llama`/`mistral` are NORM-rope and correct as Llama; the rest are
+        // explicitly handled variants.
+        for a in ["llama", "mistral", "qwen2", "phi3", "gemma2", "qwen2moe"] {
+            assert!(Arch::is_known(a), "{a} should be known");
+        }
+        // Unrecognized archs — including NeoX-rope ones that would silently
+        // mis-rotate Q/K when loaded as Llama — are flagged so the loader warns.
+        for a in ["gemma", "gemma3", "starcoder2", "cohere", "totally-unknown"] {
+            assert!(!Arch::is_known(a), "{a} should be unknown");
         }
     }
 

@@ -2019,13 +2019,15 @@ impl Backend for GpuBackend {
         seq_len: usize,
         kv_dim: usize,
         logit_softcap: f32,
+        window: usize,
     ) {
-        // Gemma2 logit softcap isn't in the WGSL kernel; fall back to the CPU
-        // attention for that (rare, Gemma-only) path. softcap == 0 stays on GPU.
-        if logit_softcap > 0.0 {
+        // The WGSL kernel handles neither Gemma2 logit softcap nor sliding-window
+        // attention; fall back to the CPU for those (rare, Gemma-only) paths.
+        // softcap == 0 && window == 0 stays on GPU.
+        if logit_softcap > 0.0 || window != 0 {
             super::CpuBackend.attention(
                 out, q, key_cache, value_cache, att, pos, n_heads, n_kv_heads, head_size, seq_len,
-                kv_dim, logit_softcap,
+                kv_dim, logit_softcap, window,
             );
             return;
         }
@@ -2144,11 +2146,12 @@ impl Backend for GpuBackend {
         seq_len: usize,
         kv_dim: usize,
         logit_softcap: f32,
+        window: usize,
     ) {
-        if logit_softcap > 0.0 {
+        if logit_softcap > 0.0 || window != 0 {
             super::CpuBackend.attention_batch(
                 out, q, key_cache, value_cache, att, pos_base, rows, n_heads, n_kv_heads,
-                head_size, seq_len, kv_dim, logit_softcap,
+                head_size, seq_len, kv_dim, logit_softcap, window,
             );
             return;
         }
@@ -2170,6 +2173,7 @@ impl Backend for GpuBackend {
                     seq_len,
                     kv_dim,
                     logit_softcap,
+                    window,
                 );
             }
             return;
@@ -2830,6 +2834,7 @@ mod tests {
             1,
             2,
             0.0,
+            0,
         );
         close(&out, &[3.0, -4.0]);
     }
@@ -3278,10 +3283,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let mut att_g = vec![0.0; n_heads * seq_len];
         let mut att_c = att_g.clone();
         g.attention(
-            &mut a_g, &q, &kc, &vc, &mut att_g, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0,
+            &mut a_g, &q, &kc, &vc, &mut att_g, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0, 0,
         );
         CpuBackend.attention(
-            &mut a_c, &q, &kc, &vc, &mut att_c, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0,
+            &mut a_c, &q, &kc, &vc, &mut att_c, pos, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0, 0,
         );
         close(&a_g, &a_c);
     }
@@ -3344,10 +3349,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let (mut a, mut b) = (vec![0.0; n * dim], vec![0.0; n * dim]);
         let mut att = vec![0.0; n_heads * seq_len];
         g.attention_batch(
-            &mut a, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0,
+            &mut a, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0, 0,
         );
         CpuBackend.attention_batch(
-            &mut b, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0,
+            &mut b, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0, 0,
         );
         close(&a, &b);
     }

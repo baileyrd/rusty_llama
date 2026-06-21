@@ -1297,10 +1297,11 @@ impl Backend for CudaBackend {
         seq_len: usize,
         kv_dim: usize,
         logit_softcap: f32,
+        window: usize,
     ) {
         self.cpu.attention(
             out, q, key_cache, value_cache, att, pos, n_heads, n_kv_heads, head_size, seq_len,
-            kv_dim, logit_softcap,
+            kv_dim, logit_softcap, window,
         );
     }
 
@@ -2208,7 +2209,7 @@ mod tests {
         let mut want = vec![0.0; n * dim];
         let mut att = vec![0.0; n_heads * seq_len];
         CpuBackend.attention_batch(
-            &mut want, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0,
+            &mut want, &q, &kc, &vc, &mut att, 0, n, n_heads, n_kv_heads, head_size, seq_len, kv_dim, 0.0, 0,
         );
         close_approx(&got, &want, 1e-4, 1e-4);
     }
@@ -2245,7 +2246,7 @@ mod tests {
         let mut att = vec![0.0; n_heads * seq_len];
         CpuBackend.attention_batch(
             &mut want, &q, &kc, &vc, &mut att, pos_base, rows, n_heads, n_kv_heads, head_size,
-            seq_len, kv_dim, 0.0,
+            seq_len, kv_dim, 0.0, 0,
         );
         close_approx(&got, &want, 1e-4, 1e-4);
     }

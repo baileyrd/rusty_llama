@@ -108,6 +108,9 @@ pub trait Backend: Send + Sync {
         kv_dim: usize,
         // tanh softcap on the QK scores before softmax (0.0 = disabled; Gemma2 = 50).
         logit_softcap: f32,
+        // Sliding-window size: attend only to the last `window` keys (0 = full
+        // causal). Gemma2 SWA layers pass it; every other path passes 0.
+        window: usize,
     );
 
     /// SwiGLU gate: `hb[i] = silu(hb[i]) * hb2[i]`.
@@ -221,6 +224,7 @@ pub trait Backend: Send + Sync {
         seq_len: usize,
         kv_dim: usize,
         logit_softcap: f32,
+        window: usize,
     ) {
         let dim = n_heads * head_size;
         for r in 0..rows {
@@ -237,6 +241,7 @@ pub trait Backend: Send + Sync {
                 seq_len,
                 kv_dim,
                 logit_softcap,
+                window,
             );
         }
     }

@@ -295,10 +295,11 @@ impl Backend for AdapterBackend<'_> {
         seq_len: usize,
         kv_dim: usize,
         logit_softcap: f32,
+        window: usize,
     ) {
         self.inner.attention(
             out, q, key_cache, value_cache, att, pos, n_heads, n_kv_heads, head_size, seq_len,
-            kv_dim, logit_softcap,
+            kv_dim, logit_softcap, window,
         );
     }
 

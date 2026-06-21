@@ -412,3 +412,33 @@ Ordered by ROI (value ÷ effort).
   `store_prefill_kv`); refreshed line refs. Fixed the in-code comment falsely claiming decode
   "runs entirely on the CPU". `PERFORMANCE.md` reconciled to measured (~3.0–3.8× prefill /
   ~1.3–1.5× decode) and given explicit CUDA rows in the headline decode/prefill tables.
+
+---
+
+## Divergence audit follow-ups (2026-06-21)
+
+Full report: [`docs/Reviews/2026-06-21-divergence-audit.md`](docs/Reviews/2026-06-21-divergence-audit.md).
+10-subsystem audit mapping every place rusty diverges from llama.cpp (139 findings → 52
+confirmed, 7 refuted, ~30 confirmed *non*-divergences). The perf divergences are all
+already tracked (A1 = int8 MMQ = L7); the new value is the silent-correctness bucket, all
+on breadth archs (never the TinyLlama path).
+
+- [x] **D1 (C1) Warn on unrecognized architecture.** `Arch::from_name` silently mapped any
+  unknown `general.architecture` to `Arch::Llama` (NORM rope, no NeoX permute) → a NeoX-rope
+  model rusty doesn't recognize loaded silently and rotated Q/K wrong. Added `Arch::is_known`;
+  `Model::from_gguf` now warns (still loads permissively). Tested.
+- [x] **D2 (C2) Honor SPM `add_space_prefix`.** `Spm::from_gguf` ignored
+  `tokenizer.ggml.add_space_prefix` and always prepended the dummy space → different token
+  ids than llama.cpp on GGUFs that disable it. Added the field (default true) + GGUF read +
+  encode gate. Tested.
+- [x] **D3 (C3) Gemma2 interleaved sliding-window attention (iSWA).** *(done 2026-06-21)*
+  `cpu.rs` attention always attended `0..=pos`; Gemma2 even layers cap at the last 4096 keys
+  (bit-identical &lt;4096 tokens, divergent beyond). Added `Config.sliding_window` (GGUF
+  `attention.sliding_window`) + `Config::attn_window(layer)` (window on Gemma2 even layers,
+  mirroring llama.cpp's `il % 2 == 0`), threaded a `window` param through
+  `Backend::attention`/`attention_batch`, and the CPU kernel now starts at `pos+1-window`
+  (== llama.cpp's `q_pos - k_pos >= n_swa` mask). wgpu/cuda fall back to CPU when
+  `window != 0`; `uses_resident_decode()` excludes `sliding_window > 0`. Tested
+  (`attention_sliding_window_excludes_old_keys`, `attn_window_follows_gemma2_interleave`).
+- [ ] **D4 Breadth gaps (not silent):** missing quant types (Q5_K/Q3_K/Q2_K/Q5_0/Q5_1/Q4_1/
+  IQ/MXFP4/TQ — hard error at load), sharded-GGUF loading, non-hardcoded chat templates.
