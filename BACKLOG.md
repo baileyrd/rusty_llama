@@ -340,16 +340,21 @@ Ordered by ROI (value ÷ effort).
 
 ### R4 — Robustness & cleanup
 
-- [ ] **R4.1 Harden GGUF parser (4 untrusted scalars).** `tensor_count`/`kv_count` →
-  `with_capacity` (cap to `.min(file_len/min_entry)`); `alignment` `is_power_of_two`;
-  `rows*cols` `checked_mul`; dup keys/tensor-names `insert().is_some()` → error
-  (gguf.rs:130-142). Fail cleanly on corrupt/malicious GGUF per the "untrusted mmap" mandate.
-- [ ] **R4.2 Delete dead code** (legibility): CUDA `attention_kernel`'s unused `seq_len`
-  param + inconsistent callers (cuda.rs:160, 1013/1021/1044, 1188, 1507); the F16 matmul
-  arm / `dot_quant_row` if no loader produces `QMatrix::Quant{F16}` (cpu.rs:22-36, 127-132,
-  271-280); gate `Q8Activation.block_sums` on `vnni_supported()` (quant.rs:326-332); cache
-  resolved wgpu pipelines in `LayerBinds` (gpu.rs:1850); single-pass `grammar.rs` parser
-  (grammar.rs:317-350).
+- [x] **R4.1 Harden GGUF parser (untrusted scalars)** *(done 2026-06-20)*. Cap the three
+  count-based `with_capacity` (kv/tensor/dims) at `1<<16` so a malicious count can't OOM
+  before the read loop hits truncated data; reject tensor dims whose element product
+  overflows u64 (`n_elements()` recomputes it for the `tensor_bytes` length guard); reject
+  duplicate tensor names. (`alignment` was already `.max(1)`-guarded, so no div-by-zero.)
+  3 hand-built-bytes tests (`gguf::hardening_tests`).
+- [~] **R4.2 Delete dead code** *(partial 2026-06-20)*. **Done:** removed the CUDA flash
+  attention kernel's vestigial `seq_len` param (provably unused — the kernel derives the
+  causal bound from `pos`, KV stride is `kv_dim`) across kernel + launcher + 4 call sites;
+  GPU parity tests confirm. **Deliberately NOT done** (investigated, not worth the risk):
+  the F16 `_`/`dot_quant_row` arm is **live** — it's the generic fallback for less-common
+  quants (Q5_K/Q3_K/…), not dead (F16 weights dequant to f32 → `QMatrix::F32`, never
+  `Quant{F16}`). `block_sums` gating, wgpu pipeline caching, and the grammar single-pass
+  rewrite are micro-optimizations/refactors (marginal gain, real breakage risk on this
+  VNNI/GPU hardware), not dead-code removals — declined.
 
 ### R5 — Larger levers
 

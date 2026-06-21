@@ -11,8 +11,8 @@ hand-computed values and the scalar oracle; (2) **integration / GGUF / prefill
 parity** tests run the full forward pass and generation loop on synthetic models;
 (3) **device-gated GPU/CUDA parity + in-crate benchmarks** compare backends and
 report `tok/s` against `llama-bench`. The honest headline (PERFORMANCE.md,
-2026-06-16): real TinyLlama-1.1B Q4_K_M prefill **~4.4× behind** llama.cpp CUDA,
-decode **~3.4× behind**.
+2026-06-16): real TinyLlama-1.1B Q4_K_M prefill **~3.0–3.8× behind** llama.cpp CUDA,
+decode **~1.3–1.5× behind**.
 
 llama.cpp counterpart: `docs/Research/08-capabilities-and-tooling.md`
 (`llama-bench` methodology, `pp512`/`tg128` definitions).
@@ -50,7 +50,7 @@ Two distinct bars, chosen by how lossy the path is:
 | CPU SIMD (AVX2 / VNNI) integer dot | **bit-exact** (`to_bits` eq) | reduction is pure integer; no rounding introduced |
 | Batched prefill vs sequential (CPU) | **bit-exact** (`assert_eq!`) | batched ops loop the single-token ops in the same order (`tests/prefill.rs:1`) |
 | wgpu F32 / Q8_0 dequant op vs CPU | **tight tol** `1e-3 + 1e-3·\|w\|` | reassociated / FMA-contracted f32 (`src/backend/gpu.rs:2220`) |
-| CUDA TF32 GEMM vs CPU | **TF32 tol** `0.02 + ic·2e-4 + 0.03·\|w\|` | TF32 keeps ~10 mantissa bits (≈2⁻¹¹ rel), error grows with reduction length `ic` (`src/backend/cuda.rs:945`) |
+| CUDA f16 GEMM vs CPU | **f16 tol** `0.02 + ic·2e-4 + 0.03·\|w\|` | the cuBLASLt `Matmul<f16>` narrows activations to f16, error grows with reduction length `ic` (`src/backend/cuda.rs:1597`) |
 | CUDA nvrtc elementwise kernels vs CPU | `atol + rtol·\|w\|` (`close_approx`) | per-op f32 kernels, maxdiff ≤ 3e-7 (`src/backend/cuda.rs:1372`) |
 | int8 (DP4A) fused decode vs CPU | **loose coherence** `< 0.05` | int8 *activation* quant is lossy by design; per-op int8 kernels are pinned bit-exact separately (`tests/gpu_parity.rs:216`) |
 
@@ -105,8 +105,8 @@ and Q8_0.
 ## 3. In-crate unit & parity tests (`src/`)
 
 Backends keep their parity tests next to the kernels they validate. Counts of
-`#[test]` functions: `src/backend/gpu.rs` 34, `src/quant.rs` 22,
-`src/backend/cpu.rs` 17, `src/backend/cuda.rs` 16, `src/tokenizer.rs` 14,
+`#[test]` functions: `src/backend/gpu.rs` 34, `src/quant.rs` 24,
+`src/backend/cpu.rs` 21, `src/backend/cuda.rs` 25, `src/tokenizer.rs` 14,
 `src/config.rs` 5, `src/sampler.rs` 3.
 
 ### CPU (`src/backend/cpu.rs`)
@@ -149,8 +149,8 @@ pinned against the **exact integer dot** here — that's why the e2e int8 decode
 test is allowed to be merely coherent.
 
 ### CUDA (`src/backend/cuda.rs`)
-`close_tc(got, want, ic)` (`:945`, TF32 tolerance) and `close_approx`
-(`:1372`). A `noise()` xorshift PRNG seeds reproducible inputs (`:927`). **All 16
+`close_tc(got, want, ic)` (`:1597`, f16-GEMM tolerance) and `close_approx`
+(`:2080`). A `noise()` xorshift PRNG seeds reproducible inputs (`:1579`). **All 25
 tests are `#[ignore]`** (need a CUDA device) and additionally early-return via
 `cuda()` when no device is present:
 
@@ -219,9 +219,9 @@ dequant vs Q8_0 int8 GEMV.
 `bench_prefill_real_tinyllama` (`src/backend/cuda.rs:1317`) is the north star: it
 loads the **actual** TinyLlama-1.1B Q4_K_M GGUF (22 layers, dim 2048, GQA 32/4),
 prefills `512.min(seq_len)` tokens (`:1337`), warms up (weights cached as **f16**
-on-device, ~2.2 GB, `:1314`), and prints `pp512` tok/s to compare against
-`llama-bench ... -ngl 99` (pp512). `bench_decode_real_tinyllama` (`:1199`) runs
-128 resident decode steps (warm-up via `backend_warmup`, `:1251`) for `tg128`.
+on-device, ~2.2 GB), and prints `pp512` tok/s to compare against
+`llama-bench ... -ngl 99` (pp512). `bench_decode_real_tinyllama` (`:1905`) runs
+128 resident decode steps (packed-DP4A GEMV, KV resident across steps) for `tg128`.
 
 ### Headline numbers (PERFORMANCE.md, 2026-06-16)
 
@@ -238,13 +238,13 @@ Setup: Intel Core Ultra 9 285H (AVX2, **no** AVX-512) + RTX 5070 Ti Laptop GPU
 | **CUDA, + batched KV download** | **~4,450** | **~4.4× behind** |
 | llama.cpp CUDA | **19,637** | — |
 
-**Decode (`tg128`, real TinyLlama-1.1B Q4_K_M)** — `PERFORMANCE.md:180`–184:
+**Decode (`tg128`, real TinyLlama-1.1B Q4_K_M)** — latest (BACKLOG.md L11/6.2):
 
 | Path | tg128 | |
 | --- | ---: | --- |
-| rusty_llama CPU | ~52 | — |
-| **rusty_llama CUDA (resident, f16)** | **~123** | 2.4× CPU |
-| llama.cpp CUDA | **419** | **~3.4× ahead** |
+| rusty_llama CPU | ~53 | — |
+| **rusty_llama CUDA (resident, packed-DP4A + CUDA graph)** | **~275** | ~5.2× CPU |
+| llama.cpp CUDA | **~415** | **~1.3–1.5× ahead** |
 
 **CPU/GPU decode (separate apples-to-apples)** — `PERFORMANCE.md:20`–27:
 CPU autovectorized scalar 36.7 → AVX2 integer kernels **49.8 tok/s** (+36%) vs
@@ -252,10 +252,10 @@ llama.cpp CPU 73.6 (1.48×); wgpu 45.9 vs llama.cpp Vulkan 375.9 (8.2×).
 
 **Why the gaps:** prefill is now compute-bound — the residual ~4.4× is
 GEMM/kernel efficiency vs llama.cpp's fused tensor-core kernels, not per-op
-overhead (`PERFORMANCE.md:170`). Decode's ~3.4× **is weight bandwidth**: we stream
-**f16** (~2 B/weight) vs llama.cpp's **Q4_K** (~0.56 B) ≈ 3.5×, which roughly *is*
-the gap — making quantized-on-device weights the clear next decode lever
-(`PERFORMANCE.md:188`).
+overhead (`PERFORMANCE.md:170`). The old decode bandwidth wall is closed: the decode GEMV now streams **packed
+Q4_K/Q6_K** (~0.56 B/weight) via on-device `__dp4a`, so decode is **~1.3–1.5×**
+behind and now graph/GEMV-tuning-bound, not bandwidth-bound
+(`PERFORMANCE.md:182`–213).
 
 ### The negative-result benches (kept, not wired)
 `bench_kquant_int8_vs_dequant_gemv` (`gpu.rs:3053`) measured int8 DP4A at
@@ -328,8 +328,9 @@ runs. For *real* assets, `scripts/download_assets.sh` fetches Karpathy's
   `q6_k_vnni_algorithm_matches_scalar` (a scalar re-implementation check) and the
   AVX2 tests give real on-machine coverage of the integer fast path. NEON has no
   path or tests at all (`BACKLOG.md:103`).
-- **Benchmarks are single-shot, not statistical** — one warm-up + one timed run,
-  no repetitions/percentiles. The CPU prefill baseline is explicitly unreliable
+- **Benchmarks follow the `llama-bench` protocol** — one untimed warm-up, then
+  `-r` timed reps (default 5, `RUSTY_LLAMA_BENCH_R`) reported as **mean ± stddev**
+  tok/s (`src/bench_util.rs` `bench_stat`/`bench_reps`). The CPU prefill baseline is explicitly unreliable
   under sustained GPU load (laptop thermal throttling, `PERFORMANCE.md:167`), so
   CUDA-vs-llama.cpp is the only trustworthy prefill comparison; synthetic prefill
   numbers (~735 tok/s) are far below the real-model figure's relevance.

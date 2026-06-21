@@ -94,7 +94,7 @@ reference merge within tolerance; templates round-trip known prompts.
 
 **Detailed plan → [`plans/phase-2-decode-gemv.md`](plans/phase-2-decode-gemv.md)**
 
-The **only** change that closes the ~3.4× decode gap, which is pure weight
+The **only** change that closes the remaining ~1.3–1.5× decode gap, which is pure weight
 bandwidth (`04`, `09`, `../Research/03`). Everything else about decode is already
 resident.
 

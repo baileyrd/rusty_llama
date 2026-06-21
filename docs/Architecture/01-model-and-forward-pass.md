@@ -116,7 +116,7 @@ Per-layer organization is one `QMatrix` per `(layer, projection)`; the model nev
 
 ## `RunState` — scratch + KV cache
 
-`RunState` (`src/model.rs:323-334`) is mutable scratch reused across single-token forward passes. `RunState::new(c)` (`src/model.rs:338-353`) allocates:
+`RunState` (`src/model.rs:694-706`) is mutable scratch reused across single-token forward passes. `RunState::new(c)` (`src/model.rs:710-731`) allocates:
 
 | Buffer | Length | Role |
 |---|---|---|
@@ -133,13 +133,13 @@ Per-layer organization is one `QMatrix` per `(layer, projection)`; the model nev
 
 **KV cache layout** is flat `(n_layers, seq_len, kv_dim)`, row-major. Position indexing in `forward` (`src/model.rs:418-419`): `loff = layer*seq_len*kv_dim` selects the layer block; `kv_at = loff + pos*kv_dim` is the write slot for the current position; the attention read spans the whole layer block `loff .. loff + seq_len*kv_dim`. This is **single-sequence** — there is no batch/sequence dimension.
 
-`logits()` / `logits_mut()` expose the result buffer (the sampler scales it in place). Under `gpu`/`cuda` features, `key_cache()`/`value_cache()` (`src/model.rs:367-376`) and `store_prefill_kv` (`src/model.rs:382-386`) let a device backend mirror or repopulate the host cache so subsequent CPU `forward_step` decode reads correct keys/values.
+`logits()` / `logits_mut()` expose the result buffer (the sampler scales it in place). Under `gpu`/`cuda` features, `key_cache()`/`value_cache()` (`src/model.rs:746-755`) let a device backend mirror the host cache so subsequent CPU `forward_step` decode reads correct keys/values.
 
 ─────────────────────────────────────────────────
 
 ## The forward pass, op by op (`forward`)
 
-`forward(model, state, backend: &dyn Backend, token, pos)` (`src/model.rs:393-477`) runs one transformer step for `token` at absolute position `pos`, reads/writes the KV cache, and leaves next-token logits in `state.logits()`. It mirrors llama2.c's `forward()` op-for-op. Every primitive is a `Backend` call (`src/backend/mod.rs:32-224`); shapes are passed explicitly.
+`forward(model, state, backend: &dyn Backend, token, pos)` (`src/model.rs:959-961`, body in `forward_with` `:965-1116`) runs one transformer step for `token` at absolute position `pos`, reads/writes the KV cache, and leaves next-token logits in `state.logits()`. It mirrors llama2.c's `forward()` op-for-op. Every primitive is a `Backend` call (`src/backend/mod.rs:32-224`); shapes are passed explicitly.
 
 ```mermaid
 flowchart TD
@@ -182,7 +182,7 @@ Step-by-step with `Backend` mapping:
 
 Notes on the subtle bits:
 - **K/V are written before RoPE**: the projection matmuls (steps 3-4) write directly into the cache slot, then `rope` rotates `q` (the local buffer) and the just-written `k` (the cache slice) **in place** (`src/model.rs:433-441`). `v` is never rotated.
-- **GQA**: `attention` gets both `n_heads` and `n_kv_heads`; query head→KV head mapping uses `kv_mul = n_heads/n_kv_heads`. The CPU kernel computes the softmaxed scores into `att`; the contract (`src/backend/mod.rs:65-87`) says `att` contents are unspecified after the call — callers must not rely on them.
+- **GQA**: `attention` gets both `n_heads` and `n_kv_heads`; query head→KV head mapping uses `kv_mul = n_heads/n_kv_heads`. The CPU kernel is flash / online-softmax and keeps its running state in registers, leaving `att` untouched (`src/backend/cpu.rs:377-382`); the contract (`src/backend/mod.rs:83-86`) says `att` contents are unspecified after the call — callers must not rely on them.
 - **RoPE is partial-rotary aware**: only the first `inv_freq.len()` pairs (`rotary_dim/2`) of each head are rotated; trailing pairs pass through (`src/backend/mod.rs:44-63`).
 - `slice(tensor, layer, stride)` (`src/model.rs:713-715`) borrows the per-layer RMSNorm row out of the flat `(n_layers, dim)` buffer.
 
@@ -209,10 +209,10 @@ The `Backend::forward_prefill` trait method (`src/backend/mod.rs:215-223`) defau
 
 `generate(model, state, backend, tokenizer, sampler, prompt, steps, on_piece)` (`src/model.rs:596-652`) is the public autoregressive loop; returns the count of generated tokens (excluding the prompt) and streams decoded bytes to `on_piece`.
 
-1. Encode prompt with BOS: `tokenizer.encode(prompt, true, false)` (`:606`).
+1. Encode prompt: `tokenizer.encode(prompt, tokenizer.add_bos(), false)` (`src/model.rs:1397`), then delegate to `generate_tokens`.
 2. Clamp `steps = steps.min(seq_len)` (`:607`).
 3. **Fast path** (`:613-624`): if `n >= 2 && steps >= n`, delegate to `generate_prefilled` — only taken when every prompt token would be processed anyway, so the emitted stream is byte-identical to the sequential loop.
-4. **Sequential loop** (`:626-649`): start at `token = prompt_tokens[0]`, `pos = 0`. Each iteration calls `backend.forward_step(model, state, token, pos)`, then picks `next`: while `pos < prompt_tokens.len()-1` it **forces** the next prompt token; otherwise it `sampler.sample(state.logits_mut())`. `pos += 1`. If `next == 1` (BOS doubles as EOS) it breaks. Else `on_piece(tokenizer.decode(token, next))`, advance `token = next`, `generated += 1`.
+4. **Sequential loop** (`:626-649`): start at `token = prompt_tokens[0]`, `pos = 0`. Each iteration calls `backend.forward_step(model, state, token, pos)`, then picks `next`: while `pos < prompt_tokens.len()-1` it **forces** the next prompt token; otherwise it `sampler.sample(state.logits())`. `pos += 1`. If `next == 1 || tokenizer.is_eog(next)` it breaks. Else `on_piece(tokenizer.decode(token, next))`, advance `token = next`, `generated += 1`.
 
 `generate_prefilled(...)` (`src/model.rs:660-709`) — caller guarantees `prompt_tokens.len() >= 2` and `steps >= len`:
 
@@ -229,9 +229,9 @@ Both paths produce the identical token stream; only the prompt's KV fill differs
 ## Status, gaps & notes
 
 - **Single-sequence KV cache only.** `key_cache`/`value_cache` are flat `(n_layers, seq_len, kv_dim)` with no batch/sequence dimension (`src/model.rs:332-334`); no paged attention, no concurrent sequences, no cache eviction/sliding window. Context is hard-capped at `seq_len` (steps clamped, `src/model.rs:607`).
-- **Llama-family architecture only.** `from_gguf` assumes the `llama` tensor naming (`attn_q/k/v/output`, `ffn_gate/up/down`, `*_norm`) and the RMSNorm→RoPE→GQA→SwiGLU block; no MoE, no parallel-residual / GPT-NeoX layouts, no per-layer norm bias, no attention/QK norm.
-- **BOS-as-EOS stop.** Generation stops only on token id `1` (`src/model.rs:642,681,695`); there is no configurable EOS set, no stop strings, no max-new-token vs. context distinction beyond the `seq_len` clamp.
-- **No batched logits from prefill.** `forward_prefill` discards all but the final-position logits (`src/model.rs:582-587`), so it cannot serve prompt-token logprobs or scoring use cases.
+- **Multiple architectures.** `from_gguf` dispatches on `general.architecture` (`src/model.rs:177-178`) and supports Llama, Qwen2, Phi-3, Gemma2, Mixtral (MoE) and Qwen2-MoE — including QKV bias (Qwen2), fused QKV / gate+up (Phi-3), sandwich norm + logit softcapping (Gemma2), and routed/shared experts (`config.n_expert > 0`, `moe_ffn_row`). Still no parallel-residual / GPT-NeoX-only layouts or QK-norm archs.
+- **BOS-as-EOS stop.** Generation stops on token id `1` or any tokenizer end-of-generation token (`next == 1 || tokenizer.is_eog(next)`, `src/model.rs:1445,1482,1496`); there are no stop strings, no max-new-token vs. context distinction beyond the `seq_len` clamp.
+- **No batched logits from prefill.** `forward_prefill` discards all but the final-position logits (`src/model.rs:1154-1166`), so it cannot serve prompt-token logprobs or scoring use cases.
 - **Doc-comment drift:** `from_gguf`'s doc comment still says partial rotary and long-context RoPE scaling are "not yet handled" (`src/model.rs:133-135`), but both are in fact implemented (`rope_dim` at `:156-163`, `read_rope_scaling` at `:166`). The comment is stale; the code is correct.
 - **Eager, per-op dispatch.** The forward pass is a straight-line sequence of `Backend` calls with no graph/fusion at this layer; fusion (if any) lives inside a backend's `forward_step`/`*_batch` overrides (CPU does not fuse). Contrast llama.cpp, which builds a `ggml` compute graph.
 

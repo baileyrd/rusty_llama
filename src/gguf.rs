@@ -130,7 +130,9 @@ impl<'a> Gguf<'a> {
         let tensor_count = r.u64()? as usize;
         let kv_count = r.u64()? as usize;
 
-        let mut metadata = HashMap::with_capacity(kv_count);
+        // ponytail: cap pre-allocation at 1<<16 so a malicious count can't OOM us
+        // before the read loop hits truncated data and errors out cleanly.
+        let mut metadata = HashMap::with_capacity(kv_count.min(1 << 16));
         for _ in 0..kv_count {
             let key = r.string()?;
             let value_type = r.u32()?;
@@ -138,18 +140,26 @@ impl<'a> Gguf<'a> {
             metadata.insert(key, value);
         }
 
-        let mut tensors = Vec::with_capacity(tensor_count);
-        let mut index = HashMap::with_capacity(tensor_count);
+        let mut tensors = Vec::with_capacity(tensor_count.min(1 << 16));
+        let mut index = HashMap::with_capacity(tensor_count.min(1 << 16));
         for i in 0..tensor_count {
             let name = r.string()?;
             let n_dims = r.u32()? as usize;
-            let mut dims = Vec::with_capacity(n_dims);
+            let mut dims = Vec::with_capacity(n_dims.min(1 << 16));
             for _ in 0..n_dims {
                 dims.push(r.u64()?);
             }
+            // Reject dims whose element count overflows u64 — n_elements() recomputes
+            // this product and feeds it to the tensor_bytes length guard; a wrap would
+            // undercut that guard.
+            dims.iter()
+                .try_fold(1u64, |a, &d| a.checked_mul(d))
+                .ok_or_else(|| Error::Format(format!("tensor '{name}' dims overflow")))?;
             let ggml_type = GgmlType::from_u32(r.u32()?)?;
             let offset = r.u64()?;
-            index.insert(name.clone(), i);
+            if index.insert(name.clone(), i).is_some() {
+                return Err(Error::Format(format!("duplicate tensor name '{name}'")));
+            }
             tensors.push(TensorInfo {
                 name,
                 dims,
@@ -297,5 +307,65 @@ impl<'a> Reader<'a> {
                 )))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn str_(v: &mut Vec<u8>, s: &str) {
+        v.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        v.extend_from_slice(s.as_bytes());
+    }
+    fn header(tensor_count: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes()); // version
+        b.extend_from_slice(&tensor_count.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // kv_count
+        b
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_name() {
+        let mut b = header(2);
+        for _ in 0..2 {
+            str_(&mut b, "dup");
+            b.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            b.extend_from_slice(&1u64.to_le_bytes()); // dims[0]
+            b.extend_from_slice(&0u32.to_le_bytes()); // type F32
+            b.extend_from_slice(&0u64.to_le_bytes()); // offset
+        }
+        b.resize(b.len() + 64, 0);
+        let err = match Gguf::parse(&b) {
+            Ok(_) => panic!("expected duplicate-name error"),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_dims_overflow() {
+        let mut b = header(1);
+        str_(&mut b, "big");
+        b.extend_from_slice(&2u32.to_le_bytes()); // n_dims
+        b.extend_from_slice(&u64::MAX.to_le_bytes()); // dims[0]
+        b.extend_from_slice(&2u64.to_le_bytes()); // dims[1] -> product overflows
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.resize(b.len() + 64, 0);
+        let err = match Gguf::parse(&b) {
+            Ok(_) => panic!("expected dims-overflow error"),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn huge_count_does_not_oom() {
+        // tensor_count = u64::MAX must not pre-allocate; it errors on truncated data.
+        let b = header(u64::MAX);
+        assert!(Gguf::parse(&b).is_err());
     }
 }

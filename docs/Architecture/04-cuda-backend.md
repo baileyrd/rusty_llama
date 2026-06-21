@@ -9,10 +9,11 @@ compute kernels. Three things matter most: (1) it loads everything *dynamically*
 nvcc or CUDA libs at build time — and the backend fails *gracefully* on a
 CUDA-less host); (2) the GEMM path is **`Matmul<f16>` with f32 accumulate**, fed
 by an f16 weight cache keyed on the source data pointer, and it drives the whole
-**resident fused prefill**; (3) decode is a **resident `forward_step`** — KV
-cache + activations stay on device across steps, with a *one-time* host→device KV
-upload bridging a prior prefill. Measured ~4.4× behind llama.cpp on prefill,
-~3.4× behind on decode (`PERFORMANCE.md`).
+**resident fused prefill**; (3) decode is a **resident `forward_step`** — KV cache + activations stay on
+device across steps, packed Q4_K/Q6_K weights dot-producted with `__dp4a`, and the
+whole per-step kernel sequence captured into a **CUDA graph** and replayed; a
+*one-time* host→device KV upload bridges a prior prefill. Measured ~3.0–3.8× behind llama.cpp on prefill,
+~1.3–1.5× behind on decode (`PERFORMANCE.md`).
 
 Sibling docs: the CPU oracle every op is parity-checked against is
 `02-backend-trait-and-cpu.md`; the portable GPU sibling is `03-gpu-backend-wgpu.md`;
@@ -51,8 +52,8 @@ Init sequence (`src/backend/cuda.rs:318-342`):
 | Step | Call | Note |
 | --- | --- | --- |
 | Context | `CudaContext::new(0)` | device 0; runs `cuInit` internally |
-| Event tracking off | `ctx.disable_event_tracking()` | single-stream backend ⇒ multi-stream sync is pure overhead (2 events/alloc); disabled *before* any alloc (`:319-324`) |
-| Stream | `ctx.default_stream()` | one stream for everything |
+| Event tracking off | `ctx.disable_event_tracking()` | single-stream backend ⇒ multi-stream sync is pure overhead (2 events/alloc); disabled *before* any alloc (`:594-596`) |
+| Stream | `ctx.new_stream()` | a NON-default stream: the legacy NULL stream can't be captured into a CUDA graph, and the resident decode captures its per-step kernels (`:600-602`) |
 | cuBLASLt | `CudaBlasLT::new(stream.clone())` | the GEMM handle (`:326-327`) |
 | Kernels | `Kernels::compile(&ctx)` | nvrtc-compile `KERNEL_SRC` once (`:328`) |
 | Name | `ctx.name()` | for logging/benches (`:329-331`, exposed via `device_name()` `:346`) |
@@ -64,7 +65,7 @@ Init sequence (`src/backend/cuda.rs:318-342`):
 | Field | Type | Role |
 | --- | --- | --- |
 | `ctx` | `Arc<CudaContext>` | held only to keep the context alive (`#[allow(dead_code)]`) |
-| `stream` | `Arc<CudaStream>` | the single default stream |
+| `stream` | `Arc<CudaStream>` | the single non-default (graph-capturable) stream |
 | `blas` | `CudaBlasLT` | cuBLASLt handle for the f16 GEMM |
 | `kernels` | `Kernels` | compiled nvrtc functions (§4–5) |
 | `weights` | `Mutex<HashMap<usize, Arc<CudaSlice<f16>>>>` | f16 weight cache keyed by source pointer (§3) |
@@ -152,11 +153,12 @@ Round-to-nearest narrowing (`cvt.rn`). Launched elementwise via
 
 ## 5. The nvrtc compute kernels
 
-`Kernels` (`src/backend/cuda.rs:204-212`) holds 7 `CudaFunction` handles compiled
+`Kernels` (`src/backend/cuda.rs:446-459`) holds 12 `CudaFunction` handles compiled
 once via `compile_ptx(KERNEL_SRC)` + `load_module` (`Kernels::compile`,
-`:215-233`). Two are the `cvt` pair (§4); the five compute kernels mirror the
-matching `CpuBackend` op exactly (parity-tested, §7) and run resident inside the
-fused prefill/decode:
+`:462-489`). Two are the `cvt` pair (§4); the rest — the elementwise/norm/rope/attention
+kernels plus the Q8_K activation quantizer and the packed Q4_K/Q6_K/fused-QKV decode
+GEMVs and the KV-append kernel — mirror the matching `CpuBackend` op exactly
+(parity-tested, §7) and run resident inside the fused prefill/decode:
 
 | Kernel | Launch shape | What it does on device |
 | --- | --- | --- |
@@ -164,11 +166,11 @@ fused prefill/decode:
 | `swiglu_kernel` (`:81-84`) | `for_num_elems` | `hb[i] = silu(hb[i]) * hb2[i]` (`silu = v/(1+e^-v)`) |
 | `rmsnorm_kernel` (`:87-103`) | one **block per row**, `block=256`, shared `block*4` B | shared-mem sum-of-squares reduction, then `out = x · rsqrt(ms+eps) · w` |
 | `rope_kernel` (`:106-128`) | grid `(rows, ceil(n_pairs/64))`, one thread per (row, even/odd pair) | in-place rotary on `q`/`k` at abs pos `pos_base+row`; partial-rotary tail untouched (`n_freqs` guard); `mscale` applied to cos/sin |
-| `attention_kernel` (`:135-200`) | one **block per (row, head)**, `block=128` | cooperative causal GQA: threads split keys for scores + head-dims for output; scores row + softmax (max-subtract, exp, sum) all in **shared memory**, no global scratch |
+| `attention_kernel` (`:157-232`) | one **block per (row, head)**, `block=128` | causal GQA **flash attention**: keys streamed in tiles of `blockDim.x` with an online (running-max) softmax; only a per-tile prob row in shared memory, **no `seq_len`-sized score buffer**, so context isn't bounded by shared memory |
 
-Attention shared-memory layout is `[ sq:head_size | sc:seq_len | red:blockDim ]`
-floats (`src/backend/cuda.rs:148-151`); the launcher sizes
-`shared_mem_bytes = (head_size + seq_len + BLOCK) * 4` (`:582-587`). The kernel
+Attention shared-memory layout is `[ sq:head_size | sp:blockDim | acc:head_size | red:blockDim ]`
+floats (`src/backend/cuda.rs:170-174`); the launcher sizes
+`shared_mem_bytes = (2*head_size + 2*BLOCK) * 4` (`:1040`), with no `seq_len` term. The kernel
 uses `kv_off = (h / kv_mul) * head_size` to map a query head to its KV group
 (`:144`) — the GQA grouping. Each launcher (`dev_rmsnorm` `:489-508`, `dev_rope`
 `:513-551`, `dev_attention` `:557-601`, `dev_add` `:473-478`, `dev_swiglu`
@@ -192,14 +194,17 @@ prompt runs on-device**:
   attention → `wo` GEMM → residual add; then rmsnorm → w1/w3 GEMMs → swiglu → w2
   GEMM → residual add. **No in-loop `synchronize`** — each layer keeps its own K/V
   buffer so nothing blocks.
-- KV handoff: after the loop, **one batch** of `clone_dtoh` downloads copies every
-  layer's K/V back into the host cache via `state.store_prefill_kv(...)` so a
-  subsequent CPU/decode step is correct (`:893-897`).
-- Logits: download the residual, do the **final RMSNorm of the last position +
-  classifier on the host path** (`cpu.rmsnorm` + `gemm`) (`:899-905`).
+- KV residency: there is no host KV download. The fused prefill writes K/V straight
+  into the resident decode cache (`d.key[layer]`/`d.value[layer]`), so the
+  prefill→decode handoff needs no round-trip — it just sets `d.kv_filled = n`
+  (`:1531`). (There is no `store_prefill_kv` function.)
+- Logits: run the **final RMSNorm of the last position + classifier ON-DEVICE**,
+  reusing the decode classifier (`d.rms_final` + packed-DP4A `gemv_decode` against
+  `w.wcls`); only the vocab-sized logits come back (`:1533-1555`).
 
-Batching the KV download (no per-layer sync) was the third prefill speedup, ~3,560
-→ ~4,450 tok/s (`PERFORMANCE.md:157-160`).
+Running the final RMSNorm + classifier on-device (reusing the decode classifier),
+downloading only the logits, was the R3.1 prefill refinement; current measured
+prefill is ~5,230 tok/s (`PERFORMANCE.md`).
 
 ### 6.2 Resident `forward_step` decode (`src/backend/cuda.rs:714-801`)
 
@@ -223,8 +228,10 @@ the resident cache, then `kv_filled = pos` (`:738-756`). After that, each step:
 3. `kv_filled = pos + 1` (`:793`); final rmsnorm + classifier GEMV → `synchronize`
    → download logits to host `state` (`:796-800`).
 
-Only the per-step embedding goes up and the logits come down — everything else
-stays resident (`:709-713`). Decode is batch-1 GEMV, i.e. bandwidth-bound (§ Status).
+Only the per-step embedding (and the absolute position int) go up and the logits
+come down — everything else stays resident (`:1378-1383`). Decode is batch-1
+packed-quant DP4A GEMV, captured into a CUDA graph and replayed each step
+(`:1386-1425`); it is bandwidth-/launch-bound (§ Status).
 
 ```mermaid
 flowchart LR
@@ -283,33 +290,34 @@ the GGUF can't be opened or isn't a GGUF (`:1204-1214`, `:1323-1333`).
 
 ## Status, gaps & notes
 
-- **Measured gaps (`PERFORMANCE.md:138-194`).** Real TinyLlama-1.1B Q4_K_M, same
-  machine (RTX 5070 Ti Laptop): prefill **~4,450 tok/s vs llama.cpp 19,637
-  (~4.4× behind)**; decode **~123 tok/s vs 419 (~3.4× behind)**. Correctness held
-  throughout (per-op parity + prefill/decode coherence, rel L2 ≤ 6e-4).
+- **Measured gaps (`PERFORMANCE.md`).** Real TinyLlama-1.1B Q4_K_M, same
+  machine (RTX 5070 Ti): prefill **~5,230 tok/s vs llama.cpp ~19,637
+  (~3.0–3.8× behind)**; decode **~275 tok/s vs ~415 (~1.3–1.5× behind)**.
+  Correctness held throughout (per-op parity + prefill/decode coherence).
 - **cuBLASLt is precisely the dequant→f16 GEMM that llama.cpp routes *around*.**
   Its CUDA backend sends quantized prefill to **MMQ** (int8 tensor cores reading
   *packed* quant weights, never round-tripping through VRAM as f16) and quantized
-  decode to **MMVQ** (DP4A GEMV over packed weights). We dequantize to f16 once and
-  lean on cuBLASLt — simpler, but it forgoes the packed-weight bandwidth win that
-  is most of the gap. The residual ~4.4× prefill is now **GEMM/kernel compute
-  efficiency** vs llama.cpp's fused kernels, not overhead (`PERFORMANCE.md:170-172`).
-- **Decode gap is f16 weight bandwidth.** Decode is batch-1 GEMV (each weight read
-  once, no reuse ⇒ bandwidth-bound). We stream **f16** weights (~2 B/weight) vs
-  llama.cpp's **Q4_K** (~0.56 B) ≈ 3.5×, which roughly *is* the gap. The clear
-  high-ROI next lever is **quantized-on-device weights / `dot4I8Packed`** for
-  decode (`PERFORMANCE.md:187-194`).
+  decode to **MMVQ** (DP4A GEMV over packed weights). Prefill still dequantizes to f16 once and leans on cuBLASLt — simpler, but it
+  forgoes the packed-weight bandwidth win. The residual ~3.0–3.8× prefill is now
+  **GEMM/kernel compute efficiency** vs llama.cpp's fused kernels, not overhead
+  (`PERFORMANCE.md`).
+- **Decode streams packed-quant weights.** Decode is batch-1 GEMV (each weight read
+  once, no reuse ⇒ bandwidth-bound). The packed Q4_K/Q6_K DP4A decode GEMV (default-on
+  for k-quant, opt-out `RUSTY_LLAMA_CUDA_NO_QGEMV`, `:1232-1236`) streams ~0.56 B/weight
+  vs the f16 cache's 2 B, closing most of the old f16-bandwidth gap; the residual
+  ~1.3–1.5× is now largely launch/enqueue overhead, which the captured CUDA graph
+  (`:1386-1425`) attacks (`PERFORMANCE.md`).
 - **Decode also pays a one-time host KV upload** on the first post-prefill step
   (`:738-756`); keeping KV resident across the prefill→decode boundary would drop
   it (lower-ROI per `PERFORMANCE.md:192-194`).
-- **Attention is the cooperative tiled kernel, not flash attention** — it
-  materializes the per-(row,head) score row in shared memory (no online softmax,
-  no global score matrix, but also no fused FA). Warp-level / flash attention is a
-  noted lower-ROI follow-up.
-- **Stale doc-comments:** a few comments still say "TF32 GEMMs"
-  (`src/backend/cuda.rs:803`; module header `:8`) from the pre-f16 cut; the live
-  path is `Matmul<f16>` (`:444`, §3.2) — the `PERFORMANCE.md` history confirms the
-  TF32→f16 transition (`:155-156`). The elementwise/non-GEMM trait methods
+- **Attention is a flash / online-softmax kernel** — keys are streamed in tiles
+  with a running-max softmax and only a per-tile prob row in shared memory (no
+  `seq_len`-sized score buffer), so context isn't bounded by shared memory
+  (`:150-232`).
+- **Stale in-code comment:** the `impl Backend` header comment still says "Decode
+  via `forward_step` still runs entirely on the CPU" (`src/backend/cuda.rs:1259`),
+  which is **false** — decode runs fully on-device (packed-DP4A GEMVs + CUDA graph,
+  `:1322-1429`). The module header and `:803` no longer mention TF32. The elementwise/non-GEMM trait methods
   (`rmsnorm`/`rope`/`attention`/`swiglu`/`add`, `:654-707`) still **delegate to the
   CPU** when called individually; the on-device kernels are reached *only* via the
   fused `forward_prefill`/`forward_step` overrides.
