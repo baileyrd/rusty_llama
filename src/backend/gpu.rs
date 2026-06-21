@@ -236,18 +236,34 @@ struct P { rows: u32, cols: u32, n: u32 };
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
+// Tiled over the batch: each thread computes TN output rows, so each weight
+// element is read once and reused across the tile (weight DRAM /TN). TN must
+// match matmul_batch_tn() on the host.
+const TN: u32 = 4u;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
-    let r = gid.y;
-    if (row >= p.rows || r >= p.n) { return; }
-    var acc = 0.0;
+    let r0 = gid.y * TN;
+    if (row >= p.rows || r0 >= p.n) { return; }
+    let nm1 = p.n - 1u;
     let wbase = row * p.cols;
-    let xbase = r * p.cols;
+    // Out-of-range rows clamp to a valid one; their outputs are simply not stored.
+    let x0 = min(r0 + 0u, nm1) * p.cols;
+    let x1 = min(r0 + 1u, nm1) * p.cols;
+    let x2 = min(r0 + 2u, nm1) * p.cols;
+    let x3 = min(r0 + 3u, nm1) * p.cols;
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var j = 0u; j < p.cols; j = j + 1u) {
-        acc = acc + w[wbase + j] * x[xbase + j];
+        let wv = w[wbase + j];
+        acc.x = acc.x + wv * x[x0 + j];
+        acc.y = acc.y + wv * x[x1 + j];
+        acc.z = acc.z + wv * x[x2 + j];
+        acc.w = acc.w + wv * x[x3 + j];
     }
-    outp[r * p.rows + row] = acc;
+    outp[(r0 + 0u) * p.rows + row] = acc.x;
+    if (r0 + 1u < p.n) { outp[(r0 + 1u) * p.rows + row] = acc.y; }
+    if (r0 + 2u < p.n) { outp[(r0 + 2u) * p.rows + row] = acc.z; }
+    if (r0 + 3u < p.n) { outp[(r0 + 3u) * p.rows + row] = acc.w; }
 }
 "#;
 
@@ -430,25 +446,38 @@ struct P { rows: u32, cols: u32, n: u32 };
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
+const TN: u32 = 4u;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
-    let r = gid.y;
-    if (row >= p.rows || r >= p.n) { return; }
+    let r0 = gid.y * TN;
+    if (row >= p.rows || r0 >= p.n) { return; }
     let nb = p.cols / 32u;
     let row_base = row * nb * 34u;
-    let xrow = r * p.cols;
-    var acc = 0.0;
+    let nm1 = p.n - 1u;
+    let o0 = min(r0 + 0u, nm1) * p.cols;
+    let o1 = min(r0 + 1u, nm1) * p.cols;
+    let o2 = min(r0 + 2u, nm1) * p.cols;
+    let o3 = min(r0 + 3u, nm1) * p.cols;
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var b = 0u; b < nb; b = b + 1u) {
         let bb = row_base + b * 34u;
         let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
-        let xb = xrow + b * 32u;
+        let xb = b * 32u;
         for (var i = 0u; i < 32u; i = i + 1u) {
             let q = (i32(gb(bb + 2u + i)) << 24u) >> 24u;
-            acc = acc + d * f32(q) * x[xb + i];
+            let wv = d * f32(q);
+            let xi = xb + i;
+            acc.x = acc.x + wv * x[o0 + xi];
+            acc.y = acc.y + wv * x[o1 + xi];
+            acc.z = acc.z + wv * x[o2 + xi];
+            acc.w = acc.w + wv * x[o3 + xi];
         }
     }
-    outp[r * p.rows + row] = acc;
+    outp[(r0 + 0u) * p.rows + row] = acc.x;
+    if (r0 + 1u < p.n) { outp[(r0 + 1u) * p.rows + row] = acc.y; }
+    if (r0 + 2u < p.n) { outp[(r0 + 2u) * p.rows + row] = acc.z; }
+    if (r0 + 3u < p.n) { outp[(r0 + 3u) * p.rows + row] = acc.w; }
 }
 "#;
 
@@ -582,15 +611,24 @@ struct P { rows: u32, cols: u32, n: u32 };
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
-fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
-    var acc = 0.0;
+const TN: u32 = 4u;
+// Tiled over the batch: each weight nibble is dequantized ONCE and dotted against
+// TN activation rows, so weight bytes (and the dequant work) are read/done once per
+// tile instead of once per row. TN must match matmul_batch_tn() on the host.
+fn dot_q4k_tile(row_base: u32, nb: u32, r0: u32, ncols: u32, nrows: u32) -> vec4<f32> {
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let nm1 = nrows - 1u;
+    let o0 = min(r0 + 0u, nm1) * ncols;
+    let o1 = min(r0 + 1u, nm1) * ncols;
+    let o2 = min(r0 + 2u, nm1) * ncols;
+    let o3 = min(r0 + 3u, nm1) * ncols;
     for (var b = 0u; b < nb; b = b + 1u) {
         let bb = row_base + b * 144u;
         let d = f16f32(gb(bb) | (gb(bb + 1u) << 8u));
         let dmin = f16f32(gb(bb + 2u) | (gb(bb + 3u) << 8u));
         let sbase = bb + 4u;
         let qbase = bb + 16u;
-        let xb = xoff + b * 256u;
+        let xb = b * 256u;
         var y = 0u;
         var is = 0u;
         for (var chunk = 0u; chunk < 4u; chunk = chunk + 1u) {
@@ -600,11 +638,21 @@ fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
             let d2 = d * f32(sm2.x); let min2 = dmin * f32(sm2.y);
             let cbase = qbase + chunk * 32u;
             for (var j = 0u; j < 32u; j = j + 1u) {
-                acc = acc + (d1 * f32(gb(cbase + j) & 0x0fu) - min1) * x[xb + y];
+                let wv = d1 * f32(gb(cbase + j) & 0x0fu) - min1;
+                let xi = xb + y;
+                acc.x = acc.x + wv * x[o0 + xi];
+                acc.y = acc.y + wv * x[o1 + xi];
+                acc.z = acc.z + wv * x[o2 + xi];
+                acc.w = acc.w + wv * x[o3 + xi];
                 y = y + 1u;
             }
             for (var j = 0u; j < 32u; j = j + 1u) {
-                acc = acc + (d2 * f32(gb(cbase + j) >> 4u) - min2) * x[xb + y];
+                let wv = d2 * f32(gb(cbase + j) >> 4u) - min2;
+                let xi = xb + y;
+                acc.x = acc.x + wv * x[o0 + xi];
+                acc.y = acc.y + wv * x[o1 + xi];
+                acc.z = acc.z + wv * x[o2 + xi];
+                acc.w = acc.w + wv * x[o3 + xi];
                 y = y + 1u;
             }
             is = is + 2u;
@@ -615,10 +663,14 @@ fn dot_q4k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
-    let r = gid.y;
-    if (row >= p.rows || r >= p.n) { return; }
+    let r0 = gid.y * TN;
+    if (row >= p.rows || r0 >= p.n) { return; }
     let nb = p.cols / 256u;
-    outp[r * p.rows + row] = dot_q4k_row(row * nb * 144u, nb, r * p.cols);
+    let acc = dot_q4k_tile(row * nb * 144u, nb, r0, p.cols, p.n);
+    outp[(r0 + 0u) * p.rows + row] = acc.x;
+    if (r0 + 1u < p.n) { outp[(r0 + 1u) * p.rows + row] = acc.y; }
+    if (r0 + 2u < p.n) { outp[(r0 + 2u) * p.rows + row] = acc.z; }
+    if (r0 + 3u < p.n) { outp[(r0 + 3u) * p.rows + row] = acc.w; }
 }
 "#;
 
@@ -682,12 +734,20 @@ struct P { rows: u32, cols: u32, n: u32 };
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(3) var<storage, read> p: P;
-fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
-    var acc = 0.0;
+const TN: u32 = 4u;
+// Tiled over the batch: each of the four Q6_K weights per step is dequantized ONCE
+// and dotted against TN activation rows. TN must match matmul_batch_tn() on the host.
+fn dot_q6k_tile(row_base: u32, nb: u32, r0: u32, ncols: u32, nrows: u32) -> vec4<f32> {
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let nm1 = nrows - 1u;
+    let o0 = min(r0 + 0u, nm1) * ncols;
+    let o1 = min(r0 + 1u, nm1) * ncols;
+    let o2 = min(r0 + 2u, nm1) * ncols;
+    let o3 = min(r0 + 3u, nm1) * ncols;
     for (var b = 0u; b < nb; b = b + 1u) {
         let bb = row_base + b * 210u;
         let d = f16f32(gb(bb + 208u) | (gb(bb + 209u) << 8u));
-        let xb = xoff + b * 256u;
+        let xb = b * 256u;
         for (var half = 0u; half < 2u; half = half + 1u) {
             let qlb = bb + half * 64u;
             let qhb = bb + 128u + half * 32u;
@@ -702,10 +762,18 @@ fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
                 let q2 = i32((qll32 & 0x0fu) | (((qhl >> 2u) & 3u) << 4u)) - 32;
                 let q3 = i32((qll >> 4u) | (((qhl >> 4u) & 3u) << 4u)) - 32;
                 let q4 = i32((qll32 >> 4u) | (((qhl >> 6u) & 3u) << 4u)) - 32;
-                acc = acc + d * f32(sext8(gb(scb + is))) * f32(q1) * x[xb + y + l];
-                acc = acc + d * f32(sext8(gb(scb + is + 2u))) * f32(q2) * x[xb + y + l + 32u];
-                acc = acc + d * f32(sext8(gb(scb + is + 4u))) * f32(q3) * x[xb + y + l + 64u];
-                acc = acc + d * f32(sext8(gb(scb + is + 6u))) * f32(q4) * x[xb + y + l + 96u];
+                let w1 = d * f32(sext8(gb(scb + is))) * f32(q1);
+                let w2 = d * f32(sext8(gb(scb + is + 2u))) * f32(q2);
+                let w3 = d * f32(sext8(gb(scb + is + 4u))) * f32(q3);
+                let w4 = d * f32(sext8(gb(scb + is + 6u))) * f32(q4);
+                let i1 = xb + y + l;
+                let i2 = xb + y + l + 32u;
+                let i3 = xb + y + l + 64u;
+                let i4 = xb + y + l + 96u;
+                acc.x = acc.x + w1 * x[o0 + i1] + w2 * x[o0 + i2] + w3 * x[o0 + i3] + w4 * x[o0 + i4];
+                acc.y = acc.y + w1 * x[o1 + i1] + w2 * x[o1 + i2] + w3 * x[o1 + i3] + w4 * x[o1 + i4];
+                acc.z = acc.z + w1 * x[o2 + i1] + w2 * x[o2 + i2] + w3 * x[o2 + i3] + w4 * x[o2 + i4];
+                acc.w = acc.w + w1 * x[o3 + i1] + w2 * x[o3 + i2] + w3 * x[o3 + i3] + w4 * x[o3 + i4];
             }
         }
     }
@@ -714,10 +782,14 @@ fn dot_q6k_row(row_base: u32, nb: u32, xoff: u32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
-    let r = gid.y;
-    if (row >= p.rows || r >= p.n) { return; }
+    let r0 = gid.y * TN;
+    if (row >= p.rows || r0 >= p.n) { return; }
     let nb = p.cols / 256u;
-    outp[r * p.rows + row] = dot_q6k_row(row * nb * 210u, nb, r * p.cols);
+    let acc = dot_q6k_tile(row * nb * 210u, nb, r0, p.cols, p.n);
+    outp[(r0 + 0u) * p.rows + row] = acc.x;
+    if (r0 + 1u < p.n) { outp[(r0 + 1u) * p.rows + row] = acc.y; }
+    if (r0 + 2u < p.n) { outp[(r0 + 2u) * p.rows + row] = acc.z; }
+    if (r0 + 3u < p.n) { outp[(r0 + 3u) * p.rows + row] = acc.w; }
 }
 "#;
 
@@ -1514,6 +1586,14 @@ impl GpuBackend {
         }
     }
 
+    /// Batch-row tile width baked into the matmul shaders: a thread computes this
+    /// many output rows, reusing every weight element across them (weight DRAM — the
+    /// prefill bottleneck — /TN). Every batch shader (f32 / Q8_0 / Q4_K / Q6_K) is
+    /// tiled with TN=4, so this MUST stay in sync with their WGSL `TN` constants.
+    fn matmul_batch_tn(&self, _ty: GgmlType) -> u32 {
+        4
+    }
+
     /// Fetch (uploading on first use) the resident RoPE inverse-frequency table.
     fn table_buffer(&self, inv_freq: &[f32]) -> Arc<wgpu::Buffer> {
         let key = inv_freq.as_ptr() as usize;
@@ -1996,8 +2076,11 @@ impl Backend for GpuBackend {
         let ob = self.alloc_out(out.len());
         let pb = self.params(&[oc as u32, ic as u32, rows as u32]);
         let bind = self.bind(pipe, &[&gw.buf, &xb, &ob, &pb]);
-        // 2-D grid: x over output features, y over batch rows.
-        let grid = [ceil_div(oc, 64), rows as u32, 1];
+        // 2-D grid: x over output features, y over batch-row TILES. Each thread
+        // computes `tn` batch rows so a weight element is read once and reused
+        // across the tile (weight DRAM traffic — the prefill bottleneck — /tn).
+        let tn = self.matmul_batch_tn(gw.ty);
+        let grid = [ceil_div(oc, 64), ceil_div(rows, tn as usize), 1];
         self.run_grid(pipe, &bind, grid, &ob, out);
     }
 

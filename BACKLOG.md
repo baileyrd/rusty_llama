@@ -339,13 +339,34 @@ Ordered by ROI (value ÷ effort).
 
 ### R5 — Larger levers
 
-- [ ] **R5.1 wgpu prefill tiling** *(medium; only if wgpu/portability matters)*.
-  `WGSL_MATMUL_BATCH` + 3 quant variants re-stream every weight per batch row with zero
-  reuse (gpu.rs:233-252, 427, 579, 679). Tile (one workgroup per weight row × shared-mem tile
-  of N activation rows) → amortize weight DRAM by ~N. Plausibly several-× wgpu prefill,
-  independent of the (ruled-out) tensor-core gap. Biggest un-captured perf lever in the review.
+- [x] **R5.1 wgpu prefill tiling** *(done 2026-06-20)*. All four batch matmul shaders
+  (`WGSL_MATMUL_BATCH` f32 + Q8_0/Q4_K/Q6_K) now register-tile over the batch: each thread
+  computes `TN=4` output rows, so every weight element is read once (and each k-quant block
+  dequantized once) and reused across the tile, instead of being re-streamed/re-dequantized
+  per batch row. Grid y = `ceil_div(rows, TN)` via `matmul_batch_tn()`. **Measured (RTX 5070
+  Ti, Vulkan):** synthetic f32 prefill **728 → 2,170 tok/s (~3.0×)**; real TinyLlama **Q4_K_M
+  prefill 42 → 207 tok/s (~4.9×)** (k-quants gain more because the redundant in-shader dequant
+  is also amortized). Correctness: tiling preserves per-output FMA order, so output is
+  bit-identical to the untiled shader (verified by A/B); `matmul_batch_parity` (f32) +
+  `prefill_matches_cpu` (f32/Q8_0) pass, and a new `prefill_matches_cpu_real_kquant` test
+  covers the Q4_K/Q6_K shaders (which the synthetic builder can't produce).
+
+  **Separate pre-existing bug found (not tiling):** the wgpu *batched prefill* diverges from
+  the CPU on real k-quant models (rel-L2 ~3.5%, greedy token can differ) — present on `main`,
+  same with tiling on or off. The README's byte-identical claim is for the *decode* (GEMV)
+  path, not batched prefill. Tracked separately; blocks tightening the new test to argmax
+  parity. *(Did NOT add a runtime untiled-fallback toggle — a correct one needs dual
+  pipelines, not worth it for the least-important backend; A/B via `git stash`.)*
 - [ ] **R5.2 CPU long-context attention SIMD.** QK dot (cpu.rs:403) and `v·v` rmsnorm
   (cpu.rs:99) are scalar f32 — negligible at pp/tg128, measurable at long context.
+- [ ] **R5.3 wgpu batched-prefill diverges from CPU on real k-quants** *(found during R5.1)*.
+  `forward_prefill` on the GPU gives a different argmax than the CPU on TinyLlama Q4_K_M
+  (rel-L2 ~3.5%); present on `main`, independent of tiling. F32/Q8_0 synthetic prefill matches
+  fine and the GEMV *decode* path is byte-identical, so the suspect is the **dequant-in-shader
+  Q4_K/Q6_K batch matmul** numerics (or a subtle index/scale bug) vs the CPU int8 path.
+  `prefill_matches_cpu_real_kquant` currently only bounds rel-L2; tighten to argmax parity once
+  fixed. Means GPU-backed prompt processing may pick a different first token than CPU on
+  k-quant models.
 
 ### R6 — Documentation (open item 6.x — confirmed)
 
