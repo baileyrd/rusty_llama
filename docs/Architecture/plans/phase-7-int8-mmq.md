@@ -14,6 +14,47 @@ See [`PERFORMANCE.md`](../../../PERFORMANCE.md) item 3 and
 
 ---
 
+## ⏹️ Outcome — executed through the Stage-B gate (2026-06-21): **NO-GO for bounded effort**
+
+This plan was run through Stages A and B. **The kernels are proven correct on the
+RTX 5070 Ti (sm_120); the Stage-B GO/NO-GO measurement says a hand-written MMQ is
+~5× off cuBLASLt f16 and basic tuning does not close it — so the work is banked,
+not continued.** Doing the cheap stages first to learn this *is* the plan working.
+
+**What was proven correct** (PR #63, all behind `#[ignore]` tests, run with
+`--features cuda -- --ignored`):
+- **Stage A** (`mmq_stage_a_tiled_int8_gemm`): the proven `mma.sync.m16n8k32.s8`
+  fragment generalized to a tiled, K-accumulating int8 GEMM — bit-exact vs host
+  int8 (maxerr 0.0). Weights feed in native `W[n][k]` layout (no transpose).
+- **Stage B** (`mmq_stage_b_q8_0` / `_tiled` / `_v2`): the per-block-scaled Q8_0
+  MMQ (fresh mma per 32-block, scaled by `d_act·d_weight`, f32-accumulated),
+  naive + shared-tiled + register-blocked — all bit-exact vs the host Q8_0 oracle
+  (max rel ~1e-5) and within Q8_0 quant error of true f32.
+
+**The GO/NO-GO measurement** (`mmq_stage_b_bench_vs_f16`, 512×2048×2048 — one pp512
+matmul — vs `gemm_dev_f16`, the cuBLASLt f16 path MMQ would replace):
+
+| Kernel | Time | vs f16 | Correct? |
+|---|---:|---:|---|
+| f16 cuBLASLt (baseline) | 0.116 ms | 1.00× | — |
+| naive tiled MMQ | 0.525 ms | **0.22×** | rel L2 0.0042 |
+| one tuning pass (v2: 64×64 tile, register-blocked, 4× fewer syncs) | 0.634 ms | **0.18×** | rel L2 0.0042 |
+
+**Finding.** A *correct* MMQ is ~5× slower than cuBLASLt f16, and one reasonable
+tuning pass made it **slower, not faster** — an occupancy/register-pressure
+collapse (16 f32 accumulators + 18 KB shared/block dropped resident warps below
+what hides latency), the classic ILP-vs-occupancy trap. The int8 ceiling is real
+(the L7 spike measured cuBLASLt-*int8* at 2.49× f16), but a custom per-sub-block
+kernel can't borrow cuBLAS's tuning, and reaching it is deep, iterative, expert
+GEMM engineering (occupancy balance, `cp.async` double-buffering, vectorized/
+swizzled loads) — the open-ended treadmill, with the e2e payoff still Amdahl-capped
+at ~2× prefill. **Decision: bank the proven kernels, do not build Stage C.** The
+correctness foundation is preserved for any future revisit.
+
+The staged plan below stands as written; the Stage-B gate fired exactly as intended.
+
+---
+
 ## The gap, precisely
 
 | | rusty_llama | llama.cpp | Gap |
@@ -65,7 +106,7 @@ per-row int8; the +18% is the *floor* a clean MMQ must clear, not a target.
 
 ## Staging (each stage independently GPU-verifiable)
 
-### Stage A — tiled int8×int8→f32 GEMM scaffold · ~½–1 day
+### Stage A — tiled int8×int8→f32 GEMM scaffold · ~½–1 day · ✅ DONE (bit-exact, maxerr 0.0)
 Generalize `probe_int8_mma_ptx` from a single 16×8×32 fragment to a **tiled GEMM**
 over real prefill shapes `(M=rows, N=oc, K=ic)`: int8 `A` (activation) and int8 `B`
 (weight) in global memory + per-tile `f32` scales. Stage tiles into shared memory,
@@ -74,7 +115,7 @@ loop `k` in steps of 32 (one `mma.sync` per K-step), accumulate `s32`, scale to
 - **Gate:** bit-correct vs a host int8-GEMM reference at a real shape (e.g.
   2048×2048×512). Proves the tiling / fragment layout / accumulation at GEMM scale.
 
-### Stage B — Q8_0 MMQ + **THE CEILING MEASUREMENT** · ~1 day · **GO/NO-GO**
+### Stage B — Q8_0 MMQ + **THE CEILING MEASUREMENT** · ~1 day · **GO/NO-GO** · ⏹️ DONE → NO-GO (correct, but 0.18–0.22× of cuBLAS f16; see Outcome banner)
 Feed Stage A from **packed Q8_0** weights (`weight_packed`; load the 32 `int8`
 quants per block to shared, keep the per-32 `f16` scale) and Q8_0-quantized
 activation. A Q8_0 block is exactly 32 elements = **one `mma.sync` K-step**; the
@@ -90,7 +131,7 @@ Q8_0-weighted prefill matmuls behind `RUSTY_LLAMA_CUDA_MMQ`. Parity vs
   worth days of Q4_K kernel work, **STOP and document** (a legitimate, valuable
   negative result — you'll have proven the ceiling cheaply).
 
-### Stage C — Q4_K / Q6_K MMQ · ~2–4 days · *only if Stage B clears the bar*
+### Stage C — Q4_K / Q6_K MMQ · ~2–4 days · *only if Stage B clears the bar* · ⛔ NOT BUILT (Stage B was a NO-GO)
 The real kernel. Reuse `dot_q4_k_row` / `dot_q6_k_row`'s per-sub-block unpack (8×32,
 `get_scale_min_k4`, the min term `Σq·x = Σq_u·x − min·Σx`) but **stage the unpacked
 int8 quants into shared and feed `mma.sync` per 32-K sub-block**, applying the
