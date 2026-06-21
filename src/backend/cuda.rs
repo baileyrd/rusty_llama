@@ -2672,6 +2672,175 @@ extern "C" __global__ void mmq_a(
         eprintln!("STAGE A PASSED: tiled int8 mma GEMM {mm}x{nn}x{kk} exact (maxerr {maxerr:.2e})");
     }
 
+    /// Phase 7 / Stage B (correctness): Q8_0 MMQ — the per-block-scaled tiled mma.
+    /// Q8_0 carries one f32 scale per 32 elements, so unlike Stage A the s32
+    /// accumulator can't run across blocks: each 32-wide block is a fresh mma
+    /// whose int32 dot is scaled by `d_act · d_weight` and accumulated in f32.
+    /// This is the simplest MMQ and the Stage-B GO/NO-GO kernel. Verified here vs
+    /// a host Q8_0×Q8_0 reference (same math) and sanity-checked vs the true f32
+    /// dot (within Q8_0 quant error). Activation/weight are passed pre-separated
+    /// (int8 quants + f32 per-block scales); reading the packed ggml block layout
+    /// in-kernel is the next refinement.
+    #[test]
+    #[ignore = "L7 Stage B; run with --features cuda -- --ignored --nocapture"]
+    fn mmq_stage_b_q8_0() {
+        let Some(b) = cuda() else {
+            eprintln!("no CUDA device");
+            return;
+        };
+        const SRC: &str = r#"
+extern "C" __global__ void mmq_q8_0(
+    const signed char* qa, const float* da,   // activation: qa[M*K], da[M*(K/32)]
+    const signed char* qw, const float* dw,   // weight:     qw[N*K], dw[N*(K/32)]
+    float* C, int M, int N, int K)
+{
+    int row_base = blockIdx.y * 16;
+    int col_base = blockIdx.x * 8;
+    int lane = threadIdx.x & 31;
+    int gid = lane >> 2;
+    int tig = lane & 3;
+    int nblk = K / 32;
+    float f0=0.f, f1=0.f, f2=0.f, f3=0.f;
+    int z = 0;
+    for (int blk = 0; blk < nblk; blk++) {
+        int kk = blk * 32;
+        unsigned a0=0,a1=0,a2=0,a3=0,b0=0,b1=0;
+        for (int t = 0; t < 4; t++) {
+            a0 |= ((unsigned)(unsigned char)qa[(row_base+gid)*K   + kk + tig*4 + t])      << (8*t);
+            a1 |= ((unsigned)(unsigned char)qa[(row_base+gid+8)*K + kk + tig*4 + t])      << (8*t);
+            a2 |= ((unsigned)(unsigned char)qa[(row_base+gid)*K   + kk + 16 + tig*4 + t]) << (8*t);
+            a3 |= ((unsigned)(unsigned char)qa[(row_base+gid+8)*K + kk + 16 + tig*4 + t]) << (8*t);
+            b0 |= ((unsigned)(unsigned char)qw[(col_base+gid)*K   + kk + tig*4 + t])      << (8*t);
+            b1 |= ((unsigned)(unsigned char)qw[(col_base+gid)*K   + kk + 16 + tig*4 + t]) << (8*t);
+        }
+        int d0,d1,d2,d3;
+        asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "=r"(d0),"=r"(d1),"=r"(d2),"=r"(d3)
+            : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(z),"r"(z),"r"(z),"r"(z));
+        float da0 = da[(row_base+gid)*nblk   + blk];
+        float da8 = da[(row_base+gid+8)*nblk + blk];
+        float dw0 = dw[(col_base+tig*2)*nblk     + blk];
+        float dw1 = dw[(col_base+tig*2+1)*nblk   + blk];
+        f0 += (float)d0 * da0 * dw0;
+        f1 += (float)d1 * da0 * dw1;
+        f2 += (float)d2 * da8 * dw0;
+        f3 += (float)d3 * da8 * dw1;
+    }
+    C[(row_base+gid)*N   + col_base + tig*2]     = f0;
+    C[(row_base+gid)*N   + col_base + tig*2 + 1] = f1;
+    C[(row_base+gid+8)*N + col_base + tig*2]     = f2;
+    C[(row_base+gid+8)*N + col_base + tig*2 + 1] = f3;
+}
+"#;
+        // Host Q8_0 quant of one length-K row into per-32 (int8 q, f32 scale),
+        // mirroring ggml quantize_row_q8_0 (d = amax/127, q = round(v/d)).
+        fn quant_q8_0(v: &[f32], k: usize) -> (Vec<i8>, Vec<f32>) {
+            let nblk = k / 32;
+            let mut q = vec![0i8; k];
+            let mut d = vec![0f32; nblk];
+            for blk in 0..nblk {
+                let s = &v[blk * 32..blk * 32 + 32];
+                let amax = s.iter().fold(0f32, |m, &x| m.max(x.abs()));
+                let scale = amax / 127.0;
+                d[blk] = scale;
+                let id = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                for (i, &x) in s.iter().enumerate() {
+                    q[blk * 32 + i] = (x * id).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            (q, d)
+        }
+
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_120"),
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(SRC, opts).expect("nvrtc compile");
+        let st = &b.stream;
+        let m = b.ctx.load_module(ptx).expect("load module");
+        let f = m.load_function("mmq_q8_0").expect("load fn");
+
+        let (mm, nn, kk) = (32usize, 16usize, 128usize); // 4 Q8_0 blocks per row
+        let nblk = kk / 32;
+        // Pseudo-random f32 activation and weight (deterministic, no rng dep).
+        let af: Vec<f32> = (0..mm * kk).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.21).collect();
+        let wf: Vec<f32> = (0..nn * kk).map(|i| ((i * 5 % 19) as f32 - 9.0) * 0.17).collect();
+        let (mut qa, mut da) = (vec![0i8; mm * kk], vec![0f32; mm * nblk]);
+        for r in 0..mm {
+            let (q, d) = quant_q8_0(&af[r * kk..r * kk + kk], kk);
+            qa[r * kk..r * kk + kk].copy_from_slice(&q);
+            da[r * nblk..r * nblk + nblk].copy_from_slice(&d);
+        }
+        let (mut qw, mut dw) = (vec![0i8; nn * kk], vec![0f32; nn * nblk]);
+        for r in 0..nn {
+            let (q, d) = quant_q8_0(&wf[r * kk..r * kk + kk], kk);
+            qw[r * kk..r * kk + kk].copy_from_slice(&q);
+            dw[r * nblk..r * nblk + nblk].copy_from_slice(&d);
+        }
+
+        let qad = st.clone_htod(&qa).unwrap();
+        let dad = st.clone_htod(&da).unwrap();
+        let qwd = st.clone_htod(&qw).unwrap();
+        let dwd = st.clone_htod(&dw).unwrap();
+        let mut cd = st.alloc_zeros::<f32>(mm * nn).unwrap();
+        {
+            let mut lb = st.launch_builder(&f);
+            let (mi, ni, ki) = (mm as i32, nn as i32, kk as i32);
+            lb.arg(&qad).arg(&dad).arg(&qwd).arg(&dwd).arg(&mut cd).arg(&mi).arg(&ni).arg(&ki);
+            let cfg = LaunchConfig {
+                grid_dim: ((nn / 8) as u32, (mm / 16) as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.expect("launch");
+        }
+        let c: Vec<f32> = st.clone_dtoh(&cd).unwrap();
+
+        // Oracle 1 (hard gate): host Q8_0xQ8_0 — the exact same math the kernel
+        //   does, so per-cell rel error must be ~0 (only f32 add-order differs).
+        // Oracle 2 (quality): true f32 dot — measured as aggregate relative L2 over
+        //   the whole matrix (per-cell rel error is meaningless under the heavy
+        //   cancellation of random ± dot products; ‖C_q8 − C_f32‖ / ‖C_f32‖ is the
+        //   standard quant-quality metric and stays small).
+        let mut bad = 0;
+        let mut maxrel_q = 0f32;
+        let (mut err2, mut ref2) = (0f64, 0f64);
+        for i in 0..mm {
+            for j in 0..nn {
+                let mut q8 = 0f32;
+                let mut f32dot = 0f32;
+                for blk in 0..nblk {
+                    let mut idot = 0i32;
+                    for t in 0..32 {
+                        let k = blk * 32 + t;
+                        idot += qa[i * kk + k] as i32 * qw[j * kk + k] as i32;
+                        f32dot += af[i * kk + k] * wf[j * kk + k];
+                    }
+                    q8 += idot as f32 * da[i * nblk + blk] * dw[j * nblk + blk];
+                }
+                let got = c[i * nn + j];
+                let rel_q = (got - q8).abs() / q8.abs().max(1e-3);
+                maxrel_q = maxrel_q.max(rel_q);
+                if rel_q > 1e-4 {
+                    if bad < 8 {
+                        eprintln!("[{i}][{j}] gpu={got} q8ref={q8} f32={f32dot}");
+                    }
+                    bad += 1;
+                }
+                err2 += (got - f32dot) as f64 * (got - f32dot) as f64;
+                ref2 += f32dot as f64 * f32dot as f64;
+            }
+        }
+        let rel_l2 = (err2 / ref2).sqrt();
+        assert_eq!(bad, 0, "Q8_0 MMQ disagrees with host Q8_0 oracle in {bad} cells");
+        assert!(rel_l2 < 0.05, "Q8_0 MMQ vs true f32 aggregate rel L2 too high: {rel_l2}");
+        eprintln!(
+            "STAGE B PASSED: Q8_0 MMQ {mm}x{nn}x{kk} matches host Q8_0 (max rel {maxrel_q:.2e}), \
+             aggregate rel L2 vs true f32 {rel_l2:.4}"
+        );
+    }
+
     #[test]
     #[ignore = "L7 spike; run with --features cuda -- --ignored --nocapture"]
     fn bench_int8_gemm_feasibility() {
