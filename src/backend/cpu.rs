@@ -11,7 +11,8 @@ use rayon::prelude::*;
 use crate::backend::Backend;
 use crate::math::silu;
 use crate::quant::{
-    dequant_block, dequantize_into, quantize_activation_q8, quantize_activation_q8k, vec_dot_q4_0,
+    dequant_block, dequantize_into, f32_axpy_decay, f32_dot, quantize_activation_q8,
+    quantize_activation_q8k, vec_dot_q4_0,
     vec_dot_q4_k, vec_dot_q4_k_tiled, vec_dot_q6_k, vec_dot_q6_k_tiled, vec_dot_q8_0, GgmlType,
     Q8Activation, Q8KActivation, MAX_BLOCK,
 };
@@ -400,7 +401,7 @@ impl Backend for CpuBackend {
                 for t in 0..=pos {
                     let base = t * kv_dim + kv_off;
                     let k = &key_cache[base..base + head_size];
-                    let mut s = q_h.iter().zip(k).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+                    let mut s = f32_dot(q_h, k) * scale;
                     // Gemma2 tanh logit softcapping on the raw score.
                     if logit_softcap > 0.0 {
                         s = logit_softcap * (s / logit_softcap).tanh();
@@ -412,9 +413,7 @@ impl Backend for CpuBackend {
                     let p = (s - m_new).exp();
                     l = l * alpha + p;
                     let v = &value_cache[base..base + head_size];
-                    for (o, &vi) in out_h.iter_mut().zip(v) {
-                        *o = *o * alpha + p * vi;
-                    }
+                    f32_axpy_decay(out_h, alpha, p, v);
                     m = m_new;
                 }
                 let inv = 1.0 / l;

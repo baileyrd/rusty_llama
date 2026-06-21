@@ -583,6 +583,38 @@ pub fn has_int8_path(ty: GgmlType) -> bool {
     )
 }
 
+/// Dot product of two equal-length f32 slices — the CPU flash-attention QK score.
+/// Uses an 8-wide AVX2+FMA kernel when available, else a scalar reduction. This is
+/// the per-key inner loop of attention, so it dominates at long context.
+#[inline]
+pub fn f32_dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::avx2f_supported() {
+            // SAFETY: gated on runtime AVX2+FMA detection.
+            return unsafe { x86::f32_dot_avx2(a, b) };
+        }
+    }
+    a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+}
+
+/// `out[i] = out[i] * alpha + p * v[i]` — the flash-attention online rescale + value
+/// accumulate (also per-key). AVX2+FMA when available, else scalar.
+#[inline]
+pub fn f32_axpy_decay(out: &mut [f32], alpha: f32, p: f32, v: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::avx2f_supported() {
+            // SAFETY: gated on runtime AVX2+FMA detection.
+            unsafe { x86::f32_axpy_decay_avx2(out, alpha, p, v) };
+            return;
+        }
+    }
+    for (o, &vi) in out.iter_mut().zip(v) {
+        *o = *o * alpha + p * vi;
+    }
+}
+
 // --- AVX-512 VNNI integer dot products (x86_64) -----------------------------
 //
 // The scalar `vec_dot_*` kernels above already autovectorize under
@@ -598,6 +630,71 @@ pub fn has_int8_path(ty: GgmlType) -> bool {
 pub(crate) mod x86 {
     use super::{get_scale_min_k4, rd_f16, Q8Activation, Q8KActivation};
     use core::arch::x86_64::*;
+
+    /// Whether the AVX2+FMA f32 attention kernels apply (cached). The
+    /// `RUSTY_LLAMA_NO_AVX2F` escape hatch forces the scalar path (A/B benchmarking).
+    pub fn avx2f_supported() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            std::env::var_os("RUSTY_LLAMA_NO_AVX2F").is_none()
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+        })
+    }
+
+    /// Horizontal sum of the eight f32 lanes of a 256-bit register.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum_f32_x8(v: __m256) -> f32 {
+        let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let s = _mm_hadd_ps(s, s);
+        let s = _mm_hadd_ps(s, s);
+        _mm_cvtss_f32(s)
+    }
+
+    /// Dot product of two equal-length f32 slices, 8-wide with an FMA accumulator.
+    /// # Safety
+    /// AVX2+FMA must be available (see [`avx2f_supported`]).
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn f32_dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        let n = a.len();
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc);
+            i += 8;
+        }
+        let mut s = hsum_f32_x8(acc);
+        while i < n {
+            s += *pa.add(i) * *pb.add(i);
+            i += 1;
+        }
+        s
+    }
+
+    /// `out[i] = out[i]*alpha + p*v[i]`, 8-wide with FMA.
+    /// # Safety
+    /// AVX2+FMA must be available (see [`avx2f_supported`]).
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn f32_axpy_decay_avx2(out: &mut [f32], alpha: f32, p: f32, v: &[f32]) {
+        debug_assert_eq!(out.len(), v.len());
+        let n = out.len();
+        let (va, vp) = (_mm256_set1_ps(alpha), _mm256_set1_ps(p));
+        let (po, pv) = (out.as_mut_ptr(), v.as_ptr());
+        let mut i = 0;
+        while i + 8 <= n {
+            let prod = _mm256_mul_ps(vp, _mm256_loadu_ps(pv.add(i)));
+            let r = _mm256_fmadd_ps(_mm256_loadu_ps(po.add(i)), va, prod);
+            _mm256_storeu_ps(po.add(i), r);
+            i += 8;
+        }
+        while i < n {
+            *po.add(i) = *po.add(i) * alpha + p * *pv.add(i);
+            i += 1;
+        }
+    }
     use std::sync::OnceLock;
 
     /// Whether the VNNI kernels should be used: this CPU has the required
@@ -1201,6 +1298,92 @@ pub(crate) fn pack_scales_q4_k(sc: [u8; 8], m: [u8; 8]) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R5.2: the AVX2 f32 attention kernels must match the scalar reference at every
+    /// 8-wide tile boundary (the remainder loop is the real correctness risk).
+    #[test]
+    fn f32_simd_kernels_match_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !x86::avx2f_supported() {
+                eprintln!("no AVX2+FMA — skipping SIMD parity");
+                return;
+            }
+            for &n in &[1usize, 7, 8, 9, 15, 16, 31, 63, 64, 65, 80, 127, 128] {
+                let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7 - 3.0).sin()).collect();
+                let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3 + 1.0).cos()).collect();
+                // dot
+                let want: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+                let got = unsafe { x86::f32_dot_avx2(&a, &b) };
+                assert!(
+                    (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                    "dot n={n}: {got} vs {want}"
+                );
+                // out = out*alpha + p*v
+                let (alpha, p) = (0.9f32, 0.25f32);
+                let mut want_v = a.clone();
+                for (o, &vi) in want_v.iter_mut().zip(&b) {
+                    *o = *o * alpha + p * vi;
+                }
+                let mut got_v = a.clone();
+                unsafe { x86::f32_axpy_decay_avx2(&mut got_v, alpha, p, &b) };
+                for i in 0..n {
+                    assert!(
+                        (got_v[i] - want_v[i]).abs() <= 1e-4 * (1.0 + want_v[i].abs()),
+                        "axpy n={n} i={i}: {} vs {}",
+                        got_v[i],
+                        want_v[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// R5.2: measure the long-context attention inner-loop speedup (AVX2 vs scalar).
+    #[test]
+    #[ignore = "bench; run with --lib -- --ignored --nocapture"]
+    fn bench_f32_attention_kernels() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::time::Instant;
+            let (hs, keys, heads, iters) = (128usize, 4096usize, 32usize, 8usize);
+            let q: Vec<f32> = (0..hs).map(|i| (i as f32 * 0.01).sin()).collect();
+            let kc: Vec<f32> = (0..keys * hs).map(|i| (i as f32 * 0.001).cos()).collect();
+            let vc: Vec<f32> = (0..keys * hs).map(|i| (i as f32 * 0.002).sin()).collect();
+            let p = 0.013f32;
+
+            let run = |simd: bool| {
+                let t0 = Instant::now();
+                let mut sink = 0.0f32;
+                for _ in 0..iters {
+                    for _h in 0..heads {
+                        let mut acc = vec![0.0f32; hs];
+                        for t in 0..keys {
+                            let k = &kc[t * hs..t * hs + hs];
+                            let v = &vc[t * hs..t * hs + hs];
+                            if simd {
+                                let s = unsafe { x86::f32_dot_avx2(&q, k) };
+                                unsafe { x86::f32_axpy_decay_avx2(&mut acc, 0.99, p * s, v) };
+                            } else {
+                                let s: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+                                for (o, &vi) in acc.iter_mut().zip(v) {
+                                    *o = *o * 0.99 + p * s * vi;
+                                }
+                            }
+                        }
+                        sink += acc[0];
+                    }
+                }
+                (t0.elapsed(), sink)
+            };
+            let (ts, _) = run(false);
+            let (tv, _) = if x86::avx2f_supported() { run(true) } else { (ts, 0.0) };
+            eprintln!(
+                "attn inner-loop (hs={hs}, keys={keys}, heads={heads}): scalar {ts:?}  avx2 {tv:?}  speedup {:.2}x",
+                ts.as_secs_f64() / tv.as_secs_f64()
+            );
+        }
+    }
 
     #[test]
     fn f16_roundtrip_simple_values() {

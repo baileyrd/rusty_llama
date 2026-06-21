@@ -376,8 +376,15 @@ Ordered by ROI (value ÷ effort).
   path, not batched prefill. Tracked separately; blocks tightening the new test to argmax
   parity. *(Did NOT add a runtime untiled-fallback toggle — a correct one needs dual
   pipelines, not worth it for the least-important backend; A/B via `git stash`.)*
-- [ ] **R5.2 CPU long-context attention SIMD.** QK dot (cpu.rs:403) and `v·v` rmsnorm
-  (cpu.rs:99) are scalar f32 — negligible at pp/tg128, measurable at long context.
+- [x] **R5.2 CPU long-context attention SIMD** *(done 2026-06-20)*. The CPU flash-attention
+  inner loop's two scalar f32 hot loops — the QK dot and the online value rescale+accumulate
+  (`out = out*alpha + p*v`) — are now AVX2+FMA 8-wide kernels (`quant::f32_dot` /
+  `f32_axpy_decay`), runtime-detected with a scalar fallback and a `RUSTY_LLAMA_NO_AVX2F`
+  escape hatch. Parity verified at every tile boundary (`f32_simd_kernels_match_scalar`,
+  lengths 1…128); flash-attention parity tests still pass. Measured **2.31× on the
+  long-context inner loop** (hs=128, 4096 keys — memory-bound, hence < 8×). Negligible at
+  short context (attention is a small fraction of decode there), real at long context where
+  attention dominates.
 - [x] **R5.3 wgpu/CPU divergence on real k-quants — investigated; NOT a GPU bug** *(found
   during R5.1, resolved 2026-06-20)*. The wgpu backend disagrees with the CPU on TinyLlama
   Q4_K_M (rel-L2 ~3.5%, different greedy token) — but the divergence is general (decode too,
@@ -397,9 +404,10 @@ Ordered by ROI (value ÷ effort).
 
 ### R6 — Documentation (open item 6.x — confirmed)
 
-- [ ] **R6.1 Refresh stale Architecture/Research docs** to current code: `04` (12 kernels,
-  `new_stream`, resident DP4A decode + CUDA graph — not 7-kernel/default-stream/CPU-decode);
-  `02` (flash/online-softmax, not materialized); `08` (decode ~275/~1.4×, not 123/3.4×); `06`
-  (F16 accepted, not rejected); `01` (MoE exists; drop nonexistent `store_prefill_kv`). Fix
-  the in-code comment cuda.rs:1248-1251 ("decode runs entirely on the CPU"). Reconcile
-  `PERFORMANCE.md` headline (4.4×/2.0×) with latest measured (~3.0–3.8× / ~1.3–1.5×).
+- [x] **R6.1 Refresh stale Architecture/Research docs** *(done 2026-06-20, PRs #57 + #58)*.
+  A 6-agent audit produced 79 code-grounded corrections, reviewed then applied: `04` (12
+  kernels, `new_stream`, resident DP4A decode + CUDA graph); `02` (flash/online-softmax);
+  `08`/`09` (decode/prefill numbers); `06` (F16 accepted); `01` (MoE; dropped nonexistent
+  `store_prefill_kv`); refreshed line refs. Fixed the in-code comment falsely claiming decode
+  "runs entirely on the CPU". `PERFORMANCE.md` reconciled to measured (~3.0–3.8× prefill /
+  ~1.3–1.5× decode) and given explicit CUDA rows in the headline decode/prefill tables.
