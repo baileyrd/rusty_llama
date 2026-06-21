@@ -240,6 +240,20 @@ cool machine; numbers below are reasoned, not all freshly benched.
   per-row int8 is fundamentally too coarse for Q4_K; the only quality path is the
   **per-sub-block MMQ kernel** (hand-written tiled int8-TC — the real treadmill, not
   attempted). +18% lossy prefill isn't worth a generation footgun.
+
+  **L7 gate (2026-06-20): the MMQ tensor-core path is FEASIBLE here, primitive banked.**
+  Probed the blocking unknown — can nvrtc emit an int8 tensor-core op header-free?
+  `<mma.h>` (the wmma C++ API) is unavailable to nvrtc (no include search path), but
+  raw inline-PTX `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` compiles with
+  `arch=compute_120` and runs **bit-correct on sm_120** with a hand-laid-out 32-lane
+  fragment layout (`probe_int8_mma_ptx` test, 0/128 mismatches vs the host reference).
+  So a per-sub-block MMQ is buildable header-free; the verified mma primitive is the
+  foundation. **Deferred (not abandoned):** the full tiled Q4_K MMQ is days of the
+  hardest kernel work for an Amdahl-limited e2e win (the spike's *actual* integration
+  got +18%, not the 2.49× GEMM number; a clean MMQ would beat that but the ceiling is
+  unproven until ~70% built), and prefill is the less-important regime (decode is only
+  ~1.4× behind). Staged plan when revisited: tiled int8 GEMM → Q8_0 MMQ (measure the
+  e2e ceiling here) → Q4_K MMQ → wire into `forward_prefill`, each GPU-verifiable.
 - [ ] **L8. Tensor-core flash attention** (GPU prefill + long context).
 - [ ] **L9. Aggressive CPU micro-kernel** (NR-tiling, software prefetch, drop the
   hsum) to chip the CPU prefill ~28× — llama.cpp-class GEMM tuning.
