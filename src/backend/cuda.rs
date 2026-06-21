@@ -2996,6 +2996,172 @@ extern "C" __global__ void mmq_q8_0_tiled(
         eprintln!("STAGE B (tiled) PASSED: {mm}x{nn}x{kk} matches host Q8_0 (max rel {maxrel:.2e})");
     }
 
+    /// Phase 7 / Stage B (tuning pass v2): the same Q8_0 MMQ with the three big
+    /// algorithmic wins over the naive tiled kernel — a 64x64 block tile,
+    /// REGISTER BLOCKING (each warp computes a 2x2 grid of 16x8 mma tiles, reusing
+    /// 2 A-fragments x 2 B-fragments -> 4 mmas), and staging 128 K per sync so 4
+    /// sub-blocks run between syncs (K/128 syncs instead of K/32). Requires
+    /// M%64==0, N%64==0, K%128==0. Scalar shared staging (vectorized int4 loads +
+    /// double-buffering are the next pass if the trajectory justifies it).
+    const MMQ_Q8_0_V2_SRC: &str = r#"
+#define BM 64
+#define BN 64
+#define BK_TILE 128
+#define KSUB 4
+#define WARPS_N 4
+extern "C" __global__ void mmq_q8_0_v2(
+    const signed char* qa, const float* da,
+    const signed char* qw, const float* dw,
+    float* C, int M, int N, int K)
+{
+    __shared__ signed char sA[BM*BK_TILE];
+    __shared__ signed char sB[BN*BK_TILE];
+    __shared__ float sDa[BM*KSUB];
+    __shared__ float sDw[BN*KSUB];
+    int brow = blockIdx.y * BM;
+    int bcol = blockIdx.x * BN;
+    int tid = threadIdx.x;
+    int warp = tid >> 5, lane = tid & 31;
+    int wr = warp / WARPS_N;        // 0..1 -> warp rows [wr*32, +32)
+    int wc = warp % WARPS_N;        // 0..3 -> warp cols [wc*16, +16)
+    int gid = lane >> 2, tig = lane & 3;
+    int nblk_k = K / 32;
+
+    float acc[2][2][4];
+    for (int mi=0; mi<2; mi++) for (int ni=0; ni<2; ni++) for (int t=0; t<4; t++) acc[mi][ni][t]=0.f;
+    int z = 0;
+
+    for (int k0 = 0; k0 < K; k0 += BK_TILE) {
+        for (int idx = tid; idx < BM*BK_TILE; idx += blockDim.x)
+            sA[idx] = qa[(brow + idx/BK_TILE)*K + k0 + idx%BK_TILE];
+        for (int idx = tid; idx < BN*BK_TILE; idx += blockDim.x)
+            sB[idx] = qw[(bcol + idx/BK_TILE)*K + k0 + idx%BK_TILE];
+        int sub0 = k0 / 32;
+        for (int idx = tid; idx < BM*KSUB; idx += blockDim.x)
+            sDa[idx] = da[(brow + idx/KSUB)*nblk_k + sub0 + idx%KSUB];
+        for (int idx = tid; idx < BN*KSUB; idx += blockDim.x)
+            sDw[idx] = dw[(bcol + idx/KSUB)*nblk_k + sub0 + idx%KSUB];
+        __syncthreads();
+
+        for (int sub = 0; sub < KSUB; sub++) {
+            int ks = sub*32;
+            unsigned af[2][4], bf[2][2];
+            for (int mi=0; mi<2; mi++) {
+                int rg = wr*32 + mi*16 + gid;
+                unsigned a0=0,a1=0,a2=0,a3=0;
+                for (int t=0;t<4;t++){
+                    a0 |= ((unsigned)(unsigned char)sA[rg*BK_TILE     + ks + tig*4 + t])      << (8*t);
+                    a1 |= ((unsigned)(unsigned char)sA[(rg+8)*BK_TILE + ks + tig*4 + t])      << (8*t);
+                    a2 |= ((unsigned)(unsigned char)sA[rg*BK_TILE     + ks + 16 + tig*4 + t]) << (8*t);
+                    a3 |= ((unsigned)(unsigned char)sA[(rg+8)*BK_TILE + ks + 16 + tig*4 + t]) << (8*t);
+                }
+                af[mi][0]=a0; af[mi][1]=a1; af[mi][2]=a2; af[mi][3]=a3;
+            }
+            for (int ni=0; ni<2; ni++) {
+                int cg = wc*16 + ni*8 + gid;
+                unsigned b0=0,b1=0;
+                for (int t=0;t<4;t++){
+                    b0 |= ((unsigned)(unsigned char)sB[cg*BK_TILE + ks + tig*4 + t])      << (8*t);
+                    b1 |= ((unsigned)(unsigned char)sB[cg*BK_TILE + ks + 16 + tig*4 + t]) << (8*t);
+                }
+                bf[ni][0]=b0; bf[ni][1]=b1;
+            }
+            for (int mi=0; mi<2; mi++) {
+                float da0 = sDa[(wr*32+mi*16+gid)*KSUB + sub];
+                float da8 = sDa[(wr*32+mi*16+gid+8)*KSUB + sub];
+                for (int ni=0; ni<2; ni++) {
+                    int d0,d1,d2,d3;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                        : "=r"(d0),"=r"(d1),"=r"(d2),"=r"(d3)
+                        : "r"(af[mi][0]),"r"(af[mi][1]),"r"(af[mi][2]),"r"(af[mi][3]),
+                          "r"(bf[ni][0]),"r"(bf[ni][1]),"r"(z),"r"(z),"r"(z),"r"(z));
+                    float dw0 = sDw[(wc*16+ni*8+tig*2)*KSUB + sub];
+                    float dw1 = sDw[(wc*16+ni*8+tig*2+1)*KSUB + sub];
+                    acc[mi][ni][0] += (float)d0*da0*dw0;
+                    acc[mi][ni][1] += (float)d1*da0*dw1;
+                    acc[mi][ni][2] += (float)d2*da8*dw0;
+                    acc[mi][ni][3] += (float)d3*da8*dw1;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int mi=0; mi<2; mi++) for (int ni=0; ni<2; ni++) {
+        int orow = brow + wr*32 + mi*16 + gid;
+        int ocol = bcol + wc*16 + ni*8 + tig*2;
+        C[orow*N + ocol]         = acc[mi][ni][0];
+        C[orow*N + ocol + 1]     = acc[mi][ni][1];
+        C[(orow+8)*N + ocol]     = acc[mi][ni][2];
+        C[(orow+8)*N + ocol + 1] = acc[mi][ni][3];
+    }
+}
+"#;
+
+    /// Correctness of the v2 (register-blocked) Q8_0 MMQ vs the host Q8_0 oracle.
+    #[test]
+    #[ignore = "L7 Stage B; run with --features cuda -- --ignored --nocapture"]
+    fn mmq_stage_b_q8_0_v2() {
+        let Some(b) = cuda() else {
+            eprintln!("no CUDA device");
+            return;
+        };
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_120"),
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(MMQ_Q8_0_V2_SRC, opts).expect("compile");
+        let st = &b.stream;
+        let module = b.ctx.load_module(ptx).expect("module");
+        let f = module.load_function("mmq_q8_0_v2").expect("fn");
+
+        let (mm, nn, kk) = (128usize, 128usize, 256usize); // 2x2 blocks, 2 K-tiles
+        let nblk = kk / 32;
+        let af: Vec<f32> = (0..mm * kk).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.21).collect();
+        let wf: Vec<f32> = (0..nn * kk).map(|i| ((i * 5 % 19) as f32 - 9.0) * 0.17).collect();
+        let (qa, da) = quant_rows_q8_0(&af, mm, kk);
+        let (qw, dw) = quant_rows_q8_0(&wf, nn, kk);
+        let qad = st.clone_htod(&qa).unwrap();
+        let dad = st.clone_htod(&da).unwrap();
+        let qwd = st.clone_htod(&qw).unwrap();
+        let dwd = st.clone_htod(&dw).unwrap();
+        let mut cd = st.alloc_zeros::<f32>(mm * nn).unwrap();
+        {
+            let mut lb = st.launch_builder(&f);
+            let (mi, ni, ki) = (mm as i32, nn as i32, kk as i32);
+            lb.arg(&qad).arg(&dad).arg(&qwd).arg(&dwd).arg(&mut cd).arg(&mi).arg(&ni).arg(&ki);
+            let cfg = LaunchConfig {
+                grid_dim: ((nn / 64) as u32, (mm / 64) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.expect("launch");
+        }
+        let c: Vec<f32> = st.clone_dtoh(&cd).unwrap();
+        let mut bad = 0;
+        let mut maxrel = 0f32;
+        for i in 0..mm {
+            for j in 0..nn {
+                let mut q8 = 0f32;
+                for blk in 0..nblk {
+                    let mut idot = 0i32;
+                    for t in 0..32 {
+                        let k = blk * 32 + t;
+                        idot += qa[i * kk + k] as i32 * qw[j * kk + k] as i32;
+                    }
+                    q8 += idot as f32 * da[i * nblk + blk] * dw[j * nblk + blk];
+                }
+                let rel = (c[i * nn + j] - q8).abs() / q8.abs().max(1e-3);
+                maxrel = maxrel.max(rel);
+                if rel > 1e-4 {
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "v2 Q8_0 MMQ disagrees with host oracle in {bad} cells");
+        eprintln!("STAGE B (v2) PASSED: {mm}x{nn}x{kk} matches host Q8_0 (max rel {maxrel:.2e})");
+    }
+
     /// Phase 7 / Stage B GO/NO-GO microbench: time the tiled Q8_0 MMQ against the
     /// current `gemm_dev_f16` (cuBLASLt f16, the path it would replace) at a pp512
     /// prefill matmul shape. The decision number for whether int8 MMQ justifies
@@ -3039,6 +3205,21 @@ extern "C" __global__ void mmq_q8_0_tiled(
             shared_mem_bytes: 0,
         };
         let (mi, ni, ki) = (rows as i32, oc as i32, ic as i32);
+
+        // v2 (register-blocked, 64x64 tile, 128-K stage) — the tuning pass.
+        let opts2 = cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_120"),
+            ..Default::default()
+        };
+        let ptx2 = cudarc::nvrtc::compile_ptx_with_opts(MMQ_Q8_0_V2_SRC, opts2).expect("compile v2");
+        let module2 = b.ctx.load_module(ptx2).expect("module2");
+        let f2 = module2.load_function("mmq_q8_0_v2").expect("fn2");
+        let cfg2 = LaunchConfig {
+            grid_dim: ((oc / 64) as u32, (rows / 64) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut cd2 = st.alloc_zeros::<f32>(rows * oc).unwrap();
 
         // --- f16 baseline: pack a Q8_0 QMatrix + an f16 activation for gemm_dev_f16 ---
         let mut packed = vec![0u8; oc * nblk * 34];
@@ -3104,11 +3285,44 @@ extern "C" __global__ void mmq_q8_0_tiled(
         st.synchronize().unwrap();
         let f16_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
 
+        // v2: correctness cross-check vs f16, then time.
+        {
+            let mut lb = st.launch_builder(&f2);
+            lb.arg(&qad).arg(&dad).arg(&qwd).arg(&dwd).arg(&mut cd2).arg(&mi).arg(&ni).arg(&ki);
+            unsafe { lb.launch(cfg2) }.expect("launch");
+        }
+        st.synchronize().unwrap();
+        let cm2: Vec<f32> = st.clone_dtoh(&cd2).unwrap();
+        let (mut e2b, mut r2b) = (0f64, 0f64);
+        for (m, f) in cm2.iter().zip(&cb) {
+            e2b += (*m - *f) as f64 * (*m - *f) as f64;
+            r2b += *f as f64 * *f as f64;
+        }
+        let rel2 = (e2b / r2b).sqrt();
+        assert!(rel2 < 0.05, "v2 MMQ vs f16 diverge: rel L2 {rel2}");
+        for _ in 0..5 {
+            let mut lb = st.launch_builder(&f2);
+            lb.arg(&qad).arg(&dad).arg(&qwd).arg(&dwd).arg(&mut cd2).arg(&mi).arg(&ni).arg(&ki);
+            unsafe { lb.launch(cfg2) }.expect("launch");
+        }
+        st.synchronize().unwrap();
+        let t = Instant::now();
+        for _ in 0..reps {
+            let mut lb = st.launch_builder(&f2);
+            lb.arg(&qad).arg(&dad).arg(&qwd).arg(&dwd).arg(&mut cd2).arg(&mi).arg(&ni).arg(&ki);
+            unsafe { lb.launch(cfg2) }.expect("launch");
+        }
+        st.synchronize().unwrap();
+        let v2_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
         eprintln!(
-            "STAGE B BENCH {rows}x{oc}x{ic} (rel L2 {rel:.4}): tiled-MMQ {mmq_ms:.3} ms, \
-             f16 cuBLASLt {f16_ms:.3} ms => {:.2}x {}",
+            "STAGE B BENCH {rows}x{oc}x{ic}: f16 cuBLASLt {f16_ms:.3} ms (1.00x baseline)\n  \
+             naive-MMQ {mmq_ms:.3} ms => {:.2}x vs f16 (rel L2 {rel:.4})\n  \
+             tuned-MMQ {v2_ms:.3} ms => {:.2}x vs f16 (rel L2 {rel2:.4}); \
+             tuning lifted MMQ {:.2}x ({mmq_ms:.3} -> {v2_ms:.3} ms)",
             f16_ms / mmq_ms,
-            if f16_ms > mmq_ms { "(MMQ faster)" } else { "(f16 faster)" }
+            f16_ms / v2_ms,
+            mmq_ms / v2_ms,
         );
     }
 
