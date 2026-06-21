@@ -37,8 +37,10 @@ and the prioritized list of work it points to. Measured 2026-06-16.
 
 llama.cpp: **CPU 5,890 · Vulkan 16,988 · CUDA 18,457**. rusty_llama's batched
 prefill helps but uses no tensor cores, so it is one to two orders of magnitude
-behind (synthetic prefill bench ~735 tok/s; the real-model figure isn't
-separable from the CLI but is far below llama.cpp regardless).
+behind. The batched prefill matmul is now register-tiled (each thread computes
+TN=4 output rows, every weight read once), lifting the synthetic f32 prefill bench
+~728 → ~2,170 tok/s (~3.0×) and real TinyLlama Q4_K_M prefill ~42 → ~207 tok/s
+(~4.9×) — still far below llama.cpp's tensor-core Vulkan/CUDA regardless.
 
 ## Why the gaps
 
@@ -48,7 +50,7 @@ separable from the CLI but is far below llama.cpp regardless).
   VNNI → AVX2 → scalar (roadmap #1, done). The residual gap is that llama.cpp's
   AVX2 quant kernels and threading are still better-tuned on this class of
   hardware.
-- **GPU (~8× decode, ~24× prefill):** the decisive factor is **tensor cores**.
+- **GPU (~8× decode, ~8× prefill):** the decisive factor is **tensor cores**.
   llama.cpp's Vulkan backend reports `matrix cores: NV_coopmat2` and its CUDA
   backend uses native `mma`; both exploit the RTX 5070 Ti's tensor cores (plus
   flash attention and years of kernel tuning). Our wgpu (v29) cooperative GEMV
@@ -151,7 +153,8 @@ separable from the CLI but is far below llama.cpp regardless).
    | rusty_llama — CUDA, naive attention + f32 weights | 744 tok/s | ~26× behind |
    | rusty_llama — CUDA, tiled attention + f32 weights | ~2,700 tok/s | ~7.3× behind |
    | rusty_llama — CUDA, tiled attention + f16 weights | ~3,560 tok/s | ~5.5× behind |
-   | rusty_llama — **CUDA, + batched KV download** | **~4,450 tok/s** | **~4.4× behind** |
+   | rusty_llama — **CUDA, + batched KV download** | ~4,450 tok/s | ~4.4× behind |
+   | rusty_llama — **CUDA, + conversion-kill (shared f16 narrow)** | **~5,230 tok/s** | **~3.8× behind** |
    | llama.cpp — CUDA (`llama-bench`, fresh) | **19,637 tok/s** | — |
 
    Three changes closed most of the gap from the first cut's ~26×. (1) Replacing
@@ -170,14 +173,15 @@ separable from the CLI but is far below llama.cpp regardless).
    GEMM scratch) left the real model ~unchanged (**~4,500 tok/s**) but lifted the
    small synthetic 4-layer proxy **16.7k → 25k** — i.e. **real-model prefill is now
    compute-bound** (per-op overhead is a small fraction of the big GEMMs), while
-   op-heavy small models still gained. Now **~4.4× behind llama.cpp**, correctness
+   op-heavy small models still gained. A later conversion-kill (sharing the per-norm f16 narrow across q/k/v and w1/w3) lifted real-model pp512 ~4,671 → ~5,230 t/s. Now **~3.8× behind llama.cpp**, correctness
    held throughout (per-op parity + prefill/decode coherence, rel L2 ≤6e-4). The
    CPU prefill baseline here is unreliable (laptop thermal throttling under
    sustained GPU load), so CUDA-vs-llama.cpp is the meaningful comparison.
 
-   The residual ~4.4× on real-model prefill is now in **GEMM/kernel compute
-   efficiency** (cuBLASLt + our nvrtc kernels vs llama.cpp's tuned, fused kernels),
-   not overhead — further prefill gains are diminishing without beating cuBLASLt.
+   The residual ~3.8× on real-model prefill is now the **f16-cuBLAS-vs-int8-MMQ**
+   structural gap (llama.cpp doesn't use cuBLAS for quantized prefill), not overhead.
+   The L7 gate confirmed a header-free int8 tensor-core `mma.sync` is feasible on
+   sm_120 (`probe_int8_mma_ptx`), but the full per-sub-block MMQ kernel is not yet built.
 
    **Decode (`tg128`) — packed-weight DP4A GEMV (Phase 2, adopted).**
    `CudaBackend::forward_step` runs a resident single-token decode (KV cache +
@@ -195,8 +199,9 @@ separable from the CLI but is far below llama.cpp regardless).
    | --- | ---: | --- |
    | rusty_llama — CPU | ~50 tok/s | — |
    | rusty_llama — CUDA (resident, **f16** GEMV) | ~86 tok/s | 1.7× CPU |
-   | rusty_llama — **CUDA (resident, packed DP4A)** | **~207 tok/s** | **2.4× over f16** |
-   | llama.cpp — CUDA (`llama-bench`) | ~415 tok/s | ~2.0× ahead |
+   | rusty_llama — **CUDA (resident, packed DP4A)** | ~207 tok/s | 2.4× over f16 |
+   | rusty_llama — **CUDA (resident, DP4A + captured CUDA graph)** | **~275 tok/s** | — |
+   | llama.cpp — CUDA (`llama-bench`) | ~415 tok/s | **~1.5× ahead** |
 
    The per-GEMV microbench (`bench_decode_gemv_quant_vs_f16`) shows **3.5–4.2×**
    at the decode shapes — the full bandwidth ratio; end-to-end is 2.4× because the
@@ -208,7 +213,9 @@ separable from the CLI but is far below llama.cpp regardless).
    `RUSTY_LLAMA_CUDA_NO_QGEMV`. Correctness: integer-core parity vs the CPU dot +
    multi-step / prefill→decode coherence (rel L2 ≤6e-4). **Phase 2.2** also made
    the prefill→decode KV handoff device-resident (the one-time host round-trip is
-   gone). The residual ~2× to llama.cpp is **GEMV/kernel tuning** — flash
+   gone). **Phase 6.2** then captured the per-step kernel sequence into a CUDA graph
+   (replayed per token on a capturable non-NULL stream), lifting decode to ~275 t/s.
+   The residual ~1.5× to llama.cpp is **GEMV/kernel tuning** — flash
    attention (item 4) was measured decode-neutral, ruling attention out as the
    residual decode cost.
 4. **Flash (online-softmax) attention — DONE (Phase 5.2), decode-neutral.** A

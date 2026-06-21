@@ -2,7 +2,7 @@
 
 ## Summary
 
-`rusty_llama` is a from-scratch Llama inference engine in Rust — "llama.cpp, the
+`rusty_llama` is a from-scratch Llama-family inference engine in Rust (Llama, Qwen2, Phi-3, Gemma2, and Mixtral / Qwen2-MoE) — "llama.cpp, the
 Rust way." It loads Karpathy llama2.c checkpoints **and** GGUF files, and runs the
 Llama-family transformer (RMSNorm, RoPE incl. YaRN/llama3 scaling, grouped-query
 attention, SwiGLU FFN). The whole design turns on one abstraction: a single
@@ -155,8 +155,8 @@ TinyLlama-1.1B Q4_K_M, Core Ultra 9 285H + RTX 5070 Ti (Blackwell), vs llama.cpp
 |---|---|---:|---:|---|
 | CPU | decode tok/s | 49.8 (AVX2) | 73.6 | 1.48× |
 | wgpu | decode tok/s | 45.9 | 375.9 (Vulkan) | 8.2× |
-| CUDA | prefill pp512 tok/s | ~4,450 | 19,637 | ~4.4× |
-| CUDA | decode tg128 tok/s | ~123 | 419 | ~3.4× |
+| CUDA | prefill pp512 tok/s | ~5,230 | 19,637 | ~3.8× |
+| CUDA | decode tg128 tok/s | ~289 | 415 | ~1.4× |
 
 The decode gap is weight **bandwidth** (we stream f16 ≈2 B/weight vs Q4_K ≈0.56);
 the prefill gap is GEMM kernel quality (cuBLASLt vs llama.cpp's fused MMQ). Full
@@ -178,7 +178,7 @@ analysis + roadmap in `09-status-and-roadmap.md`.
 
 ## Status & known gaps (brief)
 
-Single architecture (Llama family), single sequence (no batching/server), four
+Six architectures (Llama, Qwen2, Phi-3, Gemma2, + Mixtral / Qwen2-MoE), single sequence (no batching/server), four
 sampler behaviors, six quant types consumed (no quantize-to-disk). The CUDA
 backend is the speed frontier (prefill at the cuBLASLt wall, decode at the f16
 bandwidth wall). The honest, ROI-ranked treatment — plus the doc-drift items this

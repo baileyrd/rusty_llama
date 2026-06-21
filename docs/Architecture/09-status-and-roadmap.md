@@ -4,9 +4,10 @@
 
 Where `rusty_llama` actually stands today, what the roadmap has burned down, the
 current head-to-head numbers, and what's worth doing next. The CPU path is mature
-(within 1.48× of llama.cpp); the wgpu and CUDA backends are built and merged; the
-tensor-core CUDA backend is the speed frontier (prefill ~4.4× behind at the
-cuBLASLt wall, decode ~3.4× behind at the f16-bandwidth wall). The high-ROI
+(within ~1.35× of llama.cpp); the wgpu and CUDA backends are built and merged; the
+tensor-core CUDA backend is the speed frontier (prefill ~3.0–3.8× behind, the
+f16-cuBLAS-vs-int8-MMQ gap; decode ~1.3–1.5× behind after the packed-DP4A GEMV +
+CUDA-graph capture closed the bandwidth wall). The high-ROI
 bounded-effort speed levers are largely spent; the open question is **breadth vs
 the one remaining decode lever** — covered here and, from the llama.cpp side, in
 `../Research/09-rusty-llama-gap-analysis.md`.
@@ -39,13 +40,13 @@ TinyLlama-1.1B Q4_K_M; Core Ultra 9 285H (AVX2, no AVX-512) + RTX 5070 Ti
 |---|---|---:|---:|---|
 | CPU | decode | 49.8 tok/s | 73.6 | **1.48×** behind |
 | wgpu | decode | 45.9 tok/s | 375.9 (Vulkan) | 8.2× behind |
-| CUDA | prefill (pp512) | ~4,450 tok/s | 19,637 | **~4.4×** behind |
-| CUDA | decode (tg128) | **~207 tok/s** | ~415 | **~2.0×** behind |
+| CUDA | prefill (pp512) | ~5,230 tok/s | 19,637 | **~3.0–3.8×** behind |
+| CUDA | decode (tg128) | **~275 tok/s** | ~415 | **~1.3–1.5×** behind |
 
 Two distinct walls (see `04` and `../Research/03-cuda-kernels.md`):
-- **Decode ~2× (was ~3.4×) — bandwidth wall closed (Phase 2).** The packed
+- **Decode ~1.3–1.5× (was ~3.4×) — bandwidth wall closed (Phase 2), then CUDA-graph capture.** The packed
   Q4_K/Q6_K `__dp4a` GEMV streams ~0.56 B/weight vs f16's ~2 B — CUDA decode
-  86 → 207 tok/s same-session (2.4×). The residual ~2× is kernel/GEMV tuning — **flash attention (Phase 5.2) was measured decode-neutral**, confirming attention is not the decode bottleneck.
+  86 → 207 tok/s same-session (2.4×); capturing the per-step kernel sequence into a CUDA graph (6.2) then lifted it to ~275 tok/s. The residual is launch-ramp/GEMV overhead, not GEMV-internal — **flash attention (Phase 5.2) was measured decode-neutral**, confirming attention is not the decode bottleneck.
 - **Prefill ~4.4× = GEMM kernel quality.** cuBLASLt `Matmul<f16>` + our nvrtc
   kernels vs llama.cpp's fused int8 tensor-core MMQ. Now compute-bound (per-op
   overhead already cut), so further gains require beating cuBLASLt.
@@ -133,10 +134,9 @@ From `PERFORMANCE.md`, unchanged by this capture: matching llama.cpp's raw
 throughput is a treadmill — a mature, tensor-core-tuned, perpetually-moving
 target an ~11k-LOC from-scratch engine won't out-run. The worthwhile goal is to
 **close the glaring, bounded-effort gaps while staying legible**, and to add
-**user-visible breadth** where it's cheap. The CPU AVX2 work (1.48× behind) and
-the merged CUDA backend (3.4–4.4× behind, down from 8–26×) are that goal
-executed; the remaining moves are breadth (Tier 1/3) and the single bounded
-decode lever (Tier 2).
+**user-visible breadth** where it's cheap. The CPU AVX2 work (~1.35–1.48× behind) and
+the merged CUDA backend (~1.3–3.8× behind, down from 8–26×) are that goal
+executed; the remaining moves are breadth (Tier 1/3) and the prefill int8-MMQ lever.
 
 ─────────────────────────────────────────────────────────────────────────────
 

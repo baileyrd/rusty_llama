@@ -68,7 +68,7 @@ Each op is its own WGSL module (its own `@group(0)` bindings; they cannot be mer
 | `WGSL_SWIGLU` | `:109` | `hb[i]=silu(hb[i])*hb2[i]`, `silu=v·σ(v)` | `ceil(n/64)` × 64 |
 | `WGSL_ROPE` | `:124` | RoPE rotate q/k pairs; partial rotary (`ph>=n_freqs` skipped) + `mscale`; k only while `i<kv_dim` | `ceil(dim/2/64)` × 64 |
 | `WGSL_ATTENTION` | `:153` | one wg/head: scaled scores vs every cached key, max-subtracted softmax (`storageBarrier` at `:210`), value-weighted sum | `n_heads` wg × 64 |
-| `WGSL_MATMUL_BATCH` | `:231` | batched f32 GEMV, out `(n,rows)` row-major | 2-D `[ceil(rows/64), n]` × 64 |
+| `WGSL_MATMUL_BATCH` | `:231` | batched f32 GEMV, **register-tiled `TN=4` over the batch** (each weight read once, reused across 4 rows; `:239-242`), out `(n,rows)` row-major | 2-D `[ceil(rows/64), ceil(n/4)]` × 64 |
 | `WGSL_RMSNORM_BATCH` | `:253` | one wg per batch row | `rows` wg × 256 |
 | `WGSL_ROPE_BATCH` | `:280` | 2-D: pair within head × batch row, abs pos `pos_base+r` | `[ceil(q_dim/2/64), rows]` × 64 |
 | `WGSL_ATTENTION_BATCH` | `:314` | one thread/(row,head), causal **online (running-max) softmax**, no score buffer; `array<f32,128>` accumulator → `head_size<=128` only (`MAX_BATCH_HEAD`, `:355`) | `[ceil(rows·n_heads/64),1]` × 64 |
@@ -96,7 +96,7 @@ The defining trick: quantized weights are uploaded as their **raw block bytes** 
 - **Q4_K** (`:534`): 144-byte superblocks of 256 = 8 output chunks of 32. For chunk `oc`: sub-block scale/min via `scale_min_k4(oc)`, nibble high/low by `oc&1`, `acc += (d·sc·nib - dmin·mn)·x` (`:549-565`). Mirrors `quant::block_q4_k`.
 - **Q6_K** (`:628`): 210-byte superblocks (128B `ql`, 64B `qh`, 16 signed-i8 scales, f16 `d`). Per chunk: 4-bit `ql` nibble + 2-bit `qh` → signed `q-32`, signed sub-scale, `acc += d·sc·q·x` (`:643-665`). Mirrors `quant::block_q6_k`.
 
-`_BATCH` variants run a 2-D grid (x = output feature, y = batch row) with the dequant inlined per row (`dot_q4k_row` `:583`, `dot_q6k_row` `:683`).
+`_BATCH` variants run a 2-D grid (x = output feature, y = batch-row **tile**) and are **register-tiled `TN=4`**: each weight nibble is dequantized **once** and dotted against 4 activation rows, so weight bytes and dequant work are amortized across the tile (`dot_q4k_tile` `:618`, `dot_q6k_tile` `:739`).
 
 ### 4b. int8 (DP4A) path — `dot4I8Packed`
 

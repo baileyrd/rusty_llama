@@ -3,7 +3,7 @@
 ## Summary
 
 `rusty_llama` reads ggml's blocked quantization formats and runs matmuls directly on the
-compressed bytes. The module `src/quant.rs` (≈1590 lines) owns the whole stack: the
+compressed bytes. The module `src/quant.rs` (≈1850 lines) owns the whole stack: the
 `GgmlType` enum and its block geometry, per-block dequantizers, two activation quantizers
 (`Q8Activation` block-32 and `Q8KActivation` block-256), and four integer dot kernels
 (`vec_dot_q8_0/q4_0/q4_k/q6_k`) with a scalar reference, an AVX2 fast path, and an
@@ -299,7 +299,7 @@ out, and `docs/Architecture/01-model-and-forward-pass.md` for where weights are 
 
 ## Testing
 
-`#[cfg(test)] mod tests` (`src/quant.rs:1016`) covers, with `path:line`:
+`#[cfg(test)] mod tests` covers, with `path:line`:
 - **Round-trips**: `f16_roundtrip_simple_values` (`:1021`), `q8_0_roundtrip` (`:1029`),
   `q4_k_constant_block` (`:1040`), `q6_k_constant_block` (`:1053`, exercises signed scale).
 - **Length validation**: `rejects_bad_lengths` (`:1067`).

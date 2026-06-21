@@ -1253,10 +1253,13 @@ fn graph_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("RUSTY_LLAMA_CUDA_NO_GRAPH").is_err())
 }
 
-// The matmuls run on cuBLASLt (f16 tensor cores); every other op delegates to
-// the CPU backend. `forward_prefill` drives all its GEMMs through
-// `matmul`/`matmul_batch`, so this captures the prefill tensor-core win. (Decode
-// via `forward_step` still runs entirely on the CPU — see that method.)
+// Per-op trait surface: the matmuls run on cuBLASLt (f16 tensor cores) and the
+// elementwise/norm ops delegate to the CPU backend. `forward_prefill` drives all
+// its GEMMs through `matmul`/`matmul_batch`, so it captures the prefill tensor-core
+// win. Decode is NOT this path: `forward_step` (below) is a fully on-device resident
+// loop — KV cache + activations stay on the GPU across steps, weights are dot-producted
+// with packed `__dp4a` GEMVs, and the per-step kernel sequence is captured into a CUDA
+// graph and replayed. (Only non-dense/MoE archs fall back to the generic per-op path.)
 impl Backend for CudaBackend {
     fn rmsnorm(&self, out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
         self.cpu.rmsnorm(out, x, weight, eps);
