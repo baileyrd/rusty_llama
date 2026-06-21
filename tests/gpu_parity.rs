@@ -193,6 +193,80 @@ fn bench_prefill_gpu_real() {
     );
 }
 
+/// R5.3 quality probe: does the CPU's int8 (Q8_K per-256-block) activation actually
+/// cost output quality vs the f32-exact GPU reference, or are the ~3.5% logit
+/// divergences just near-tie flips? Measures perplexity (lower = better predicts real
+/// text) and the argmax-flip rate on real English. Gated on the GGUF + a GPU.
+#[test]
+#[ignore = "R5.3 quality probe; needs GGUF + GPU"]
+fn cpu_int8_quality_vs_f32() {
+    let path = std::env::var("RUSTY_LLAMA_GGUF")
+        .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".into());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skip: {path} not found");
+        return;
+    }
+    let Some(g) = gpu() else { return };
+    let bytes = std::fs::read(&path).unwrap();
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    let tok = Tokenizer::from_gguf(&gguf).unwrap();
+    let text = "The history of artificial intelligence began in antiquity, with myths and \
+        stories of artificial beings endowed with intelligence by master craftsmen. Modern \
+        machine learning lets computers improve at tasks through experience rather than \
+        following explicit rules written by a programmer.";
+    let tokens = tok.encode(text, true, false);
+    let n = tokens.len();
+    assert!(n >= 16, "need enough tokens, got {n}");
+
+    // Mean negative log-likelihood of the actual next token (perplexity = exp(NLL))
+    // + the per-position argmax, from a token-at-a-time forward.
+    let run = |backend: &dyn Backend| -> (f64, Vec<usize>) {
+        let mut s = RunState::new(&model.config);
+        let mut nll = 0.0f64;
+        let mut cnt = 0usize;
+        let mut am = Vec::with_capacity(n);
+        for pos in 0..n {
+            forward(&model, &mut s, backend, tokens[pos], pos);
+            let logits = s.logits();
+            am.push(argmax(logits));
+            if pos + 1 < n {
+                let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let denom: f64 = logits.iter().map(|&l| ((l - mx) as f64).exp()).sum();
+                let logp = ((logits[tokens[pos + 1]] - mx) as f64) - denom.ln();
+                nll += -logp;
+                cnt += 1;
+            }
+        }
+        (nll / cnt as f64, am)
+    };
+    let (cpu_nll, cpu_am) = run(&CpuBackend::new());
+    let (gpu_nll, gpu_am) = run(&g);
+    let flips = cpu_am.iter().zip(&gpu_am).filter(|(a, b)| a != b).count();
+    eprintln!(
+        "n={n} | CPU(int8) ppl={:.3} (nll {:.4}) | GPU(f32) ppl={:.3} (nll {:.4})",
+        cpu_nll.exp(),
+        cpu_nll,
+        gpu_nll.exp(),
+        gpu_nll
+    );
+    eprintln!(
+        "argmax CPU-vs-GPU differs at {}/{} positions ({:.1}%)",
+        flips,
+        n,
+        100.0 * flips as f64 / n as f64
+    );
+    // R5.3 resolution: the int8 path is quality-neutral — perplexity matches the f32
+    // reference within noise (measured ~0.2%). Guard against a future int8-accuracy
+    // regression: CPU NLL must stay within 5% of the f32 NLL. (Greedy tokens can still
+    // differ on near-ties — that's expected and not a quality loss.)
+    let rel = (cpu_nll - gpu_nll).abs() / gpu_nll;
+    assert!(
+        rel < 0.05,
+        "CPU int8 perplexity drifted {rel:.3} from f32 — int8 accuracy regression?"
+    );
+}
+
 /// Proves the wgpu **Q4_K/Q6_K matmul is numerically exact**: it matches the true f32
 /// dequant dot (`dequant_row` + f32 dot — the same dequant the shader does) to f32
 /// precision. This is the R5.3 resolution — the GPU is correct; the GPU-vs-CPU
