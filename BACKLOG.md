@@ -382,10 +382,13 @@ Ordered by ROI (value ÷ effort).
   the CPU's int8 fast path quantizes activations to **Q8_K (per-256-block)**, losing ~0.3% per
   matmul which compounds over 22 layers to flip the argmax. (Q8_0 matched because it uses fine
   per-32-block Q8.) So the README's "byte-identical" cross-backend claim was wrong (fixed); the
-  GPU side has a proper exactness test now. **Real residual (separate, optional):** the CPU
-  int8 path is ~0.3%/matmul less accurate than f32 on k-quants — a deliberate speed tradeoff
-  (llama.cpp makes the same choice); finer activation blocking would tighten it if CPU k-quant
-  accuracy ever matters.
+  GPU side has a proper exactness test now. **Residual quality question — investigated, it's
+  a NON-ISSUE.** The CPU int8 path is ~0.3%/matmul less accurate than f32, but does that cost
+  output quality? Measured perplexity on real English (TinyLlama Q4_K_M): **CPU(int8) 63.82 vs
+  GPU(f32) 64.39 — identical within noise** (NLL 4.156 vs 4.165, ~0.2%), and only 1/51 (2%)
+  greedy tokens differ between backends (near-ties). So the int8 fast path is quality-neutral;
+  the cross-backend greedy divergence is cosmetic, not a regression. Guarded by
+  `cpu_int8_quality_vs_f32` (asserts CPU perplexity stays within 5% of f32). Thread closed.
 
 ### R6 — Documentation (open item 6.x — confirmed)
 
