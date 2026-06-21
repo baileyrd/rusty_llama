@@ -112,6 +112,88 @@ fn prefill_matches_cpu() {
     }
 }
 
+/// Real Q4_K_M model parity — the synthetic builder only emits F32/Q8_0, so this is
+/// the only coverage for the tiled **Q4_K and Q6_K** batch matmul shaders. Gated on
+/// the GGUF being present (`RUSTY_LLAMA_GGUF` or the default TinyLlama path) and a
+/// GPU; skips cleanly otherwise.
+#[test]
+fn prefill_matches_cpu_real_kquant() {
+    let path = std::env::var("RUSTY_LLAMA_GGUF")
+        .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".into());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skipping real-model k-quant parity: {path} not found");
+        return;
+    }
+    let Some(g) = gpu() else { return };
+    let bytes = std::fs::read(&path).unwrap();
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    let tokens: Vec<usize> = vec![1, 22, 333, 444, 555, 666, 777, 888];
+
+    let logits = |backend: &dyn Backend| -> Vec<f32> {
+        let mut s = RunState::new(&model.config);
+        forward_prefill(&model, &mut s, backend, &tokens, 0);
+        s.logits().to_vec()
+    };
+    let cpu = logits(&CpuBackend::new());
+    let gpu_l = logits(&g);
+
+    assert!(gpu_l.iter().all(|v| v.is_finite()));
+    // Relative L2 across the vocab (real-model logits are large, so an absolute
+    // bound isn't meaningful; cf. the CUDA coherence tests). A dequant/index bug in
+    // the tiled k-quant shaders would corrupt the argmax, so assert that too.
+    let num: f32 = cpu.iter().zip(&gpu_l).map(|(a, b)| (a - b) * (a - b)).sum();
+    let den: f32 = cpu.iter().map(|a| a * a).sum::<f32>().max(1e-12);
+    let rel = (num / den).sqrt();
+    eprintln!(
+        "real Q4_K_M prefill: argmax cpu={} gpu={} rel-L2={rel}",
+        argmax(&cpu),
+        argmax(&gpu_l)
+    );
+    // Regression guard for the tiled Q4_K/Q6_K batch shaders. NOTE: the wgpu *batched
+    // prefill* already diverges from the CPU on real k-quant models (rel-L2 ~3.5%,
+    // and the greedy token can differ) — a PRE-EXISTING issue, not caused by tiling.
+    // (Verified: tiling preserves per-output FMA order, so tiled output is bit-
+    // identical to the untiled shader — same rel-L2 to 8 sig figs.) So we can't
+    // assert CPU argmax parity here; instead bound rel-L2 so a gross tiling bug
+    // (NaN / wrong index / ~50% error) is still caught. Tightening this to argmax
+    // parity is blocked on fixing the pre-existing wgpu k-quant prefill divergence.
+    assert!(gpu_l.iter().all(|v| v.is_finite()));
+    assert!(rel < 0.05, "real Q4_K_M prefill rel-L2 {rel} — tiling regression?");
+}
+
+/// Timing bench for the wgpu batched prefill on the real Q4_K_M model (Q4_K + Q6_K
+/// shaders). Ignored by default; run with:
+///   cargo test --release --features gpu --test gpu_parity -- --ignored --nocapture bench_prefill_gpu_real
+/// A/B the tiling with `git stash push src/backend/gpu.rs`.
+#[test]
+#[ignore = "timing benchmark; needs the GGUF + a GPU"]
+fn bench_prefill_gpu_real() {
+    let path = std::env::var("RUSTY_LLAMA_GGUF")
+        .unwrap_or_else(|_| "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".into());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skip: {path} not found");
+        return;
+    }
+    let Some(g) = gpu() else { return };
+    let bytes = std::fs::read(&path).unwrap();
+    let gguf = Gguf::parse(&bytes).unwrap();
+    let model = Model::from_gguf(&gguf).unwrap();
+    let n = 512usize;
+    let tokens: Vec<usize> = (0..n).map(|i| (i * 7 + 3) % model.config.vocab_size).collect();
+    let mut s = RunState::new(&model.config);
+    // warmup (uploads + caches weights on device), then a timed prefill.
+    forward_prefill(&model, &mut s, &g, &tokens, 0);
+    let t = std::time::Instant::now();
+    forward_prefill(&model, &mut s, &g, &tokens, 0);
+    let dt = t.elapsed();
+    eprintln!(
+        "wgpu prefill pp{n}: {:?} -> {:.0} tok/s",
+        dt,
+        n as f64 / dt.as_secs_f64()
+    );
+}
+
 /// The fused on-device decode step (with the prefill→decode KV sync) must track
 /// the CPU forward and pick the same next token, for F32 and Q8_0.
 #[test]
