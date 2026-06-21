@@ -441,6 +441,11 @@ fn gemma2_loads_softcaps_and_sandwich_norms() {
     assert_eq!(model.config.embd_scale, (c.dim as f32).sqrt());
     assert_eq!(model.config.attn_logit_softcap, 50.0);
     assert_eq!(model.config.final_logit_softcap, 30.0);
+    // The synthetic GGUF omits `attention.sliding_window`, so Gemma2 falls back to
+    // llama.cpp's hardcoded default (4096), applied to even (SWA) layers only.
+    assert_eq!(model.config.sliding_window, 4096);
+    assert_eq!(model.config.attn_window(0), 4096);
+    assert_eq!(model.config.attn_window(1), 0);
     // "Sandwich" post-attention / post-FFN norms are present.
     assert_eq!(model.weights.rms_attn_post.len(), c.n_layers * c.dim);
     assert_eq!(model.weights.rms_ffn_post.len(), c.n_layers * c.dim);

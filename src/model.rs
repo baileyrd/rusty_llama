@@ -256,12 +256,14 @@ impl<'a> Model<'a> {
         let final_logit_softcap = gguf.meta_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
 
         // Gemma2 interleaved sliding-window attention: even layers attend only to
-        // the last `sliding_window` keys (GGUF `attention.sliding_window`, 4096).
-        // Absent key → 0 → full causal on every layer. See `Config::attn_window`.
+        // the last `sliding_window` keys. Read from GGUF `attention.sliding_window`;
+        // when the key is absent it defaults to 4096 for Gemma2 (llama.cpp hardcodes
+        // `n_swa = 4096` then overrides from the key) and 0 (full causal) otherwise.
+        // See `Config::attn_window`.
         let sliding_window = gguf
             .meta_u64(&key("attention.sliding_window"))
             .map(|v| v as usize)
-            .unwrap_or(0);
+            .unwrap_or(if matches!(arch, Arch::Gemma2) { 4096 } else { 0 });
 
         // Gemma2 divides the attention scores by sqrt(query_pre_attn_scalar),
         // which differs from sqrt(head_size) on Gemma2-27B (144 vs 128). The
