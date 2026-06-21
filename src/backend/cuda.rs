@@ -157,7 +157,7 @@ extern "C" __global__ void kv_append(float* cache, const float* row,
 extern "C" __global__ void attention_kernel(float* out, const float* q,
         const float* kcache, const float* vcache,
         int rows, const int* pos_base, int n_heads, int kv_mul, int head_size,
-        int seq_len, int kv_dim) {
+        int kv_dim) {
     int idx = blockIdx.x;
     if (idx >= rows * n_heads) return;
     int r = idx / n_heads, h = idx % n_heads;
@@ -1018,15 +1018,13 @@ impl CudaBackend {
         n_heads: usize,
         kv_mul: usize,
         head_size: usize,
-        seq_len: usize,
         kv_dim: usize,
     ) {
-        let (rows_i, nh_i, kvm_i, hs_i, sl_i, kv_i) = (
+        let (rows_i, nh_i, kvm_i, hs_i, kv_i) = (
             rows as i32,
             n_heads as i32,
             kv_mul as i32,
             head_size as i32,
-            seq_len as i32,
             kv_dim as i32,
         );
         // One block per (row, head); 128 (power-of-two) threads cooperate, the
@@ -1049,7 +1047,6 @@ impl CudaBackend {
             .arg(&nh_i)
             .arg(&kvm_i)
             .arg(&hs_i)
-            .arg(&sl_i)
             .arg(&kv_i);
         unsafe { b.launch(cfg) }.expect("launch attention");
     }
@@ -1154,8 +1151,6 @@ impl CudaBackend {
     ) {
         let (dim, kv_dim, head_size, hidden) = (d.dim, d.kv_dim, d.head_size, d.hidden);
         let (n_heads, kv_mul, n_freqs, mscale) = (d.n_heads, d.kv_mul, d.n_freqs, d.mscale);
-        // Unused by the attention kernel (it derives the causal bound from `pos`).
-        let seq_len = d.seq_len;
         for layer in 0..d.n_layers {
             // --- Attention (batch-1 GEMVs) ---
             self.dev_rmsnorm(&mut d.xb, &d.x, &d.rms_att[layer], 1, dim, eps);
@@ -1193,7 +1188,7 @@ impl CudaBackend {
             self.dev_kv_append(&mut d.value[layer], &d.v_row, &d.pos_dev, kv_dim);
             self.dev_attention(
                 &mut d.xb, &d.q, &d.key[layer], &d.value[layer], 1, &d.pos_dev, n_heads, kv_mul,
-                head_size, seq_len, kv_dim,
+                head_size, kv_dim,
             );
             if q_dim_ok {
                 self.dev_quantize_q8k(&mut d.aq, &mut d.ad, &mut d.absums, &d.xb, dim);
@@ -1515,7 +1510,7 @@ impl Backend for CudaBackend {
             );
             self.dev_attention(
                 &mut xb, &q, &d.key[layer], &d.value[layer], n, &d.pos_dev, n_heads, kv_mul,
-                head_size, n, kv_dim,
+                head_size, kv_dim,
             );
             self.gemm_dev(&mut xb2, &xb, &w.wo[layer], n);
             self.dev_add(&mut x, &xb2, n * dim);
@@ -2204,7 +2199,7 @@ mod tests {
         let mut outd = b.stream.alloc_zeros::<f32>(n * dim).unwrap();
         let posd = b.stream.clone_htod(&[0i32]).unwrap();
         b.dev_attention(
-            &mut outd, &qd, &kcd, &vcd, n, &posd, n_heads, n_heads / n_kv_heads, head_size, seq_len,
+            &mut outd, &qd, &kcd, &vcd, n, &posd, n_heads, n_heads / n_kv_heads, head_size,
             kv_dim,
         );
         b.stream.synchronize().unwrap();
@@ -2241,7 +2236,7 @@ mod tests {
         let posd = b.stream.clone_htod(&[pos_base as i32]).unwrap();
         b.dev_attention(
             &mut outd, &qd, &kcd, &vcd, rows, &posd, n_heads, n_heads / n_kv_heads, head_size,
-            seq_len, kv_dim,
+            kv_dim,
         );
         b.stream.synchronize().unwrap();
         let got = b.stream.clone_dtoh(&outd).unwrap();
