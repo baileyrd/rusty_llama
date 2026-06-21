@@ -255,6 +255,14 @@ impl<'a> Model<'a> {
         let attn_logit_softcap = gguf.meta_f32(&key("attn_logit_softcapping")).unwrap_or(0.0);
         let final_logit_softcap = gguf.meta_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
 
+        // Gemma2 interleaved sliding-window attention: even layers attend only to
+        // the last `sliding_window` keys (GGUF `attention.sliding_window`, 4096).
+        // Absent key → 0 → full causal on every layer. See `Config::attn_window`.
+        let sliding_window = gguf
+            .meta_u64(&key("attention.sliding_window"))
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
         // Gemma2 divides the attention scores by sqrt(query_pre_attn_scalar),
         // which differs from sqrt(head_size) on Gemma2-27B (144 vs 128). The
         // backends bake in 1/sqrt(head_size), so we pre-scale q by
@@ -305,6 +313,7 @@ impl<'a> Model<'a> {
             attn_logit_softcap,
             final_logit_softcap,
             attn_scale_correction,
+            sliding_window,
             n_expert,
             n_expert_used,
             n_ff_exp,
@@ -909,6 +918,7 @@ impl Batch {
                     p.seq_len,
                     kv_dim,
                     p.attn_logit_softcap,
+                    p.attn_window(layer),
                 );
             }
             backend.matmul_batch(&mut self.xb2[..n * dim], &self.ao[..n * q_dim], &w.wo[layer], n);
@@ -1053,6 +1063,7 @@ pub fn forward_with(
             p.seq_len,
             kv_dim,
             p.attn_logit_softcap,
+            p.attn_window(layer),
         );
 
         backend.matmul(&mut state.xb2[..dim], &state.xb[..q_dim], &w.wo[layer]);
@@ -1272,6 +1283,7 @@ fn prefill_residual<B: Backend + ?Sized>(
             p.seq_len,
             kv_dim,
             p.attn_logit_softcap,
+            p.attn_window(layer),
         );
 
         backend.matmul_batch(&mut xb2, &ao, &w.wo[layer], n);

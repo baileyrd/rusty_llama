@@ -431,9 +431,14 @@ on breadth archs (never the TinyLlama path).
   `tokenizer.ggml.add_space_prefix` and always prepended the dummy space → different token
   ids than llama.cpp on GGUFs that disable it. Added the field (default true) + GGUF read +
   encode gate. Tested.
-- [ ] **D3 (C3) Gemma2 interleaved sliding-window attention (iSWA).** `cpu.rs` attention
-  always attends `0..=pos`; Gemma2 even layers cap at the last 4096 keys. Bit-identical
-  &lt;4096 tokens, divergent beyond. Needs a per-layer `n_swa` window mask. Documented as a
-  known long-context divergence; short-context Gemma2 unaffected.
+- [x] **D3 (C3) Gemma2 interleaved sliding-window attention (iSWA).** *(done 2026-06-21)*
+  `cpu.rs` attention always attended `0..=pos`; Gemma2 even layers cap at the last 4096 keys
+  (bit-identical &lt;4096 tokens, divergent beyond). Added `Config.sliding_window` (GGUF
+  `attention.sliding_window`) + `Config::attn_window(layer)` (window on Gemma2 even layers,
+  mirroring llama.cpp's `il % 2 == 0`), threaded a `window` param through
+  `Backend::attention`/`attention_batch`, and the CPU kernel now starts at `pos+1-window`
+  (== llama.cpp's `q_pos - k_pos >= n_swa` mask). wgpu/cuda fall back to CPU when
+  `window != 0`; `uses_resident_decode()` excludes `sliding_window > 0`. Tested
+  (`attention_sliding_window_excludes_old_keys`, `attn_window_follows_gemma2_interleave`).
 - [ ] **D4 Breadth gaps (not silent):** missing quant types (Q5_K/Q3_K/Q2_K/Q5_0/Q5_1/Q4_1/
   IQ/MXFP4/TQ — hard error at load), sharded-GGUF loading, non-hardcoded chat templates.

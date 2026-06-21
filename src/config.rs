@@ -105,6 +105,11 @@ pub struct Config {
     /// `1/sqrt(head_size)`. `1.0` for every model where they coincide; differs
     /// only on Gemma2-27B (`query_pre_attn_scalar` 144 vs `head_dim` 128).
     pub attn_scale_correction: f32,
+    /// Sliding-window attention size (GGUF `attention.sliding_window`). `0` =
+    /// full causal attention on every layer (every arch except Gemma2). Gemma2
+    /// sets it (4096) and applies it to even layers only — see
+    /// [`Config::attn_window`].
+    pub sliding_window: usize,
     /// Number of mixture-of-experts experts per FFN block. `0` = a dense FFN
     /// (every arch so far); `> 0` selects the routed MoE path (Mixtral).
     pub n_expert: usize,
@@ -143,6 +148,7 @@ impl Default for Config {
             attn_logit_softcap: 0.0,
             final_logit_softcap: 0.0,
             attn_scale_correction: 1.0,
+            sliding_window: 0,
             n_expert: 0,
             n_expert_used: 0,
             n_ff_exp: 0,
@@ -185,6 +191,18 @@ impl Config {
         self.n_heads / self.n_kv_heads
     }
 
+    /// Sliding-window size for `layer`'s attention, or `0` for full causal.
+    /// Gemma2 interleaves SWA: even layers attend only to the last
+    /// `sliding_window` keys, odd layers are global. Every other arch returns
+    /// `0`. Mirrors llama.cpp's Gemma2 per-layer pattern (`il % 2 == 0` is SWA).
+    #[inline]
+    pub fn attn_window(&self, layer: usize) -> usize {
+        match self.arch {
+            Arch::Gemma2 if layer.is_multiple_of(2) => self.sliding_window,
+            _ => 0,
+        }
+    }
+
     /// Whether this model is eligible for the fused, device-resident
     /// decode/prefill fast path (CUDA/GPU). Only dense Llama-graph models
     /// qualify; MoE models (Mixtral is `Arch::Llama` but routed) and the breadth
@@ -200,6 +218,9 @@ impl Config {
             // Today such models already fall back via logit-softcap, but this makes
             // the invariant explicit rather than relying on that coincidence.
             && self.attn_scale_correction == 1.0
+            // Sliding-window (Gemma2 iSWA) layers need the per-op attention,
+            // which applies the window; the resident kernels attend full-causal.
+            && self.sliding_window == 0
     }
 
     /// Number of dimensions RoPE rotates per head (`rope_dim`, or the full
@@ -521,5 +542,31 @@ mod tests {
         // 1/sqrt(head_size). Otherwise the correction would be silently dropped.
         c.attn_scale_correction = attn_scale_correction(128, 144.0);
         assert!(!c.uses_resident_decode());
+    }
+
+    #[test]
+    fn attn_window_follows_gemma2_interleave() {
+        // Gemma2 interleaves SWA: even layers use the window, odd layers global.
+        let g = Config {
+            arch: Arch::Gemma2,
+            sliding_window: 4096,
+            ..Default::default()
+        };
+        assert_eq!(g.attn_window(0), 4096);
+        assert_eq!(g.attn_window(2), 4096);
+        assert_eq!(g.attn_window(1), 0);
+        assert_eq!(g.attn_window(3), 0);
+
+        // A sliding window forces the per-op path even for an otherwise-eligible
+        // dense Llama (the resident kernels attend full-causal); and non-Gemma2
+        // archs ignore the window for attention entirely.
+        let mut l = Config {
+            arch: Arch::Llama,
+            ..Default::default()
+        };
+        assert!(l.uses_resident_decode());
+        l.sliding_window = 4096;
+        assert!(!l.uses_resident_decode());
+        assert_eq!(l.attn_window(0), 0);
     }
 }

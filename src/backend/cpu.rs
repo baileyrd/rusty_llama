@@ -374,6 +374,7 @@ impl Backend for CpuBackend {
         seq_len: usize,
         kv_dim: usize,
         logit_softcap: f32,
+        window: usize,
     ) {
         // Flash attention: a single streaming pass over the keys per head with an
         // online (running-max) softmax, so no `seq_len`-sized score buffer is
@@ -398,7 +399,15 @@ impl Backend for CpuBackend {
                 for o in out_h.iter_mut() {
                     *o = 0.0;
                 }
-                for t in 0..=pos {
+                // Sliding-window attention (Gemma2 SWA layers): attend only to
+                // the last `window` keys. 0 = full causal. Mirrors llama.cpp's
+                // `q_pos - k_pos >= n_swa` mask (keep when `pos - t < window`).
+                let t_start = if window != 0 && pos + 1 > window {
+                    pos + 1 - window
+                } else {
+                    0
+                };
+                for t in t_start..=pos {
                     let base = t * kv_dim + kv_off;
                     let k = &key_cache[base..base + head_size];
                     let mut s = f32_dot(q_h, k) * scale;
@@ -940,9 +949,44 @@ mod tests {
             1,
             2,
             0.0,
+            0,
         );
         approx(out[0], 3.0);
         approx(out[1], -4.0);
+    }
+
+    #[test]
+    fn attention_sliding_window_excludes_old_keys() {
+        // head_size 1, one head. Key 0 carries a huge score, so full causal
+        // attention is dominated by value[0]; a sliding window of 3 at pos 5 must
+        // attend only to keys 3..=5 and never see value[0] (Gemma2 iSWA).
+        let (hs, seq_len, kv_dim, pos) = (1usize, 8usize, 1usize, 5usize);
+        let q = [1.0f32];
+        let mut key_cache = vec![0.0f32; seq_len * kv_dim];
+        key_cache[0] = 10.0; // key 0 dominates the unwindowed softmax
+        let mut value_cache = vec![0.0f32; seq_len * kv_dim];
+        value_cache[0] = 1000.0;
+        value_cache[3] = 7.0;
+        value_cache[4] = 8.0;
+        value_cache[5] = 9.0;
+        let mut att = [0.0f32; 8];
+
+        // Full causal (window 0): value[0] dominates the output.
+        let mut out_full = [0.0f32; 1];
+        CpuBackend.attention(
+            &mut out_full, &q, &key_cache, &value_cache, &mut att, pos, 1, 1, hs, seq_len, kv_dim,
+            0.0, 0,
+        );
+        assert!(out_full[0] > 100.0, "full attention should see value[0]: {}", out_full[0]);
+
+        // Sliding window 3: keys 3..=5 only (their scores are 0 -> uniform), so the
+        // output is mean(7, 8, 9) = 8 — value[0] is masked out.
+        let mut out_win = [0.0f32; 1];
+        CpuBackend.attention(
+            &mut out_win, &q, &key_cache, &value_cache, &mut att, pos, 1, 1, hs, seq_len, kv_dim,
+            0.0, 3,
+        );
+        approx(out_win[0], 8.0);
     }
 
     #[test]
@@ -968,6 +1012,7 @@ mod tests {
             2,
             2,
             0.0,
+            0,
         );
         approx(out[0], 4.0); // mean(2, 6)
         approx(out[1], 6.0); // mean(4, 8)
@@ -1038,6 +1083,7 @@ mod tests {
                     seq_len,
                     kv_dim,
                     softcap,
+                    0,
                 );
                 for (o, w) in out.iter().zip(&reference(pos, softcap)) {
                     assert!((o - w).abs() < 1e-6, "flash {o} vs classic {w} (pos {pos} cap {softcap})");

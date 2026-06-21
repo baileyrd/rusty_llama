@@ -124,15 +124,23 @@ parity for those vocabs.
 the GGUF key, gating the dummy space in `encode`. Tested by
 `spm_add_space_prefix_toggles_dummy_space`.
 
-### C3. Gemma2 interleaved sliding-window attention (iSWA) not implemented — **documented**
-`cpu.rs:401` always attends `0..=pos`; there is no per-layer `n_swa` window.
-Gemma2's even layers attend only to the last 4096 keys. rusty is **numerically
-identical below 4096 tokens** (why 2B greedy validation passed) and **divergent
-beyond it**. Independently flagged by two finders.
+### C3. Gemma2 interleaved sliding-window attention (iSWA) not implemented — **FIXED**
+`cpu.rs` attention always attended `0..=pos`; there was no per-layer `n_swa`
+window. Gemma2's even layers attend only to the last 4096 keys. rusty was
+**numerically identical below 4096 tokens** (why 2B greedy validation passed) and
+**divergent beyond it**. Independently flagged by two finders.
 
-→ **Status:** documented here as a known long-context divergence (the full fix is
-a per-layer window mask + `n_swa` config field — out of scope for this small PR).
-Short-context Gemma2 is unaffected.
+→ **Fix (this PR):** added `Config.sliding_window` (GGUF
+`attention.sliding_window`) and `Config::attn_window(layer)` — `Some` window on
+Gemma2 even layers, 0 elsewhere, mirroring llama.cpp's `il % 2 == 0` SWA pattern.
+Threaded a `window: usize` param through `Backend::attention`/`attention_batch`;
+the CPU kernel starts its streaming pass at `max(0, pos+1-window)`, exactly
+llama.cpp's `q_pos - k_pos >= n_swa` mask. The wgpu/cuda kernels don't implement
+the window, so they fall back to the CPU attention when `window != 0` (Gemma2
+already takes the per-op path via its logit-softcap; `uses_resident_decode()` now
+also excludes any `sliding_window > 0` model, making the invariant explicit).
+Tested by `attention_sliding_window_excludes_old_keys` (the mask) and
+`attn_window_follows_gemma2_interleave` (the even/odd pattern + resident guard).
 
 ### C4–C6 (medium/low, breadth)
 - **Missing quant types** — `Q5_K, Q3_K, Q2_K, Q5_0, Q5_1, Q4_1`, all IQ/MXFP4/TQ
@@ -182,8 +190,7 @@ high-ROI work is the silent-correctness bucket, which is nearly free.
 
 1. **C1 — warn on unrecognized arch instead of silent Llama fallback.** ✅ done.
 2. **C2 — honor `add_space_prefix`.** ✅ done.
-3. **C3 — document Gemma2 iSWA as wrong >4096**, add `n_swa` mask when convenient.
-   📝 documented.
+3. **C3 — Gemma2 iSWA per-layer `n_swa` window mask.** ✅ done.
 4. **A1 — int8 Q4_K MMQ kernel (BACKLOG L7).** The *only* remaining real speed
    lever; primitive already banked. Large effort, known ceiling.
 5. Everything in D: leave it. f64 rmsnorm accumulation is the only one worth
