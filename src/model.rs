@@ -617,60 +617,128 @@ fn deq_tensor(gguf: &Gguf, name: &str) -> Result<Vec<f32>> {
     dequantize(info.ggml_type, gguf.tensor_bytes(info)?, info.n_elements())
 }
 
+/// Growth increment for [`KvCache`]'s lazy capacity (in positions). Chosen to
+/// keep relayout-copy events infrequent (a handful over a full context) while
+/// still bounding the worst case (a short generation on a long-context model)
+/// well below eagerly allocating the whole `max_seq_len` up front.
+const KV_PAGE: usize = 256;
+
 /// The transformer's key/value cache.
 ///
 /// PHASE-0 INVARIANT: holds exactly **one** sequence; the layout is the flat
-/// `(n_layers, seq_len, kv_dim)` buffer. All slot/window arithmetic lives here
-/// and nowhere else, so Phase 4 (paged, multi-sequence KV — see
-/// `docs/Architecture/plans/`) can repage these internals or add a `seq_id`
-/// dimension without touching `forward`/`forward_prefill` or the `Backend`
-/// trait. Returned slices are the exact ranges the old inline `loff`/`kv_at`
-/// arithmetic produced.
+/// `(n_layers, cap, kv_dim)` buffer, `cap` a lazily-grown capacity (<=
+/// `max_seq_len`, see [`KvCache::ensure_capacity`]) rather than eagerly
+/// `max_seq_len` from construction — the memory-efficiency half of Phase 4
+/// (paged, multi-sequence KV — see `docs/Architecture/plans/`); real
+/// multi-sequence sharing is a separate, larger follow-on. All slot/window
+/// arithmetic lives here and nowhere else, so `forward`/`forward_prefill` and
+/// the `Backend` trait don't change. Returned slices are the exact ranges the
+/// old inline `loff`/`kv_at` arithmetic produced, just against `cap` instead
+/// of a fixed `seq_len` — every per-op `Backend::attention`/`attention_batch`
+/// impl already only reads `key_cache[..(pos+1)*kv_dim]`, so a shorter (but
+/// `>= pos+1`) window is correct for them unchanged. The two backends that
+/// mirror the *whole* flat buffer onto a device for resident decode
+/// ([`RunState::key_cache`]/[`RunState::value_cache`], read together with
+/// [`RunState::kv_capacity`] for the current stride) are the ones that do
+/// need to know `cap` explicitly — see `backend/cuda.rs`/`backend/gpu.rs`'s
+/// prefill-KV upload, which computes its per-layer offset from
+/// [`KvCache::capacity`] rather than the model's `seq_len`.
 pub(crate) struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
-    seq_len: usize,
+    n_layers: usize,
+    /// Current per-layer capacity (positions); grows in [`KV_PAGE`]
+    /// increments, capped at `max_seq_len`.
+    cap: usize,
+    /// The model's context window — `cap` never exceeds this.
+    max_seq_len: usize,
     kv_dim: usize,
 }
 
 impl KvCache {
-    /// Allocate a zeroed cache for `n_layers` layers of `(seq_len, kv_dim)`.
-    fn new(n_layers: usize, seq_len: usize, kv_dim: usize) -> Self {
-        let cells = n_layers * seq_len * kv_dim;
+    /// Allocate a zeroed cache for `n_layers` layers, capacity starting at
+    /// `min(KV_PAGE, max_seq_len)` and growing on demand up to `max_seq_len`.
+    fn new(n_layers: usize, max_seq_len: usize, kv_dim: usize) -> Self {
+        let cap = KV_PAGE.min(max_seq_len.max(1));
+        let cells = n_layers * cap * kv_dim;
         KvCache {
             k: vec![0.0; cells],
             v: vec![0.0; cells],
-            seq_len,
+            n_layers,
+            cap,
+            max_seq_len,
             kv_dim,
         }
     }
 
-    /// Flat base offset of layer `layer`'s `(seq_len, kv_dim)` block.
+    /// Current per-layer capacity (positions) — the stride a resident backend
+    /// must use when slicing [`RunState::key_cache`]/[`RunState::value_cache`].
+    /// Gated on `test` in addition to `gpu`/`cuda` (unlike `key_cache`/
+    /// `value_cache`) so it's checkable from plain unit tests without those
+    /// features enabled.
+    #[cfg(any(test, feature = "gpu", feature = "cuda"))]
+    pub(crate) fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Ensure the cache has room through position `up_to` (inclusive),
+    /// growing (and relaying out every layer's block into the new stride) in
+    /// [`KV_PAGE`] increments if not. A no-op once `cap` reaches
+    /// `max_seq_len` — the caller (`forward`/`forward_prefill`) is
+    /// responsible for not writing past the model's context window.
+    fn ensure_capacity(&mut self, up_to: usize) {
+        if up_to < self.cap || self.cap >= self.max_seq_len {
+            return;
+        }
+        let new_cap = (up_to + 1).next_multiple_of(KV_PAGE).min(self.max_seq_len);
+        if new_cap <= self.cap {
+            return;
+        }
+        let block = self.cap * self.kv_dim;
+        let new_block = new_cap * self.kv_dim;
+        let mut new_k = vec![0.0; self.n_layers * new_block];
+        let mut new_v = vec![0.0; self.n_layers * new_block];
+        for layer in 0..self.n_layers {
+            let old_off = layer * block;
+            let new_off = layer * new_block;
+            new_k[new_off..new_off + block].copy_from_slice(&self.k[old_off..old_off + block]);
+            new_v[new_off..new_off + block].copy_from_slice(&self.v[old_off..old_off + block]);
+        }
+        self.k = new_k;
+        self.v = new_v;
+        self.cap = new_cap;
+    }
+
+    /// Flat base offset of layer `layer`'s `(cap, kv_dim)` block.
     #[inline]
     fn layer_base(&self, layer: usize) -> usize {
-        layer * self.seq_len * self.kv_dim
+        layer * self.cap * self.kv_dim
     }
 
-    /// Layer `layer`'s full `(seq_len, kv_dim)` key window (what attention reads).
+    /// Layer `layer`'s full `(cap, kv_dim)` key window (what attention reads;
+    /// `cap >= pos+1` for any `pos` already written, so this is always long
+    /// enough — see the struct doc).
     fn layer_k(&self, layer: usize) -> &[f32] {
         let b = self.layer_base(layer);
-        &self.k[b..b + self.seq_len * self.kv_dim]
+        &self.k[b..b + self.cap * self.kv_dim]
     }
 
-    /// Layer `layer`'s full `(seq_len, kv_dim)` value window.
+    /// Layer `layer`'s full `(cap, kv_dim)` value window.
     fn layer_v(&self, layer: usize) -> &[f32] {
         let b = self.layer_base(layer);
-        &self.v[b..b + self.seq_len * self.kv_dim]
+        &self.v[b..b + self.cap * self.kv_dim]
     }
 
     /// The single `kv_dim` key slot at `pos` (what the per-token K matmul writes).
     fn k_slot_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
+        self.ensure_capacity(pos);
         let b = self.layer_base(layer) + pos * self.kv_dim;
         &mut self.k[b..b + self.kv_dim]
     }
 
     /// The single `kv_dim` value slot at `pos`.
     fn v_slot_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
+        self.ensure_capacity(pos);
         let b = self.layer_base(layer) + pos * self.kv_dim;
         &mut self.v[b..b + self.kv_dim]
     }
@@ -679,6 +747,7 @@ impl KvCache {
     /// the separate `k`/`v` buffers — lets the q/k/v projections share a single
     /// quantized activation through [`crate::backend::Backend::matmul_shared`].
     fn kv_slots_mut(&mut self, layer: usize, pos: usize) -> (&mut [f32], &mut [f32]) {
+        self.ensure_capacity(pos);
         let b = self.layer_base(layer) + pos * self.kv_dim;
         let kd = self.kv_dim;
         (&mut self.k[b..b + kd], &mut self.v[b..b + kd])
@@ -686,17 +755,20 @@ impl KvCache {
 
     /// The contiguous `n`-row key span from `pos_base` (what prefill writes).
     fn k_span_mut(&mut self, layer: usize, pos_base: usize, n: usize) -> &mut [f32] {
+        self.ensure_capacity(pos_base + n - 1);
         let b = self.layer_base(layer) + pos_base * self.kv_dim;
         &mut self.k[b..b + n * self.kv_dim]
     }
 
     /// The contiguous `n`-row value span from `pos_base`.
     fn v_span_mut(&mut self, layer: usize, pos_base: usize, n: usize) -> &mut [f32] {
+        self.ensure_capacity(pos_base + n - 1);
         let b = self.layer_base(layer) + pos_base * self.kv_dim;
         &mut self.v[b..b + n * self.kv_dim]
     }
 
-    /// The whole flat key buffer (a device-resident backend uploads it).
+    /// The whole flat key buffer (a device-resident backend uploads it; pair
+    /// with [`KvCache::capacity`] for the current per-layer stride).
     #[cfg(any(feature = "gpu", feature = "cuda"))]
     fn all_k(&self) -> &[f32] {
         &self.k
@@ -707,7 +779,6 @@ impl KvCache {
     fn all_v(&self) -> &[f32] {
         &self.v
     }
-
 }
 
 /// Mutable scratch space reused across forward passes, including the KV cache.
@@ -773,6 +844,14 @@ impl RunState {
         self.kv.all_v()
     }
 
+    /// Current per-layer capacity (positions) of [`RunState::key_cache`]/
+    /// [`RunState::value_cache`] — the stride a resident backend must use to
+    /// compute per-layer offsets into them (may be less than the model's
+    /// `seq_len` — see [`KvCache`]'s struct doc).
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    pub(crate) fn kv_capacity(&self) -> usize {
+        self.kv.capacity()
+    }
 }
 
 /// Continuous-batching decode scratch: batched activation buffers reused across
@@ -1826,6 +1905,47 @@ mod tests {
         assert_eq!(kv.k_span_mut(0, 0, 2).len(), 8);
         kv.v_slot_mut(0, 1).copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(&kv.layer_v(0)[4..8], [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn kv_cache_short_sequence_uses_less_than_max_seq_len_capacity() {
+        // The memory win: a context window far larger than what's actually
+        // used shouldn't cost that much memory up front.
+        let kv = KvCache::new(4, 8192, 16);
+        assert_eq!(kv.capacity(), KV_PAGE);
+        assert!(kv.capacity() < 8192);
+    }
+
+    #[test]
+    fn kv_cache_grows_lazily_and_preserves_existing_data() {
+        let mut kv = KvCache::new(2, 1000, 4);
+        assert_eq!(kv.capacity(), KV_PAGE);
+
+        // Write within the initial page — no growth yet.
+        kv.k_slot_mut(0, 0).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        kv.k_slot_mut(1, 0).copy_from_slice(&[9.0, 9.0, 9.0, 9.0]);
+        assert_eq!(kv.capacity(), KV_PAGE);
+
+        // Writing past the initial page triggers growth (a relayout copy).
+        kv.k_slot_mut(0, 300).copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        assert!(kv.capacity() > KV_PAGE, "should have grown past {KV_PAGE}");
+        assert!(kv.capacity() >= 301);
+        assert_eq!(kv.capacity() % KV_PAGE, 0);
+
+        // Data written before the growth event must survive the relayout,
+        // in both layers (proves the per-layer copy uses the right strides).
+        assert_eq!(&kv.layer_k(0)[0..4], [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&kv.layer_k(1)[0..4], [9.0, 9.0, 9.0, 9.0]);
+        assert_eq!(&kv.layer_k(0)[300 * 4..300 * 4 + 4], [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn kv_cache_capacity_never_exceeds_max_seq_len() {
+        let mut kv = KvCache::new(1, 10, 4);
+        assert_eq!(kv.capacity(), 10); // KV_PAGE=256 clamped down to max_seq_len=10
+        kv.k_slot_mut(0, 9).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(kv.capacity(), 10);
+        assert_eq!(&kv.layer_k(0)[36..40], [1.0, 2.0, 3.0, 4.0]);
     }
 
     fn moe_model_bytes(n_expert: usize, n_expert_used: usize) -> Vec<u8> {
