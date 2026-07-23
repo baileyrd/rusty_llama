@@ -43,6 +43,11 @@ Options:
   --mirostat-ent <float>  mirostat target entropy (tau)  (default: 5.0)
   --xtc-probability <f>   XTC probability, 0 = off        (default: 0.0)
   --xtc-threshold <f>     XTC probability threshold       (default: 0.1)
+  --dry-multiplier <f>    DRY penalty multiplier, 0 = off  (default: 0.0)
+  --dry-base <f>          DRY penalty exponential base     (default: 1.75)
+  --dry-allowed-length <n> DRY: shortest penalized repeat  (default: 2)
+  --dry-penalty-last-n <n> DRY match window (tokens)       (default: 64)
+  --dry-sequence-breaker <text>  DRY window restart token (repeatable, single-token only)
   --embedding             output an embedding vector instead of text
   --pooling <mode>        embedding pooling: mean|last|cls (default: mean)
   --embd-normalize <n>    embedding norm: 2 = L2, -1 = none     (default: 2)
@@ -80,6 +85,11 @@ struct Args {
     mirostat_ent: f32,
     xtc_probability: f32,
     xtc_threshold: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    dry_allowed_length: usize,
+    dry_penalty_last_n: usize,
+    dry_sequence_breakers: Vec<String>,
     embedding: bool,
     pooling: String,
     embd_normalize: i32,
@@ -326,6 +336,20 @@ fn stream_generation(
     };
 
     let mut state = RunState::new(&model.config);
+    let mut dry_sequence_breakers = std::collections::HashSet::new();
+    for text in &args.dry_sequence_breakers {
+        let toks = tokenizer.encode(text, false, false);
+        match toks.as_slice() {
+            [t] => {
+                dry_sequence_breakers.insert(*t as u32);
+            }
+            _ => eprintln!(
+                "warning: --dry-sequence-breaker '{text}' tokenizes to {} tokens, \
+                 not 1 — only single-token breakers are supported, skipping",
+                toks.len()
+            ),
+        }
+    }
     let sampler_cfg = SamplerConfig {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -343,6 +367,11 @@ fn stream_generation(
         mirostat_m: 100,
         xtc_probability: args.xtc_probability,
         xtc_threshold: args.xtc_threshold,
+        dry_multiplier: args.dry_multiplier,
+        dry_base: args.dry_base,
+        dry_allowed_length: args.dry_allowed_length,
+        dry_penalty_last_n: args.dry_penalty_last_n,
+        dry_sequence_breakers,
     };
     let mut sampler = SamplerChain::from_config(&sampler_cfg, model.config.vocab_size);
     if let Some(src) = resolve_grammar(args)? {
@@ -449,6 +478,11 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         mirostat_ent: 5.0,
         xtc_probability: 0.0,
         xtc_threshold: 0.1,
+        dry_multiplier: 0.0,
+        dry_base: 1.75,
+        dry_allowed_length: 2,
+        dry_penalty_last_n: 64,
+        dry_sequence_breakers: Vec::new(),
         embedding: false,
         pooling: "mean".to_string(),
         embd_normalize: 2,
@@ -508,6 +542,11 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--mirostat-ent" => args.mirostat_ent = value()?.parse()?,
             "--xtc-probability" => args.xtc_probability = value()?.parse()?,
             "--xtc-threshold" => args.xtc_threshold = value()?.parse()?,
+            "--dry-multiplier" => args.dry_multiplier = value()?.parse()?,
+            "--dry-base" => args.dry_base = value()?.parse()?,
+            "--dry-allowed-length" => args.dry_allowed_length = value()?.parse()?,
+            "--dry-penalty-last-n" => args.dry_penalty_last_n = value()?.parse()?,
+            "--dry-sequence-breaker" => args.dry_sequence_breakers.push(value()?.clone()),
             "--pooling" => args.pooling = value()?.clone(),
             "--embd-normalize" => args.embd_normalize = value()?.parse()?,
             "--system" => args.system = value()?.clone(),

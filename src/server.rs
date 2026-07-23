@@ -60,6 +60,10 @@ struct SamplingParams {
     mirostat_eta: Option<f32>,
     xtc_probability: Option<f32>,
     xtc_threshold: Option<f32>,
+    dry_multiplier: Option<f32>,
+    dry_base: Option<f32>,
+    dry_allowed_length: Option<usize>,
+    dry_penalty_last_n: Option<usize>,
 }
 
 /// OpenAI `response_format` — `{"type":"json_object"}` constrains output to JSON.
@@ -784,6 +788,13 @@ fn resolve_sampler(p: &SamplingParams) -> SamplerConfig {
         mirostat_m: 100,
         xtc_probability: p.xtc_probability.unwrap_or(0.0),
         xtc_threshold: p.xtc_threshold.unwrap_or(0.1),
+        dry_multiplier: p.dry_multiplier.unwrap_or(0.0),
+        dry_base: p.dry_base.unwrap_or(1.75),
+        dry_allowed_length: p.dry_allowed_length.unwrap_or(2),
+        dry_penalty_last_n: p.dry_penalty_last_n.unwrap_or(64),
+        // Sequence-breaker strings aren't exposed over the JSON API yet (would
+        // need per-request tokenization); leave the window unrestartable.
+        dry_sequence_breakers: Default::default(),
     }
 }
 

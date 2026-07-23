@@ -605,6 +605,152 @@ impl SamplerStage for Xtc {
     }
 }
 
+/// Classic Z-algorithm: `z[k]` is the length of the longest common prefix of
+/// `s` and `s[k..]` (`z[0]` is unused by convention). Standard linear-time
+/// algorithm — used here (on a *reversed* token history, see [`Dry`]) instead
+/// of an O(n²) scan so a large `penalty_last_n` stays cheap.
+fn z_array(s: &[u32]) -> Vec<usize> {
+    let n = s.len();
+    let mut z = vec![0usize; n];
+    if n == 0 {
+        return z;
+    }
+    z[0] = n;
+    let (mut l, mut r) = (0usize, 0usize);
+    for i in 1..n {
+        let mut k = if i < r { (r - i).min(z[i - l]) } else { 0 };
+        while i + k < n && s[k] == s[i + k] {
+            k += 1;
+        }
+        z[i] = k;
+        if i + k > r {
+            l = i;
+            r = i + k;
+        }
+    }
+    z
+}
+
+/// DRY ("Don't Repeat Yourself"): penalizes tokens that would extend the
+/// current context into a repeat of something that already happened earlier
+/// in it. Mirrors `llama_sampler_dry`.
+///
+/// For each earlier position `j` in the (breaker-truncated) recent-token
+/// window, find how long a suffix ending at `j` matches the suffix ending at
+/// the very end of the window (a longest-common-suffix problem, solved in one
+/// pass via the [`z_array`] of the *reversed* window — `z[k]` for the reversed
+/// array is exactly that match length for `j = window.len() - 1 - k`). If the
+/// token that historically followed position `j` equals a candidate, choosing
+/// that candidate would extend the match by one — a repeat of length
+/// `match_len + 1`. The longest such repeat found for each candidate id is
+/// penalized once it reaches `allowed_length`, scaling as
+/// `multiplier * base^(repeat_len - allowed_length)`.
+///
+/// A *filter* stage (mutates logits, doesn't select), stateful like
+/// [`Penalties`]: `accept` feeds a ring of recent tokens, `reset` clears it.
+pub struct Dry {
+    multiplier: f32,
+    base: f32,
+    allowed_length: usize,
+    penalty_last_n: usize,
+    breakers: std::collections::HashSet<u32>,
+    ring: VecDeque<u32>,
+}
+
+impl Dry {
+    pub fn new(
+        multiplier: f32,
+        base: f32,
+        allowed_length: usize,
+        penalty_last_n: usize,
+        breakers: std::collections::HashSet<u32>,
+    ) -> Self {
+        Dry {
+            multiplier,
+            base,
+            allowed_length: allowed_length.max(1),
+            penalty_last_n,
+            breakers,
+            ring: VecDeque::with_capacity(penalty_last_n.min(4096)),
+        }
+    }
+
+    fn is_off(&self) -> bool {
+        self.multiplier == 0.0 || self.base < 1.0 || self.penalty_last_n == 0
+    }
+}
+
+impl SamplerStage for Dry {
+    fn apply(&mut self, cur: &mut TokenDataArray) {
+        if self.is_off() || self.ring.len() <= self.allowed_length {
+            return;
+        }
+        let history: Vec<u32> = self.ring.iter().copied().collect();
+        let n = history.len();
+
+        // Restrict the match window to the current "run" since the most
+        // recent sequence-breaker token, scanning backward from the end —
+        // matches/repeats never cross a breaker in either direction, since
+        // anything at-or-before it is simply excluded from the window.
+        let mut rep_limit = n;
+        for i in 0..n {
+            if self.breakers.contains(&history[n - i - 1]) {
+                rep_limit = i;
+                break;
+            }
+        }
+        if rep_limit <= self.allowed_length {
+            return;
+        }
+
+        let window = &history[n - rep_limit..];
+        let rev: Vec<u32> = window.iter().rev().copied().collect();
+        let z = z_array(&rev);
+
+        let mut max_repeat: HashMap<u32, usize> = HashMap::new();
+        for k in 1..rep_limit {
+            let repeat_len = z[k] + 1;
+            if repeat_len < self.allowed_length {
+                continue;
+            }
+            let continuation = rev[k - 1];
+            max_repeat
+                .entry(continuation)
+                .and_modify(|v| *v = (*v).max(repeat_len))
+                .or_insert(repeat_len);
+        }
+        if max_repeat.is_empty() {
+            return;
+        }
+
+        for c in cur.data[..cur.size].iter_mut() {
+            if let Some(&repeat_len) = max_repeat.get(&c.id) {
+                let exp = (repeat_len - self.allowed_length) as i32;
+                c.logit -= self.multiplier * self.base.powi(exp);
+            }
+        }
+        cur.sorted = false;
+    }
+
+    fn accept(&mut self, token: u32) {
+        if self.penalty_last_n == 0 {
+            return;
+        }
+        if self.ring.len() == self.penalty_last_n {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(token);
+    }
+
+    fn reset(&mut self) {
+        self.ring.clear();
+    }
+
+    fn name(&self) -> &'static str {
+        "dry"
+    }
+}
+
 /// Knobs for [`SamplerChain::from_config`] — one per stage; off-values omit the
 /// stage. When every Phase-1 knob is at its off-value the builder produces the
 /// exact Phase-0.1 chain (byte-identical output).
@@ -630,6 +776,13 @@ pub struct SamplerConfig {
     /// XTC probability, 0 = off. Applied after `min_p`, before temp/dist.
     pub xtc_probability: f32,
     pub xtc_threshold: f32,
+    /// DRY multiplier, 0 = off. Applied right after penalties, before
+    /// top_k/mirostat.
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: usize,
+    pub dry_penalty_last_n: usize,
+    pub dry_sequence_breakers: std::collections::HashSet<u32>,
 }
 
 /// An ordered chain of [`SamplerStage`]s ending in a selector. Replaces the
@@ -686,6 +839,15 @@ impl SamplerChain {
                     cfg.presence_penalty,
                 )));
             }
+            if cfg.dry_multiplier > 0.0 {
+                stages.push(Box::new(Dry::new(
+                    cfg.dry_multiplier,
+                    cfg.dry_base,
+                    cfg.dry_allowed_length,
+                    cfg.dry_penalty_last_n,
+                    cfg.dry_sequence_breakers.clone(),
+                )));
+            }
             stages.push(Box::new(Temp { t: cfg.temperature }));
             if cfg.mirostat == 1 {
                 stages.push(Box::new(Mirostat::new(
@@ -706,8 +868,11 @@ impl SamplerChain {
                 cur: TokenDataArray::with_capacity(vocab_size),
             };
         }
-        let new_knobs =
-            cfg.top_k != 0 || cfg.min_p > 0.0 || cfg.xtc_probability > 0.0 || penalties_on;
+        let new_knobs = cfg.top_k != 0
+            || cfg.min_p > 0.0
+            || cfg.xtc_probability > 0.0
+            || cfg.dry_multiplier > 0.0
+            || penalties_on;
         if !new_knobs {
             // Byte-identical Phase-0.1 chain (temp → top_p → dist, or greedy).
             return SamplerChain::new(vocab_size, cfg.temperature, cfg.top_p, cfg.seed);
@@ -720,6 +885,15 @@ impl SamplerChain {
                 cfg.repeat_penalty,
                 cfg.frequency_penalty,
                 cfg.presence_penalty,
+            )));
+        }
+        if cfg.dry_multiplier > 0.0 {
+            stages.push(Box::new(Dry::new(
+                cfg.dry_multiplier,
+                cfg.dry_base,
+                cfg.dry_allowed_length,
+                cfg.dry_penalty_last_n,
+                cfg.dry_sequence_breakers.clone(),
             )));
         }
         if cfg.top_k != 0 {
@@ -1038,6 +1212,137 @@ mod tests {
     }
 
     #[test]
+    fn z_array_hand_computed() {
+        assert_eq!(z_array(&[1, 2, 1, 2]), vec![4, 0, 2, 0]);
+    }
+
+    #[test]
+    fn z_array_no_repeats() {
+        assert_eq!(z_array(&[1, 2, 3, 4]), vec![4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn z_array_empty() {
+        assert_eq!(z_array(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn dry_no_repeat_no_penalty() {
+        // All-distinct history -> every candidate's best match is a trivial
+        // length-1 "repeat" (z=0 everywhere), below the default
+        // allowed_length=2, so nothing ever reaches the penalty stage.
+        let mut d = Dry::new(1.0, 1.75, 2, 64, std::collections::HashSet::new());
+        for &t in &[1u32, 2, 3, 4, 5] {
+            d.accept(t);
+        }
+        let mut cur = tda(&[0.0; 6]);
+        d.apply(&mut cur);
+        assert!(cur.data.iter().take(6).all(|c| c.logit == 0.0));
+    }
+
+    #[test]
+    fn dry_short_repeat_at_allowed_length_boundary_hand_computed() {
+        // history: A,B,A (ids 1,2,1). Predicting B next would repeat the
+        // earlier "A,B" (positions 0-1) exactly as "A,B" again (positions
+        // 1-2 extended by B) -- a length-2 repeat, exactly at
+        // allowed_length=2 (exponent 0, so the penalty is just the bare
+        // multiplier).
+        let mut d = Dry::new(1.0, 2.0, 2, 64, std::collections::HashSet::new());
+        for &t in &[1u32, 2, 1] {
+            d.accept(t);
+        }
+        let mut cur = tda(&[0.0, 0.0, 0.0]);
+        d.apply(&mut cur);
+        assert!(
+            (cur.data[2].logit - -1.0).abs() < 1e-4,
+            "{}",
+            cur.data[2].logit
+        );
+        assert!(
+            (cur.data[1].logit - 0.0).abs() < 1e-6,
+            "{}",
+            cur.data[1].logit
+        );
+    }
+
+    #[test]
+    fn dry_long_repeat_hand_computed() {
+        // history (chronological): A,B,C,A,B (ids 1,2,3,1,2). Predicting C
+        // next would repeat the earlier "A,B,C" run (positions 0-2) exactly
+        // -- a length-3 repeat. Trace (z-array of the reversed window
+        // [2,1,3,2,1]): z=[5,0,0,2,0], so k=3 gives repeat_len=z[3]+1=3 for
+        // continuation token rev[2]=3 (C); the other k's give repeat_len=1,
+        // filtered below allowed_length=2.
+        let mut d = Dry::new(1.0, 2.0, 2, 64, std::collections::HashSet::new());
+        for &t in &[1u32, 2, 3, 1, 2] {
+            d.accept(t);
+        }
+        let mut cur = tda(&[0.0, 0.0, 0.0, 0.0]);
+        d.apply(&mut cur);
+        // penalty = multiplier * base^(repeat_len - allowed_length) = 1 * 2^(3-2) = 2
+        assert!(
+            (cur.data[3].logit - -2.0).abs() < 1e-4,
+            "{}",
+            cur.data[3].logit
+        );
+        for id in [0usize, 1, 2] {
+            assert!(
+                (cur.data[id].logit - 0.0).abs() < 1e-6,
+                "id {id}: {}",
+                cur.data[id].logit
+            );
+        }
+    }
+
+    #[test]
+    fn dry_sequence_breaker_restarts_window() {
+        // history: A,B,C,BREAK,A,B (ids 1,2,3,9,1,2). Without the breaker,
+        // predicting C would repeat "A,B,C" the same way as the hand-computed
+        // test above. With BREAK (id 9) in between, the match window
+        // truncates to just the most recent run [A,B] (rep_limit=2), which
+        // is <= allowed_length(2) -> no penalties at all.
+        let mut breakers = std::collections::HashSet::new();
+        breakers.insert(9u32);
+        let mut d = Dry::new(1.0, 2.0, 2, 64, breakers);
+        for &t in &[1u32, 2, 3, 9, 1, 2] {
+            d.accept(t);
+        }
+        let mut cur = tda(&[0.0, 0.0, 0.0, 0.0]);
+        d.apply(&mut cur);
+        for id in 0..4 {
+            assert!(
+                (cur.data[id].logit - 0.0).abs() < 1e-6,
+                "id {id}: {}",
+                cur.data[id].logit
+            );
+        }
+    }
+
+    #[test]
+    fn dry_off_when_multiplier_zero() {
+        let mut d = Dry::new(0.0, 1.75, 2, 64, std::collections::HashSet::new());
+        for &t in &[1u32, 2, 3, 1, 2] {
+            d.accept(t);
+        }
+        let mut cur = tda(&[0.0, 0.0, 0.0, 0.0]);
+        d.apply(&mut cur);
+        for id in 0..4 {
+            assert!((cur.data[id].logit - 0.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn dry_ring_evicts_past_window_and_reset_clears() {
+        let mut d = Dry::new(1.0, 2.0, 1, 3, std::collections::HashSet::new());
+        for &t in &[9u32, 9, 9, 1, 2, 1] {
+            d.accept(t); // window size 3 -> only the last 3 accepted survive
+        }
+        assert_eq!(d.ring.iter().copied().collect::<Vec<_>>(), vec![1, 2, 1]);
+        d.reset();
+        assert!(d.ring.is_empty());
+    }
+
+    #[test]
     fn mirostat_v1_collapses_and_updates_mu_hand_computed() {
         // A dominant logit drives the Zipf estimate's k formula out of its real
         // domain (negative base, fractional exponent -> NaN); the
@@ -1087,6 +1392,11 @@ mod tests {
                     mirostat_m: 100,
                     xtc_probability: 0.0,
                     xtc_threshold: 0.1,
+                    dry_multiplier: 0.0,
+                    dry_base: 1.75,
+                    dry_allowed_length: 2,
+                    dry_penalty_last_n: 64,
+                    dry_sequence_breakers: Default::default(),
                 };
                 let mut sc = SamplerChain::from_config(&cfg, vocab);
                 (0..20).map(|_| sc.sample(&logits)).collect::<Vec<_>>()
@@ -1118,6 +1428,11 @@ mod tests {
             mirostat_m: 100,
             xtc_probability: 0.0,
             xtc_threshold: 0.1,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 64,
+            dry_sequence_breakers: Default::default(),
         };
         let logits = [2.0f32, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6];
         let mut sc = SamplerChain::from_config(&cfg, 8);
