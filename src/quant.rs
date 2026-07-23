@@ -16,6 +16,7 @@
 //! | Q5_1   | 32           | 24          | 5-bit (4-bit + high plane), scale + min |
 //! | Q8_0   | 32           | 34          | 8-bit, single scale           |
 //! | Q4_K   | 256          | 144         | k-quant, 8 sub-block scales   |
+//! | Q5_K   | 256          | 176         | k-quant, 8 sub-block scales, 5-bit |
 //! | Q6_K   | 256          | 210         | k-quant, 16 sub-block scales  |
 
 use crate::error::{Error, Result};
@@ -41,6 +42,7 @@ pub enum GgmlType {
     Q5_1,
     Q8_0,
     Q4_K,
+    Q5_K,
     Q6_K,
 }
 
@@ -56,6 +58,7 @@ impl GgmlType {
             7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4_K,
+            13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
             other => {
                 return Err(Error::Format(format!(
@@ -76,6 +79,7 @@ impl GgmlType {
             GgmlType::Q5_1 => 7,
             GgmlType::Q8_0 => 8,
             GgmlType::Q4_K => 12,
+            GgmlType::Q5_K => 13,
             GgmlType::Q6_K => 14,
         }
     }
@@ -87,7 +91,7 @@ impl GgmlType {
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
                 32
             }
-            GgmlType::Q4_K | GgmlType::Q6_K => QK_K,
+            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => QK_K,
         }
     }
 
@@ -102,6 +106,7 @@ impl GgmlType {
             GgmlType::Q5_1 => 24,
             GgmlType::Q8_0 => 34,
             GgmlType::Q4_K => 144,
+            GgmlType::Q5_K => 176,
             GgmlType::Q6_K => 210,
         }
     }
@@ -154,6 +159,7 @@ pub fn dequant_block(ty: GgmlType, chunk: &[u8], out: &mut [f32]) {
         GgmlType::Q5_1 => block_q5_1(chunk, out),
         GgmlType::Q8_0 => block_q8_0(chunk, out),
         GgmlType::Q4_K => block_q4_k(chunk, out),
+        GgmlType::Q5_K => block_q5_k(chunk, out),
         GgmlType::Q6_K => block_q6_k(chunk, out),
     }
 }
@@ -319,6 +325,43 @@ fn block_q4_k(blk: &[u8], out: &mut [f32]) {
             y += 1;
         }
         is += 2;
+    }
+}
+
+/// `Q5_K`: [`block_q4_k`]'s 256-element super-block and 6-bit packed
+/// sub-block scale/min scheme, plus a 5th ("high") bit for each weight packed
+/// separately in a 32-byte `qh` plane (one bit per element, reused across all
+/// four 64-wide passes with a shifting 2-bit-per-pass mask — the same
+/// high-bit-plane idea as [`block_q5_0`], just superblocked).
+fn block_q5_k(blk: &[u8], out: &mut [f32]) {
+    let d = rd_f16(blk, 0);
+    let dmin = rd_f16(blk, 2);
+    let scales = &blk[4..16];
+    let qh = &blk[16..48];
+    let qs = &blk[48..176];
+
+    let mut y = 0;
+    let mut is = 0;
+    let mut u1: u8 = 1;
+    let mut u2: u8 = 2;
+    for ql in qs.chunks_exact(32) {
+        let (sc1, m1) = get_scale_min_k4(is, scales);
+        let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+        let (d1, min1) = (d * sc1 as f32, dmin * m1 as f32);
+        let (d2, min2) = (d * sc2 as f32, dmin * m2 as f32);
+        for l in 0..32 {
+            let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+            out[y] = d1 * ((ql[l] & 0x0f) + hi) as f32 - min1;
+            y += 1;
+        }
+        for l in 0..32 {
+            let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+            out[y] = d2 * ((ql[l] >> 4) + hi) as f32 - min2;
+            y += 1;
+        }
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
     }
 }
 
@@ -1641,6 +1684,45 @@ mod tests {
 
         let y = dequantize(GgmlType::Q4_K, &blk, QK_K).unwrap();
         assert!(y.iter().all(|&v| (v - 1.0).abs() < 1e-4), "{:?}", &y[..4]);
+    }
+
+    #[test]
+    fn q5_k_constant_block() {
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        blk.extend_from_slice(&f32_to_f16(0.0).to_le_bytes());
+        blk.extend_from_slice(&pack_scales_q4_k([1; 8], [0; 8]));
+        blk.extend(std::iter::repeat_n(0u8, QK_K / 8)); // qh: no high bits set
+        blk.extend(std::iter::repeat_n(0x11u8, QK_K / 2)); // qs: nibble 1 everywhere
+        assert_eq!(blk.len(), GgmlType::Q5_K.type_size());
+
+        let y = dequantize(GgmlType::Q5_K, &blk, QK_K).unwrap();
+        assert!(y.iter().all(|&v| (v - 1.0).abs() < 1e-4), "{:?}", &y[..4]);
+    }
+
+    #[test]
+    fn q5_k_high_bit_plane() {
+        // qh[0] = 0xff sets the high bit for `l = 0` in every one of the four
+        // 64-wide passes (both the low- and high-nibble half), landing on
+        // output indices {0,32,64,96,128,160,192,224}. With scale=1, min=0,
+        // and all qs nibbles 0, those positions should read 16 (0 | 16) and
+        // everywhere else should read 0.
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        blk.extend_from_slice(&f32_to_f16(0.0).to_le_bytes());
+        blk.extend_from_slice(&pack_scales_q4_k([1; 8], [0; 8]));
+        let mut qh = [0u8; QK_K / 8];
+        qh[0] = 0xff;
+        blk.extend_from_slice(&qh);
+        blk.extend(std::iter::repeat_n(0u8, QK_K / 2));
+        assert_eq!(blk.len(), GgmlType::Q5_K.type_size());
+
+        let y = dequantize(GgmlType::Q5_K, &blk, QK_K).unwrap();
+        let hot = [0usize, 32, 64, 96, 128, 160, 192, 224];
+        for (i, &v) in y.iter().enumerate() {
+            let want = if hot.contains(&i) { 16.0 } else { 0.0 };
+            assert!((v - want).abs() < 1e-4, "y[{i}]={v} want {want}");
+        }
     }
 
     #[test]
