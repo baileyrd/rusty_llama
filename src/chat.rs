@@ -1,11 +1,14 @@
-//! Built-in chat templates (no Jinja): render OpenAI-style messages to a prompt
-//! string, mirroring llama.cpp's hardcoded `llama-chat.cpp` templates. Phase 1
-//! covers ChatML, Llama-3, and Qwen2 (Qwen2 shares the ChatML body).
+//! Chat template rendering: [`ChatTemplate`] is 5 hardcoded families (no Jinja),
+//! mirroring llama.cpp's `llama-chat.cpp`; [`ChatRenderer::resolve`] prefers
+//! rendering the GGUF's *actual* embedded `tokenizer.chat_template` Jinja
+//! source via `minijinja` instead, falling back to the hardcoded families only
+//! when a GGUF has no template string at all.
 //!
 //! The special tokens the templates emit (`<|im_start|>`, `<|eot_id|>`,
 //! `<|begin_of_text|>`, …) are matched verbatim by the tokenizer's special-token
 //! splitter during `encode`, so a rendered prompt round-trips to the right ids.
 
+use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// A chat message role.
@@ -102,6 +105,117 @@ impl ChatTemplate {
             ChatTemplate::Phi3 => render_phi3(msgs, add_gen),
         }
     }
+}
+
+/// Either one of the 5 hardcoded [`ChatTemplate`] families, or a Jinja
+/// template rendered dynamically via `minijinja` from a GGUF's own
+/// `tokenizer.chat_template` string.
+pub enum ChatRenderer {
+    Hardcoded(ChatTemplate),
+    Jinja(String),
+}
+
+impl ChatRenderer {
+    /// Resolve a renderer for `gguf`: an explicit `override_name` (CLI/server
+    /// `--chat-template`) always wins and uses the matching hardcoded family;
+    /// else the GGUF's own `tokenizer.chat_template` Jinja source is used if
+    /// present (closing the gap a hardcoded-family guess can't: an
+    /// unrecognized or customized template); else falls back to hardcoded-family
+    /// detection ([`ChatTemplate::detect`]).
+    pub fn resolve(gguf: &Gguf, arch: &str, override_name: Option<&str>) -> Option<Self> {
+        Self::resolve_from(
+            gguf.meta_str("tokenizer.chat_template").ok(),
+            arch,
+            override_name,
+        )
+    }
+
+    /// Split out for testing (no real `Gguf` bytes needed) — mirrors
+    /// [`ChatTemplate::detect_from`], which this delegates to for the final
+    /// hardcoded-detection fallback.
+    fn resolve_from(
+        template: Option<&str>,
+        arch: &str,
+        override_name: Option<&str>,
+    ) -> Option<Self> {
+        if let Some(name) = override_name {
+            return ChatTemplate::from_name(name).map(ChatRenderer::Hardcoded);
+        }
+        if let Some(src) = template {
+            return Some(ChatRenderer::Jinja(src.to_string()));
+        }
+        // `template` is None here (the Some case already returned) — no
+        // marker string to sniff, so this is arch-only detection.
+        ChatTemplate::detect_from(None, arch).map(ChatRenderer::Hardcoded)
+    }
+
+    /// Render messages to a prompt string. `eos_token` feeds the Jinja context
+    /// (ignored by the hardcoded path). A Jinja template that fails to parse
+    /// or render is a hard error — never a silent fallback to a guessed
+    /// family, which would risk producing a subtly wrong prompt.
+    pub fn render(&self, msgs: &[Message], add_gen: bool, eos_token: &str) -> Result<String> {
+        match self {
+            ChatRenderer::Hardcoded(t) => Ok(t.render(msgs, add_gen)),
+            ChatRenderer::Jinja(src) => render_jinja(src, msgs, add_gen, eos_token),
+        }
+    }
+
+    /// Whether the caller should still ask the tokenizer to prepend BOS.
+    /// Always `true` for a dynamic Jinja template: its context's `bos_token`
+    /// is always the empty string (see [`render_jinja`]), so any `{{
+    /// bos_token }}` the template emits is a no-op and the tokenizer is the
+    /// single source of truth for BOS. Mirrors [`ChatTemplate::emits_bos`]
+    /// for the hardcoded path.
+    pub fn needs_tokenizer_bos(&self) -> bool {
+        match self {
+            ChatRenderer::Hardcoded(t) => !t.emits_bos(),
+            ChatRenderer::Jinja(_) => true,
+        }
+    }
+}
+
+/// Render `template_src` (a GGUF's raw `tokenizer.chat_template` Jinja text)
+/// via `minijinja`, with the same context shape Hugging Face's
+/// `apply_chat_template`/llama.cpp's `minja` feed it: `messages` (a list of
+/// `{role, content}`), `add_generation_prompt`, `bos_token`, `eos_token`.
+///
+/// `bos_token` is deliberately always `""`: whether a given template embeds it
+/// (like the well-known Llama-3 template does, on the first message only)
+/// isn't something this function can determine statically per-template, so
+/// making it a no-op and always adding BOS via the tokenizer instead (see
+/// [`ChatRenderer::needs_tokenizer_bos`]) avoids ever double-adding it — a
+/// deliberate simplification, not a fidelity gap that matters: BOS is a single
+/// fixed token regardless of which mechanism inserts it.
+fn render_jinja(
+    template_src: &str,
+    msgs: &[Message],
+    add_gen: bool,
+    eos_token: &str,
+) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template("chat", template_src)
+        .map_err(|e| Error::Format(format!("invalid chat template: {e}")))?;
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| Error::Format(format!("invalid chat template: {e}")))?;
+
+    let messages: Vec<minijinja::Value> = msgs
+        .iter()
+        .map(|m| {
+            minijinja::Value::from_iter([
+                ("role", m.role.as_str()),
+                ("content", m.content.as_str()),
+            ])
+        })
+        .collect();
+    let ctx = minijinja::context! {
+        messages => messages,
+        add_generation_prompt => add_gen,
+        bos_token => "",
+        eos_token => eos_token,
+    };
+    tmpl.render(ctx)
+        .map_err(|e| Error::Format(format!("chat template render error: {e}")))
 }
 
 fn render_chatml(msgs: &[Message], add_gen: bool) -> String {
@@ -276,5 +390,96 @@ mod tests {
         assert!(ChatTemplate::Llama3.emits_bos());
         assert!(!ChatTemplate::ChatMl.emits_bos());
         assert!(!ChatTemplate::Qwen2.emits_bos());
+    }
+
+    // --- ChatRenderer / render_jinja ---------------------------------------
+
+    #[test]
+    fn render_jinja_threads_context_variables() {
+        // A trivial template exercising each context key the render passes:
+        // messages (as a sequence, via `length`), add_generation_prompt (bool
+        // interpolation), and eos_token (string interpolation). bos_token is
+        // always "" (see render_jinja's doc comment), so it's covered by the
+        // Llama-3-shaped test below instead of asserted on directly here.
+        let out = render_jinja(
+            "{{ messages|length }} msgs, gen={{ add_generation_prompt }}, eos={{ eos_token }}",
+            &msgs(),
+            true,
+            "<|eot|>",
+        )
+        .unwrap();
+        assert_eq!(out, "2 msgs, gen=true, eos=<|eot|>");
+    }
+
+    #[test]
+    fn render_jinja_llama3_shaped_template() {
+        // A template with the same *shape* as the well-known, widely-published
+        // Llama-3 chat template (for-loop over messages, an `{% if
+        // loop.index0 == 0 %}` bos-prepend, a trailing generation-prompt
+        // block) — written and hand-traced independently here, not copied
+        // from a live GGUF (none available in this environment), so this
+        // proves the rendering mechanism (loops/if/interpolation/loop.index0)
+        // works, not byte-fidelity to any specific upstream file.
+        const TEMPLATE: &str = "{% for message in messages %}\
+             {% if loop.index0 == 0 %}{{ bos_token }}{% endif %}\
+             <|start_header_id|>{{ message.role }}<|end_header_id|>\n\n\
+             {{ message.content }}<|eot_id|>\
+             {% endfor %}\
+             {% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>\n\n{% endif %}";
+        let out = render_jinja(TEMPLATE, &msgs(), true, "<|eot_id|>").unwrap();
+        // bos_token is always "" (see render_jinja's doc comment), so unlike
+        // ChatTemplate::Llama3's hardcoded render, no <|begin_of_text|> here —
+        // ChatRenderer::needs_tokenizer_bos() is what covers BOS for this path.
+        assert_eq!(
+            out,
+            "<|start_header_id|>system<|end_header_id|>\n\nS<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\nU<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn render_jinja_malformed_template_is_a_clear_error() {
+        let err = render_jinja("{% for x in messages %}unclosed", &msgs(), true, "")
+            .expect_err("malformed template must error, not silently fall back");
+        assert!(
+            format!("{err}").to_lowercase().contains("template"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn chat_renderer_override_name_wins_over_template_string() {
+        let r = ChatRenderer::resolve_from(Some("{{ anything }}"), "llama", Some("chatml"));
+        assert!(matches!(
+            r,
+            Some(ChatRenderer::Hardcoded(ChatTemplate::ChatMl))
+        ));
+    }
+
+    #[test]
+    fn chat_renderer_prefers_template_string_over_arch_detection() {
+        // Even though arch="qwen2" would resolve to a known hardcoded family,
+        // a present template string wins (closing the actual gap: qwen2 GGUFs
+        // can carry a customized template too).
+        let r = ChatRenderer::resolve_from(Some("{{ messages }}"), "qwen2", None);
+        assert!(matches!(r, Some(ChatRenderer::Jinja(s)) if s == "{{ messages }}"));
+    }
+
+    #[test]
+    fn chat_renderer_falls_back_to_hardcoded_detection_when_no_template_string() {
+        let r = ChatRenderer::resolve_from(None, "qwen2", None);
+        assert!(matches!(
+            r,
+            Some(ChatRenderer::Hardcoded(ChatTemplate::Qwen2))
+        ));
+        assert!(ChatRenderer::resolve_from(None, "unknown-arch", None).is_none());
+    }
+
+    #[test]
+    fn chat_renderer_needs_tokenizer_bos() {
+        assert!(ChatRenderer::Hardcoded(ChatTemplate::ChatMl).needs_tokenizer_bos());
+        assert!(!ChatRenderer::Hardcoded(ChatTemplate::Llama3).needs_tokenizer_bos());
+        assert!(ChatRenderer::Jinja("{{ x }}".into()).needs_tokenizer_bos());
     }
 }

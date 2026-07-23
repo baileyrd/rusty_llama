@@ -16,9 +16,9 @@ use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusty_llama::{
-    forward_embed, generate_tokens, AdapterBackend, Backend, ChatTemplate, Checkpoint, ControlVector,
-    CpuBackend, Gguf, GrammarStage, LoraAdapter, Message, Model, Pooling, Role, RunState,
-    SamplerChain, SamplerConfig, Tokenizer,
+    forward_embed, generate_tokens, AdapterBackend, Backend, ChatRenderer, ChatTemplate, Checkpoint,
+    ControlVector, CpuBackend, Gguf, GrammarStage, LoraAdapter, Message, Model, Pooling, Role,
+    RunState, SamplerChain, SamplerConfig, Tokenizer,
 };
 
 const USAGE: &str = "\
@@ -159,7 +159,7 @@ fn run_loaded(
     model: &Model,
     tokenizer: &Tokenizer,
     args: &Args,
-    template: Option<ChatTemplate>,
+    template: Option<ChatRenderer>,
 ) -> Result<(), Box<dyn Error>> {
     if args.embedding {
         run_embedding(model, tokenizer, args)
@@ -175,19 +175,19 @@ fn run_loaded(
 fn resolve_chat_template(
     args: &Args,
     gguf: Option<&Gguf>,
-) -> Result<Option<ChatTemplate>, Box<dyn Error>> {
+) -> Result<Option<ChatRenderer>, Box<dyn Error>> {
     if !args.chat {
         return Ok(None);
     }
     if !args.chat_template.is_empty() {
-        return ChatTemplate::from_name(&args.chat_template).map(Some).ok_or_else(|| {
-            format!("unknown --chat-template '{}'", args.chat_template).into()
-        });
+        return ChatTemplate::from_name(&args.chat_template)
+            .map(|t| Some(ChatRenderer::Hardcoded(t)))
+            .ok_or_else(|| format!("unknown --chat-template '{}'", args.chat_template).into());
     }
     if let Some(g) = gguf {
         let arch = g.meta_str("general.architecture").unwrap_or_default();
-        if let Some(t) = ChatTemplate::detect(g, arch) {
-            return Ok(Some(t));
+        if let Some(r) = ChatRenderer::resolve(g, arch, None) {
+            return Ok(Some(r));
         }
     }
     Err("could not detect a chat template; pass --chat-template (chatml|llama3|qwen2|gemma|phi3)".into())
@@ -253,7 +253,7 @@ fn run_chat(
     model: &Model,
     tokenizer: &Tokenizer,
     args: &Args,
-    template: Option<ChatTemplate>,
+    template: Option<ChatRenderer>,
 ) -> Result<(), Box<dyn Error>> {
     let template = template.ok_or("chat mode needs a template (see --chat-template)")?;
     let mut msgs = Vec::new();
@@ -267,10 +267,20 @@ fn run_chat(
         role: Role::User,
         content: args.prompt.clone(),
     });
-    let prompt = template.render(&msgs, true);
-    // Prepend BOS only if the model wants one (add_bos_token) and the template
-    // doesn't already emit its own (llama-3's <|begin_of_text|>).
-    let tokens = tokenizer.encode(&prompt, tokenizer.add_bos() && !template.emits_bos(), false);
+    let eos_token = tokenizer
+        .eos()
+        .map(|id| String::from_utf8_lossy(&tokenizer.token_piece(id)).into_owned())
+        .unwrap_or_default();
+    let prompt = template.render(&msgs, true, &eos_token)?;
+    // Prepend BOS only if the model wants one (add_bos_token) and the
+    // template doesn't already emit its own (llama-3's <|begin_of_text|>, or
+    // whatever a dynamic Jinja template's `{{ bos_token }}` would if it
+    // weren't neutered to "" — see `ChatRenderer::needs_tokenizer_bos`).
+    let tokens = tokenizer.encode(
+        &prompt,
+        tokenizer.add_bos() && template.needs_tokenizer_bos(),
+        false,
+    );
     stream_generation(model, tokenizer, args, &tokens)
 }
 
