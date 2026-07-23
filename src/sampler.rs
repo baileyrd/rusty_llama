@@ -531,6 +531,80 @@ impl SamplerStage for MirostatV2 {
     }
 }
 
+/// "Exclude top choices": with probability `probability` each step, if enough
+/// candidates exceed `threshold` probability, drop all but the least-probable
+/// of them — pushes the sampler off its most confident continuations. Mirrors
+/// `llama_sampler_xtc`. A *filter* stage, unlike [`Mirostat`] — it narrows the
+/// candidate set but doesn't select; a later `Dist`/`Greedy` still must.
+pub struct Xtc {
+    pub threshold: f32,
+    pub probability: f32,
+    pub min_keep: usize,
+    rng: u64,
+}
+
+impl Xtc {
+    pub fn new(threshold: f32, probability: f32, min_keep: usize, seed: u64) -> Self {
+        Xtc {
+            threshold,
+            probability,
+            min_keep: min_keep.max(1),
+            rng: if seed == 0 { 1 } else { seed },
+        }
+    }
+
+    fn random_u32(&mut self) -> u32 {
+        let mut s = self.rng;
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        self.rng = s;
+        (s.wrapping_mul(0x2545F491_4F6CDD1D) >> 32) as u32
+    }
+    fn random_f32(&mut self) -> f32 {
+        (self.random_u32() >> 8) as f32 / 16_777_216.0
+    }
+}
+
+impl SamplerStage for Xtc {
+    fn apply(&mut self, cur: &mut TokenDataArray) {
+        let n = cur.size;
+        if self.probability <= 0.0 || self.threshold > 0.5 || n < 2 {
+            return;
+        }
+        // Always draw, even if the gate below skips the filter, so the RNG
+        // stream is the same length regardless of outcome (matches upstream).
+        let chance = self.random_f32();
+        if chance > self.probability {
+            return;
+        }
+        // Sort descending by logit + softmax (matches llama.cpp's
+        // `softmax_impl`, needed so "leading run above threshold" is well
+        // defined).
+        cur.data[..n]
+            .sort_unstable_by(|a, b| b.logit.partial_cmp(&a.logit).unwrap_or(Ordering::Equal));
+        cur.sorted = true;
+        cur.softmax_p();
+
+        // Index of the last candidate in the leading above-threshold run.
+        let above = cur.data[..n]
+            .iter()
+            .take_while(|c| c.p >= self.threshold)
+            .count();
+        let pos_last = above.saturating_sub(1);
+        // Drop the front `pos_last` candidates (the confident "top choices"),
+        // keeping the least-probable of them plus everything after — but only
+        // if there's something to drop and enough survives `min_keep`.
+        if pos_last > 0 && n - pos_last >= self.min_keep {
+            cur.data[..n].rotate_left(pos_last);
+            cur.size = n - pos_last;
+        }
+    }
+    fn name(&self) -> &'static str {
+        "xtc"
+    }
+}
+
 /// Knobs for [`SamplerChain::from_config`] — one per stage; off-values omit the
 /// stage. When every Phase-1 knob is at its off-value the builder produces the
 /// exact Phase-0.1 chain (byte-identical output).
@@ -553,6 +627,9 @@ pub struct SamplerConfig {
     pub mirostat_eta: f32,
     /// Only used by Mirostat v1 (the Zipf-exponent estimate window).
     pub mirostat_m: usize,
+    /// XTC probability, 0 = off. Applied after `min_p`, before temp/dist.
+    pub xtc_probability: f32,
+    pub xtc_threshold: f32,
 }
 
 /// An ordered chain of [`SamplerStage`]s ending in a selector. Replaces the
@@ -629,7 +706,8 @@ impl SamplerChain {
                 cur: TokenDataArray::with_capacity(vocab_size),
             };
         }
-        let new_knobs = cfg.top_k != 0 || cfg.min_p > 0.0 || penalties_on;
+        let new_knobs =
+            cfg.top_k != 0 || cfg.min_p > 0.0 || cfg.xtc_probability > 0.0 || penalties_on;
         if !new_knobs {
             // Byte-identical Phase-0.1 chain (temp → top_p → dist, or greedy).
             return SamplerChain::new(vocab_size, cfg.temperature, cfg.top_p, cfg.seed);
@@ -655,6 +733,14 @@ impl SamplerChain {
                 p: cfg.min_p,
                 min_keep: cfg.min_keep.max(1),
             }));
+        }
+        if cfg.xtc_probability > 0.0 {
+            stages.push(Box::new(Xtc::new(
+                cfg.xtc_threshold,
+                cfg.xtc_probability,
+                1,
+                cfg.seed,
+            )));
         }
         if cfg.temperature == 0.0 {
             stages.push(Box::new(Greedy));
@@ -906,6 +992,52 @@ mod tests {
     }
 
     #[test]
+    fn xtc_drops_leading_above_threshold_run() {
+        // logits chosen so p0=0.7312, p1=0.2690, p2≈0.0000332, p3≈0.0000122
+        // (hand-computed softmax of [10, 9, 0, -1]). threshold=0.2 -> both p0
+        // and p1 qualify (above=2), so pos_last=1: drop id 0, keep [1,2,3].
+        // probability=1.0 makes the coin-flip gate always pass regardless of
+        // seed, for a deterministic test.
+        let mut x = Xtc::new(0.2, 1.0, 1, 7);
+        let mut cur = tda(&[10.0, 9.0, 0.0, -1.0]);
+        x.apply(&mut cur);
+        assert_eq!(cur.size, 3);
+        let ids: Vec<u32> = cur.data[..cur.size].iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn xtc_min_keep_blocks_removal() {
+        // Same distribution as above (above=2, pos_last=1, n=4), but
+        // min_keep=4 means dropping 1 candidate would leave only 3 < 4, so
+        // the filter must no-op.
+        let mut x = Xtc::new(0.2, 1.0, 4, 7);
+        let mut cur = tda(&[10.0, 9.0, 0.0, -1.0]);
+        x.apply(&mut cur);
+        assert_eq!(cur.size, 4);
+    }
+
+    #[test]
+    fn xtc_always_keeps_at_least_one_token() {
+        // threshold=0.0: every probability qualifies (above=n), so pos_last =
+        // n-1 -- the filter drops all but the single least-probable
+        // candidate, never all the way to zero.
+        let mut x = Xtc::new(0.0, 1.0, 1, 3);
+        let mut cur = tda(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        x.apply(&mut cur);
+        assert_eq!(cur.size, 1);
+        assert_eq!(cur.data[0].id, 0); // the least-probable (lowest logit) token
+    }
+
+    #[test]
+    fn xtc_zero_probability_is_noop() {
+        let mut x = Xtc::new(0.1, 0.0, 1, 1);
+        let mut cur = tda(&[10.0, 9.0, 0.0, -1.0]);
+        x.apply(&mut cur);
+        assert_eq!(cur.size, 4);
+    }
+
+    #[test]
     fn mirostat_v1_collapses_and_updates_mu_hand_computed() {
         // A dominant logit drives the Zipf estimate's k formula out of its real
         // domain (negative base, fractional exponent -> NaN); the
@@ -953,6 +1085,8 @@ mod tests {
                     mirostat_tau: 5.0,
                     mirostat_eta: 0.1,
                     mirostat_m: 100,
+                    xtc_probability: 0.0,
+                    xtc_threshold: 0.1,
                 };
                 let mut sc = SamplerChain::from_config(&cfg, vocab);
                 (0..20).map(|_| sc.sample(&logits)).collect::<Vec<_>>()
@@ -982,6 +1116,8 @@ mod tests {
             mirostat_tau: 5.0,
             mirostat_eta: 0.1,
             mirostat_m: 100,
+            xtc_probability: 0.0,
+            xtc_threshold: 0.1,
         };
         let logits = [2.0f32, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6];
         let mut sc = SamplerChain::from_config(&cfg, 8);

@@ -41,6 +41,8 @@ Options:
   --mirostat <int>        mirostat mode: 0|1|2, off/v1/v2 (default: 0)
   --mirostat-lr <float>   mirostat learning rate (eta)   (default: 0.1)
   --mirostat-ent <float>  mirostat target entropy (tau)  (default: 5.0)
+  --xtc-probability <f>   XTC probability, 0 = off        (default: 0.0)
+  --xtc-threshold <f>     XTC probability threshold       (default: 0.1)
   --embedding             output an embedding vector instead of text
   --pooling <mode>        embedding pooling: mean|last|cls (default: mean)
   --embd-normalize <n>    embedding norm: 2 = L2, -1 = none     (default: 2)
@@ -76,6 +78,8 @@ struct Args {
     mirostat: u8,
     mirostat_lr: f32,
     mirostat_ent: f32,
+    xtc_probability: f32,
+    xtc_threshold: f32,
     embedding: bool,
     pooling: String,
     embd_normalize: i32,
@@ -337,6 +341,8 @@ fn stream_generation(
         mirostat_tau: args.mirostat_ent,
         mirostat_eta: args.mirostat_lr,
         mirostat_m: 100,
+        xtc_probability: args.xtc_probability,
+        xtc_threshold: args.xtc_threshold,
     };
     let mut sampler = SamplerChain::from_config(&sampler_cfg, model.config.vocab_size);
     if let Some(src) = resolve_grammar(args)? {
@@ -441,6 +447,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         mirostat: 0,
         mirostat_lr: 0.1,
         mirostat_ent: 5.0,
+        xtc_probability: 0.0,
+        xtc_threshold: 0.1,
         embedding: false,
         pooling: "mean".to_string(),
         embd_normalize: 2,
@@ -498,6 +506,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--mirostat" => args.mirostat = value()?.parse()?,
             "--mirostat-lr" => args.mirostat_lr = value()?.parse()?,
             "--mirostat-ent" => args.mirostat_ent = value()?.parse()?,
+            "--xtc-probability" => args.xtc_probability = value()?.parse()?,
+            "--xtc-threshold" => args.xtc_threshold = value()?.parse()?,
             "--pooling" => args.pooling = value()?.clone(),
             "--embd-normalize" => args.embd_normalize = value()?.parse()?,
             "--system" => args.system = value()?.clone(),
