@@ -1,6 +1,8 @@
 //! Weight layout, run-time scratch buffers, and the transformer forward pass.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::adapter::ControlVector;
 use crate::arch::{Arch, FfnActivation};
@@ -623,26 +625,100 @@ fn deq_tensor(gguf: &Gguf, name: &str) -> Result<Vec<f32>> {
 /// well below eagerly allocating the whole `max_seq_len` up front.
 const KV_PAGE: usize = 256;
 
+/// Shared KV-memory accounting across several pool-backed [`RunState`]s (one
+/// pool per server process, since every slot serves the same model).
+///
+/// This tracks a **cell budget** (`n_layers * capacity * kv_dim`, doubled for
+/// `k`+`v`, summed across every pool-backed [`KvCache`] currently checked
+/// out) rather than handing out a literal block table: each `KvCache` still
+/// owns one contiguous buffer, so `layer_k`/`layer_v`/[`RunState::key_cache`]/
+/// [`RunState::value_cache`] keep working completely unchanged for every
+/// backend — including the resident GPU/CUDA decode path, whose stride math
+/// only cares about *this* cache's own current capacity, not the pool.
+/// "Sharing the pool" means slots draw *budget* from a common ceiling and
+/// give it back when their sequence finishes ([`RunState::release_kv`]), not
+/// that they gather-read from another slot's physical pages.
+///
+/// Single-threaded (matches the server worker's ownership model — see
+/// `server.rs`'s module doc: one thread owns every slot's `RunState`), hence
+/// a plain `Rc<RefCell<..>>` rather than atomics or a mutex.
+#[derive(Clone)]
+pub struct KvPagePool {
+    inner: Rc<RefCell<PoolInner>>,
+}
+
+struct PoolInner {
+    budget_cells: usize,
+    used_cells: usize,
+}
+
+impl KvPagePool {
+    /// A pool with room for `budget_cells` total `f32` cells — see the
+    /// struct doc for exactly what's counted.
+    pub fn new(budget_cells: usize) -> Self {
+        KvPagePool {
+            inner: Rc::new(RefCell::new(PoolInner {
+                budget_cells,
+                used_cells: 0,
+            })),
+        }
+    }
+
+    /// Cells currently charged against the budget by every checked-out,
+    /// pool-backed `KvCache`.
+    pub fn used_cells(&self) -> usize {
+        self.inner.borrow().used_cells
+    }
+
+    /// The total budget this pool was constructed with.
+    pub fn budget_cells(&self) -> usize {
+        self.inner.borrow().budget_cells
+    }
+
+    /// Whether there's currently headroom to admit a new sequence. Meant to
+    /// be checked at admission time (before prefill starts) — once a
+    /// sequence is running, refusing to grow its KV would corrupt output, so
+    /// this is backpressure on *new* work, not a hard mid-flight cap. A
+    /// pool can therefore transiently read `used_cells() > budget_cells()`
+    /// while already-admitted sequences keep growing past the ceiling — an
+    /// accepted limitation (no preemption), not a bug.
+    pub fn has_headroom(&self) -> bool {
+        let p = self.inner.borrow();
+        p.used_cells < p.budget_cells
+    }
+
+    fn charge(&self, delta: usize) {
+        self.inner.borrow_mut().used_cells += delta;
+    }
+
+    fn release(&self, amount: usize) {
+        let mut p = self.inner.borrow_mut();
+        p.used_cells = p.used_cells.saturating_sub(amount);
+    }
+}
+
 /// The transformer's key/value cache.
 ///
 /// PHASE-0 INVARIANT: holds exactly **one** sequence; the layout is the flat
 /// `(n_layers, cap, kv_dim)` buffer, `cap` a lazily-grown capacity (<=
 /// `max_seq_len`, see [`KvCache::ensure_capacity`]) rather than eagerly
 /// `max_seq_len` from construction — the memory-efficiency half of Phase 4
-/// (paged, multi-sequence KV — see `docs/Architecture/plans/`); real
-/// multi-sequence sharing is a separate, larger follow-on. All slot/window
-/// arithmetic lives here and nowhere else, so `forward`/`forward_prefill` and
-/// the `Backend` trait don't change. Returned slices are the exact ranges the
-/// old inline `loff`/`kv_at` arithmetic produced, just against `cap` instead
-/// of a fixed `seq_len` — every per-op `Backend::attention`/`attention_batch`
-/// impl already only reads `key_cache[..(pos+1)*kv_dim]`, so a shorter (but
-/// `>= pos+1`) window is correct for them unchanged. The two backends that
-/// mirror the *whole* flat buffer onto a device for resident decode
-/// ([`RunState::key_cache`]/[`RunState::value_cache`], read together with
-/// [`RunState::kv_capacity`] for the current stride) are the ones that do
-/// need to know `cap` explicitly — see `backend/cuda.rs`/`backend/gpu.rs`'s
-/// prefill-KV upload, which computes its per-layer offset from
-/// [`KvCache::capacity`] rather than the model's `seq_len`.
+/// (paged, multi-sequence KV — see `docs/Architecture/plans/`). Optionally
+/// draws that growth from a shared [`KvPagePool`] budget (the multi-sequence
+/// half — see the server's continuous-batching slots) instead of growing
+/// unbounded on its own. All slot/window arithmetic lives here and nowhere
+/// else, so `forward`/`forward_prefill` and the `Backend` trait don't change.
+/// Returned slices are the exact ranges the old inline `loff`/`kv_at`
+/// arithmetic produced, just against `cap` instead of a fixed `seq_len` —
+/// every per-op `Backend::attention`/`attention_batch` impl already only
+/// reads `key_cache[..(pos+1)*kv_dim]`, so a shorter (but `>= pos+1`) window
+/// is correct for them unchanged. The two backends that mirror the *whole*
+/// flat buffer onto a device for resident decode ([`RunState::key_cache`]/
+/// [`RunState::value_cache`], read together with [`RunState::kv_capacity`]
+/// for the current stride) are the ones that do need to know `cap`
+/// explicitly — see `backend/cuda.rs`/`backend/gpu.rs`'s prefill-KV upload,
+/// which computes its per-layer offset from [`KvCache::capacity`] rather
+/// than the model's `seq_len`.
 pub(crate) struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -653,14 +729,28 @@ pub(crate) struct KvCache {
     /// The model's context window — `cap` never exceeds this.
     max_seq_len: usize,
     kv_dim: usize,
+    /// Shared budget this cache draws from, if any — see [`KvPagePool`].
+    /// `None` for a [`RunState::new`] (unpooled) instance: unlimited private
+    /// growth, exactly the behavior before pooling existed.
+    pool: Option<KvPagePool>,
+    /// This cache's current charge against `pool` (cells across *both* `k`
+    /// and `v`, all layers) — tracked so [`KvCache::shrink_to_initial`] can
+    /// give back exactly what it took, without the pool needing to know
+    /// anything about individual caches.
+    charged: usize,
 }
 
 impl KvCache {
     /// Allocate a zeroed cache for `n_layers` layers, capacity starting at
     /// `min(KV_PAGE, max_seq_len)` and growing on demand up to `max_seq_len`.
-    fn new(n_layers: usize, max_seq_len: usize, kv_dim: usize) -> Self {
+    /// Charges its initial allocation against `pool` if given.
+    fn new(n_layers: usize, max_seq_len: usize, kv_dim: usize, pool: Option<KvPagePool>) -> Self {
         let cap = KV_PAGE.min(max_seq_len.max(1));
         let cells = n_layers * cap * kv_dim;
+        let charged = 2 * cells;
+        if let Some(p) = &pool {
+            p.charge(charged);
+        }
         KvCache {
             k: vec![0.0; cells],
             v: vec![0.0; cells],
@@ -668,6 +758,8 @@ impl KvCache {
             cap,
             max_seq_len,
             kv_dim,
+            pool,
+            charged,
         }
     }
 
@@ -685,7 +777,12 @@ impl KvCache {
     /// growing (and relaying out every layer's block into the new stride) in
     /// [`KV_PAGE`] increments if not. A no-op once `cap` reaches
     /// `max_seq_len` — the caller (`forward`/`forward_prefill`) is
-    /// responsible for not writing past the model's context window.
+    /// responsible for not writing past the model's context window. Charges
+    /// the growth delta against `pool`, if any — see [`KvPagePool`]'s doc on
+    /// why this is backpressure on *new* admissions, not a hard mid-flight
+    /// cap: growth here always succeeds (refusing would corrupt an
+    /// in-progress sequence), it just keeps the shared accounting honest for
+    /// other slots' admission checks.
     fn ensure_capacity(&mut self, up_to: usize) {
         if up_to < self.cap || self.cap >= self.max_seq_len {
             return;
@@ -704,9 +801,36 @@ impl KvCache {
             new_k[new_off..new_off + block].copy_from_slice(&self.k[old_off..old_off + block]);
             new_v[new_off..new_off + block].copy_from_slice(&self.v[old_off..old_off + block]);
         }
+        let delta = 2 * self.n_layers * (new_block - block);
+        if let Some(p) = &self.pool {
+            p.charge(delta);
+        }
+        self.charged += delta;
         self.k = new_k;
         self.v = new_v;
         self.cap = new_cap;
+    }
+
+    /// Release any grown capacity back down to the initial `min(KV_PAGE,
+    /// max_seq_len)` size, giving back whatever budget it held to `pool` (if
+    /// any). Call when this cache's sequence finishes, so the next one
+    /// admitted into the same slot starts small again and — for a
+    /// pool-backed cache — other slots see the freed headroom immediately.
+    /// A no-op if already at (or under) the initial size.
+    fn shrink_to_initial(&mut self) {
+        let initial_cap = KV_PAGE.min(self.max_seq_len.max(1));
+        if self.cap <= initial_cap {
+            return;
+        }
+        let cells = self.n_layers * initial_cap * self.kv_dim;
+        let new_charge = 2 * cells;
+        if let Some(p) = &self.pool {
+            p.release(self.charged - new_charge);
+        }
+        self.charged = new_charge;
+        self.k = vec![0.0; cells];
+        self.v = vec![0.0; cells];
+        self.cap = initial_cap;
     }
 
     /// Flat base offset of layer `layer`'s `(cap, kv_dim)` block.
@@ -797,9 +921,27 @@ pub struct RunState {
 }
 
 impl RunState {
-    /// Allocate all scratch buffers for a given model configuration.
+    /// Allocate all scratch buffers for a given model configuration. The KV
+    /// cache grows privately and unbounded (up to `c.seq_len`) — the CLI's
+    /// constructor, unaffected by [`RunState::with_pool`].
     pub fn new(c: &Config) -> Self {
-        let kv_dim = c.kv_dim();
+        Self::build(c, KvCache::new(c.n_layers, c.seq_len, c.kv_dim(), None))
+    }
+
+    /// Like [`RunState::new`], but draws its KV memory from a shared
+    /// [`KvPagePool`] instead of growing unbounded on its own — for the
+    /// server's continuous-batching slots, so many slots share one memory
+    /// ceiling. Pair with [`RunState::release_kv`] when this instance's
+    /// sequence finishes, so its capacity (and the pool budget it holds) is
+    /// given back before the slot admits the next one.
+    pub fn with_pool(c: &Config, pool: &KvPagePool) -> Self {
+        Self::build(
+            c,
+            KvCache::new(c.n_layers, c.seq_len, c.kv_dim(), Some(pool.clone())),
+        )
+    }
+
+    fn build(c: &Config, kv: KvCache) -> Self {
         let q_dim = c.q_dim();
         // Attention buffers follow `q_dim` (= dim for Llama-style, but distinct
         // when an explicit head_dim makes n_heads*head_dim ≠ dim, e.g. Gemma).
@@ -817,8 +959,17 @@ impl RunState {
             logits: vec![0.0; c.vocab_size],
             router: vec![0.0; c.n_expert],
             moe_tmp: vec![0.0; if c.n_expert > 0 { c.dim } else { 0 }],
-            kv: KvCache::new(c.n_layers, c.seq_len, kv_dim),
+            kv,
         }
+    }
+
+    /// Release this instance's KV memory back down to its idle size, giving
+    /// back any [`KvPagePool`] budget it held (a no-op beyond the shrink
+    /// itself for a [`RunState::new`]/unpooled instance — there's no pool to
+    /// notify). Call when its sequence finishes, before the slot admits a
+    /// new one.
+    pub fn release_kv(&mut self) {
+        self.kv.shrink_to_initial();
     }
 
     /// Logits produced by the most recent [`forward`] call.
@@ -1893,7 +2044,7 @@ mod tests {
     #[test]
     fn kv_cache_offsets_match_flat_layout() {
         // 2 layers × 3 positions × kv_dim 4. Guards the extracted loff/slot math.
-        let mut kv = KvCache::new(2, 3, 4);
+        let mut kv = KvCache::new(2, 3, 4, None);
         assert_eq!(kv.layer_base(0), 0);
         assert_eq!(kv.layer_base(1), 12);
         assert_eq!(kv.layer_k(1).len(), 12);
@@ -1911,14 +2062,14 @@ mod tests {
     fn kv_cache_short_sequence_uses_less_than_max_seq_len_capacity() {
         // The memory win: a context window far larger than what's actually
         // used shouldn't cost that much memory up front.
-        let kv = KvCache::new(4, 8192, 16);
+        let kv = KvCache::new(4, 8192, 16, None);
         assert_eq!(kv.capacity(), KV_PAGE);
         assert!(kv.capacity() < 8192);
     }
 
     #[test]
     fn kv_cache_grows_lazily_and_preserves_existing_data() {
-        let mut kv = KvCache::new(2, 1000, 4);
+        let mut kv = KvCache::new(2, 1000, 4, None);
         assert_eq!(kv.capacity(), KV_PAGE);
 
         // Write within the initial page — no growth yet.
@@ -1941,11 +2092,85 @@ mod tests {
 
     #[test]
     fn kv_cache_capacity_never_exceeds_max_seq_len() {
-        let mut kv = KvCache::new(1, 10, 4);
+        let mut kv = KvCache::new(1, 10, 4, None);
         assert_eq!(kv.capacity(), 10); // KV_PAGE=256 clamped down to max_seq_len=10
         kv.k_slot_mut(0, 9).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(kv.capacity(), 10);
         assert_eq!(&kv.layer_k(0)[36..40], [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn kv_pool_shares_budget_across_caches_and_reclaims_on_shrink() {
+        let pool = KvPagePool::new(1_000_000); // generous budget
+        let mut a = KvCache::new(2, 1000, 4, Some(pool.clone()));
+        let b_initial = 2 * 2 * KV_PAGE * 4; // n_layers=2, kv_dim=4, *2 for k+v
+        assert_eq!(pool.used_cells(), b_initial); // just `a` so far
+        let _b = KvCache::new(2, 1000, 4, Some(pool.clone()));
+        assert_eq!(pool.used_cells(), 2 * b_initial); // `a` + `b`, independently charged
+
+        // Growing `a` charges the pool on top of both caches' initial charge.
+        a.k_slot_mut(0, 300).copy_from_slice(&[0.0; 4]);
+        let after_a_grow = pool.used_cells();
+        assert!(after_a_grow > 2 * b_initial);
+
+        // Shrinking `a` back gives its growth back to the shared pool — `b`
+        // is untouched, so total usage returns to exactly the two initial
+        // charges.
+        a.shrink_to_initial();
+        assert_eq!(pool.used_cells(), 2 * b_initial);
+    }
+
+    #[test]
+    fn kv_pool_has_headroom_reflects_budget() {
+        // Room for exactly one cache's initial charge (n_layers=2, kv_dim=4).
+        let budget = 2 * 2 * KV_PAGE * 4;
+        let pool = KvPagePool::new(budget);
+        assert!(pool.has_headroom());
+        let mut a = KvCache::new(2, 1000, 4, Some(pool.clone()));
+        assert!(
+            !pool.has_headroom(),
+            "budget exactly exhausted by one cache's initial charge"
+        );
+        // Growth is never blocked mid-flight (see KvPagePool's doc) — it can
+        // push used past budget, and has_headroom then correctly stays false
+        // rather than somehow reporting "true" once already over.
+        a.k_slot_mut(0, 300).copy_from_slice(&[0.0; 4]);
+        assert!(pool.used_cells() > budget);
+        assert!(!pool.has_headroom());
+        // Releasing brings usage back down to exactly the budget (no longer
+        // over it), though has_headroom() still reports false — the initial
+        // charge alone consumes the whole budget, so there was never true
+        // spare room to "return to".
+        a.shrink_to_initial();
+        assert_eq!(pool.used_cells(), budget);
+        assert!(!pool.has_headroom());
+    }
+
+    #[test]
+    fn run_state_with_pool_charges_and_release_kv_reclaims() {
+        let c = Config {
+            dim: 8,
+            hidden_dim: 16,
+            n_layers: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            vocab_size: 16,
+            seq_len: 1000,
+            ..Default::default()
+        };
+        let pool = KvPagePool::new(1_000_000);
+        let mut state = RunState::with_pool(&c, &pool);
+        let initial_used = pool.used_cells();
+        assert!(initial_used > 0);
+
+        // Drive real growth through the same path `forward`/`forward_prefill`
+        // use, not a private KvCache method directly. kv_dim = n_kv_heads *
+        // (dim / n_heads) = 2 * 4 = 8.
+        state.kv.k_slot_mut(0, 500).copy_from_slice(&[0.0; 8]);
+        assert!(pool.used_cells() > initial_used);
+
+        state.release_kv();
+        assert_eq!(pool.used_cells(), initial_used);
     }
 
     fn moe_model_bytes(n_expert: usize, n_expert_used: usize) -> Vec<u8> {

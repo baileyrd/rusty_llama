@@ -26,9 +26,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::make_backend;
 use crate::chat::{ChatRenderer, Message, Role};
+use crate::config::Config;
 use crate::gguf::Gguf;
 use crate::loader::Checkpoint;
-use crate::model::{forward_prefill, Batch, Model, RunState};
+use crate::model::{forward_prefill, Batch, KvPagePool, Model, RunState};
 use crate::grammar::{Grammar, GrammarStage, JSON_GRAMMAR};
 use crate::sampler::{SamplerChain, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -265,6 +266,22 @@ fn batch_cap() -> usize {
         .max(1)
 }
 
+/// Shared KV-cache pool budget, in `f32` cells (k and v counted separately).
+/// Override with `RUSTY_LLAMA_KV_BUDGET_MB`. Defaults to what `cap` slots
+/// would have eagerly reserved pre-paging (`cap * 2 * n_layers * seq_len *
+/// kv_dim`) — the worst case doesn't regress, but slots that stay short
+/// leave the difference for others to grow into instead of it sitting
+/// reserved-but-idle per slot.
+fn kv_budget_cells(cap: usize, config: &Config) -> usize {
+    match std::env::var("RUSTY_LLAMA_KV_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(mb) => (mb * 1024 * 1024 / std::mem::size_of::<f32>()).max(1),
+        None => cap * 2 * config.n_layers * config.seq_len * config.kv_dim(),
+    }
+}
+
 /// An in-flight sequence occupying a decode slot.
 struct Slot {
     reply: Sender<Event>,
@@ -353,7 +370,13 @@ fn worker(
     let vocab = model.config.vocab_size;
     let seq_len = model.config.seq_len;
     let mut batch = Batch::new(&model.config, cap);
-    let mut states: Vec<RunState> = (0..cap).map(|_| RunState::new(&model.config)).collect();
+    // Slots share one KV cell budget instead of each reserving its own
+    // worst-case allocation — a slot that finishes early (or never grows past
+    // a short prompt) frees cells for the others instead of holding them idle.
+    let kv_pool = KvPagePool::new(kv_budget_cells(cap, &model.config));
+    let mut states: Vec<RunState> = (0..cap)
+        .map(|_| RunState::with_pool(&model.config, &kv_pool))
+        .collect();
     let mut slots: Vec<Option<Slot>> = (0..cap).map(|_| None).collect();
     let mut queue: VecDeque<Job> = VecDeque::new();
     // End-of-generation ids + a lazily-built token-piece table for grammar
@@ -376,20 +399,27 @@ fn worker(
 
         // Admit queued prompts into free slots (serial prefill, per-op path so
         // the host KV the batched decode reads is consistent on every backend).
+        // Once other slots are already active, back off admitting more while
+        // the shared pool has no headroom, so growth of in-flight sequences
+        // isn't starved by new ones — but never refuse the very first
+        // admission of an idle round, or a too-small pool budget would
+        // deadlock the server instead of just running over budget.
         for i in 0..cap {
-            if slots[i].is_none() {
-                if let Some(job) = queue.pop_front() {
-                    slots[i] = admit(
-                        &model,
-                        &tokenizer,
-                        backend.as_ref(),
-                        template.as_ref(),
-                        &mut states[i],
-                        &mut pieces,
-                        &eog,
-                        job,
-                    );
-                }
+            if slots[i].is_none()
+                && (active_now == 0 || kv_pool.has_headroom())
+                && !queue.is_empty()
+            {
+                let job = queue.pop_front().unwrap();
+                slots[i] = admit(
+                    &model,
+                    &tokenizer,
+                    backend.as_ref(),
+                    template.as_ref(),
+                    &mut states[i],
+                    &mut pieces,
+                    &eog,
+                    job,
+                );
             }
         }
 
@@ -401,6 +431,7 @@ fn worker(
             }
             if slot_opt.as_ref().unwrap().is_done(&tokenizer, seq_len) {
                 slot_opt.take().unwrap().finish();
+                states[i].release_kv();
             } else {
                 slot_opt.as_mut().unwrap().emit(&tokenizer);
                 active.push(i);
