@@ -13,6 +13,7 @@
 //! | Q4_0   | 32           | 18          | 4-bit, single scale           |
 //! | Q4_1   | 32           | 20          | 4-bit, scale + min             |
 //! | Q5_0   | 32           | 22          | 5-bit (4-bit + high plane), single scale |
+//! | Q5_1   | 32           | 24          | 5-bit (4-bit + high plane), scale + min |
 //! | Q8_0   | 32           | 34          | 8-bit, single scale           |
 //! | Q4_K   | 256          | 144         | k-quant, 8 sub-block scales   |
 //! | Q6_K   | 256          | 210         | k-quant, 16 sub-block scales  |
@@ -37,6 +38,7 @@ pub enum GgmlType {
     Q4_0,
     Q4_1,
     Q5_0,
+    Q5_1,
     Q8_0,
     Q4_K,
     Q6_K,
@@ -51,6 +53,7 @@ impl GgmlType {
             2 => GgmlType::Q4_0,
             3 => GgmlType::Q4_1,
             6 => GgmlType::Q5_0,
+            7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4_K,
             14 => GgmlType::Q6_K,
@@ -70,6 +73,7 @@ impl GgmlType {
             GgmlType::Q4_0 => 2,
             GgmlType::Q4_1 => 3,
             GgmlType::Q5_0 => 6,
+            GgmlType::Q5_1 => 7,
             GgmlType::Q8_0 => 8,
             GgmlType::Q4_K => 12,
             GgmlType::Q6_K => 14,
@@ -80,7 +84,9 @@ impl GgmlType {
     pub fn block_size(self) -> usize {
         match self {
             GgmlType::F32 | GgmlType::F16 => 1,
-            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q8_0 => 32,
+            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
+                32
+            }
             GgmlType::Q4_K | GgmlType::Q6_K => QK_K,
         }
     }
@@ -93,6 +99,7 @@ impl GgmlType {
             GgmlType::Q4_0 => 18,
             GgmlType::Q4_1 => 20,
             GgmlType::Q5_0 => 22,
+            GgmlType::Q5_1 => 24,
             GgmlType::Q8_0 => 34,
             GgmlType::Q4_K => 144,
             GgmlType::Q6_K => 210,
@@ -144,6 +151,7 @@ pub fn dequant_block(ty: GgmlType, chunk: &[u8], out: &mut [f32]) {
         GgmlType::Q4_0 => block_q4_0(chunk, out),
         GgmlType::Q4_1 => block_q4_1(chunk, out),
         GgmlType::Q5_0 => block_q5_0(chunk, out),
+        GgmlType::Q5_1 => block_q5_1(chunk, out),
         GgmlType::Q8_0 => block_q8_0(chunk, out),
         GgmlType::Q4_K => block_q4_k(chunk, out),
         GgmlType::Q6_K => block_q6_k(chunk, out),
@@ -257,6 +265,24 @@ fn block_q5_0(blk: &[u8], out: &mut [f32]) {
         let x1 = ((qs[j] >> 4) | xh_1) as i32 - 16;
         out[j] = x0 as f32 * d;
         out[j + 16] = x1 as f32 * d;
+    }
+}
+
+/// `Q5_1`: [`block_q5_0`]'s 5-bit nibble+high-bit packing with an explicit
+/// `(delta, min)` pair instead of a `-16` zero point — `x = q*d + m`, `q`
+/// unsigned in `[0, 31]` (the same relationship `Q4_1` has to `Q4_0`).
+fn block_q5_1(blk: &[u8], out: &mut [f32]) {
+    let d = rd_f16(blk, 0);
+    let m = rd_f16(blk, 2);
+    let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+    let qs = &blk[8..24];
+    for j in 0..16 {
+        let xh_0 = (((qh >> j) << 4) & 0x10) as u8;
+        let xh_1 = ((qh >> (j + 12)) & 0x10) as u8;
+        let x0 = (qs[j] & 0x0f) | xh_0;
+        let x1 = (qs[j] >> 4) | xh_1;
+        out[j] = x0 as f32 * d + m;
+        out[j + 16] = x1 as f32 * d + m;
     }
 }
 
@@ -1541,6 +1567,67 @@ mod tests {
         let y1 = dequantize(GgmlType::Q5_0, &max_blk, 32).unwrap();
         assert!((y1[0] - 15.0).abs() < 1e-4, "{}", y1[0]);
         assert!((y1[16] - 15.0).abs() < 1e-4, "{}", y1[16]);
+    }
+
+    #[test]
+    fn q5_1_hand_computed_block_no_high_bits() {
+        // qh = 0: reduces to a 4-bit nibble scaled by d and offset by m (no 5th
+        // bit set, no -16 zero point — unlike Q5_0, Q5_1 has an explicit min).
+        let d = 0.5f32;
+        let m = -1.0f32;
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        blk.extend_from_slice(&f32_to_f16(m).to_le_bytes());
+        blk.extend_from_slice(&0u32.to_le_bytes());
+        let qs: Vec<u8> = (0..16u8).map(|j| j | ((15 - j) << 4)).collect();
+        blk.extend_from_slice(&qs);
+        assert_eq!(blk.len(), GgmlType::Q5_1.type_size());
+
+        let y = dequantize(GgmlType::Q5_1, &blk, 32).unwrap();
+        for j in 0..16 {
+            let want_lo = j as f32 * d + m;
+            let want_hi = (15 - j) as f32 * d + m;
+            assert!((y[j] - want_lo).abs() < 1e-4, "lo[{j}]: {} vs {want_lo}", y[j]);
+            assert!(
+                (y[j + 16] - want_hi).abs() < 1e-4,
+                "hi[{j}]: {} vs {want_hi}",
+                y[j + 16]
+            );
+        }
+    }
+
+    #[test]
+    fn q5_1_high_bit_plane() {
+        // The 5th bit (packed in `qh`) adds 16 to the raw nibble, with no
+        // subsequent zero-point subtraction (unlike Q5_0): a zero nibble +
+        // high bit -> raw 16 -> 16*d + m; a max nibble (15) + high bit ->
+        // raw 31 -> 31*d + m.
+        let d = 1.0f32;
+        let m = 2.0f32;
+        let qh: u32 = (1 << 0) | (1 << 16);
+
+        let mut zero_blk = Vec::new();
+        zero_blk.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        zero_blk.extend_from_slice(&f32_to_f16(m).to_le_bytes());
+        zero_blk.extend_from_slice(&qh.to_le_bytes());
+        zero_blk.extend_from_slice(&[0u8; 16]);
+        assert_eq!(zero_blk.len(), GgmlType::Q5_1.type_size());
+        let y0 = dequantize(GgmlType::Q5_1, &zero_blk, 32).unwrap();
+        let want0 = 16.0 * d + m;
+        assert!((y0[0] - want0).abs() < 1e-4, "{}", y0[0]);
+        assert!((y0[16] - want0).abs() < 1e-4, "{}", y0[16]);
+
+        let mut max_blk = Vec::new();
+        max_blk.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        max_blk.extend_from_slice(&f32_to_f16(m).to_le_bytes());
+        max_blk.extend_from_slice(&qh.to_le_bytes());
+        let mut qs = [0u8; 16];
+        qs[0] = 0x0f | (0x0f << 4);
+        max_blk.extend_from_slice(&qs);
+        let y1 = dequantize(GgmlType::Q5_1, &max_blk, 32).unwrap();
+        let want1 = 31.0 * d + m;
+        assert!((y1[0] - want1).abs() < 1e-4, "{}", y1[0]);
+        assert!((y1[16] - want1).abs() < 1e-4, "{}", y1[16]);
     }
 
     #[test]
