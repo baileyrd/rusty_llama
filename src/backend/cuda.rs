@@ -1354,9 +1354,14 @@ impl Backend for CudaBackend {
         let q_hid_ok = qgemv_enabled() && hidden % 256 == 0;
 
         // One-time host→device sync of any KV rows a prior prefill filled.
+        // `loff` uses the host `KvCache`'s *current* capacity as its stride,
+        // not `d.seq_len` (the device buffer's fixed max size) — the host
+        // side may hold fewer positions than that if paging hasn't grown it
+        // that far yet (see `RunState::kv_capacity`/`KvCache`'s struct doc).
         if d.kv_filled < pos {
+            let host_stride = state.kv_capacity();
             for l in 0..d.n_layers {
-                let loff = l * d.seq_len * kv_dim;
+                let loff = l * host_stride * kv_dim;
                 let (lo, hi) = (loff + d.kv_filled * kv_dim, loff + pos * kv_dim);
                 let off = d.kv_filled * kv_dim;
                 let span = hi - lo;

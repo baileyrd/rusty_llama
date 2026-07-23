@@ -1846,10 +1846,13 @@ impl GpuBackend {
         let d = guard.as_mut().unwrap();
 
         // One-time host->device sync of any KV positions a prior prefill filled.
+        // `loff` uses the host `KvCache`'s *current* capacity as its stride,
+        // not `d.seq_len` (the device buffer's fixed max size) — see the
+        // matching comment in `backend/cuda.rs`'s `forward_step`.
         if d.kv_filled < pos {
-            let (kv_dim, seq) = (d.kv_dim, d.seq_len);
+            let (kv_dim, host_stride) = (d.kv_dim, state.kv_capacity());
             for l in 0..d.n_layers {
-                let loff = l * seq * kv_dim;
+                let loff = l * host_stride * kv_dim;
                 let lo = loff + d.kv_filled * kv_dim;
                 let hi = loff + pos * kv_dim;
                 let off = (d.kv_filled * kv_dim * 4) as u64;
