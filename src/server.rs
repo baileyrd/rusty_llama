@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::make_backend;
-use crate::chat::{ChatTemplate, Message, Role};
+use crate::chat::{ChatRenderer, Message, Role};
 use crate::gguf::Gguf;
 use crate::loader::Checkpoint;
 use crate::model::{forward_prefill, Batch, Model, RunState};
@@ -383,7 +383,7 @@ fn worker(
                         &model,
                         &tokenizer,
                         backend.as_ref(),
-                        template,
+                        template.as_ref(),
                         &mut states[i],
                         &mut pieces,
                         &eog,
@@ -432,7 +432,7 @@ fn admit(
     model: &Model,
     tokenizer: &Tokenizer,
     backend: &dyn crate::Backend,
-    template: Option<ChatTemplate>,
+    template: Option<&ChatRenderer>,
     state: &mut RunState,
     pieces: &mut Option<Arc<Vec<Vec<u8>>>>,
     eog: &[u32],
@@ -447,8 +447,22 @@ fn admit(
                 ));
                 return None;
             };
-            let rendered = t.render(msgs, true);
-            tokenizer.encode(&rendered, tokenizer.add_bos() && !t.emits_bos(), false)
+            let eos_token = tokenizer
+                .eos()
+                .map(|id| String::from_utf8_lossy(&tokenizer.token_piece(id)).into_owned())
+                .unwrap_or_default();
+            let rendered = match t.render(msgs, true, &eos_token) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = job.reply.send(Event::Error(format!("chat template: {e}")));
+                    return None;
+                }
+            };
+            tokenizer.encode(
+                &rendered,
+                tokenizer.add_bos() && t.needs_tokenizer_bos(),
+                false,
+            )
         }
         JobKind::Completion(text) => tokenizer.encode(text, tokenizer.add_bos(), false),
     };
@@ -499,12 +513,9 @@ fn admit(
     })
 }
 
-fn resolve_template(gguf: &Gguf, override_name: Option<&str>) -> Option<ChatTemplate> {
-    if let Some(name) = override_name {
-        return ChatTemplate::from_name(name);
-    }
+fn resolve_template(gguf: &Gguf, override_name: Option<&str>) -> Option<ChatRenderer> {
     let arch = gguf.meta_str("general.architecture").unwrap_or_default();
-    ChatTemplate::detect(gguf, arch)
+    ChatRenderer::resolve(gguf, arch, override_name)
 }
 
 // ---------------------------------------------------------------------------

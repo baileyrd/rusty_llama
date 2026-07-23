@@ -12,6 +12,12 @@ cudarc = { version = "0.19", optional = true, default-features = false }
 fancy-regex = "0.18.0"
 half = { version = "2", optional = true }
 memmap2 = "0.9"
+# Renders a GGUF's actual embedded `tokenizer.chat_template` Jinja source
+# (falling back to the hardcoded families in src/chat.rs only when a GGUF has
+# no template string at all) instead of pattern-matching known families.
+# Not feature-gated like gpu/cuda/server — chat templating is core, not
+# optional — so this is the fourth base dependency (was three).
+minijinja = "2"
 pollster = { version = "0.4.0", optional = true }
 rayon = "1"
 serde = { version = "1", optional = true, features = ["derive"] }
