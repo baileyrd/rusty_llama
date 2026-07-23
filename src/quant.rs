@@ -15,6 +15,7 @@
 //! | Q5_0   | 32           | 22          | 5-bit (4-bit + high plane), single scale |
 //! | Q5_1   | 32           | 24          | 5-bit (4-bit + high plane), scale + min |
 //! | Q8_0   | 32           | 34          | 8-bit, single scale           |
+//! | Q2_K   | 256          | 84          | k-quant, 16 sub-block scales+mins, 2-bit |
 //! | Q3_K   | 256          | 110         | k-quant, 16 sub-block scales, 3-bit |
 //! | Q4_K   | 256          | 144         | k-quant, 8 sub-block scales   |
 //! | Q5_K   | 256          | 176         | k-quant, 8 sub-block scales, 5-bit |
@@ -42,6 +43,7 @@ pub enum GgmlType {
     Q5_0,
     Q5_1,
     Q8_0,
+    Q2_K,
     Q3_K,
     Q4_K,
     Q5_K,
@@ -59,6 +61,7 @@ impl GgmlType {
             6 => GgmlType::Q5_0,
             7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
+            10 => GgmlType::Q2_K,
             11 => GgmlType::Q3_K,
             12 => GgmlType::Q4_K,
             13 => GgmlType::Q5_K,
@@ -81,6 +84,7 @@ impl GgmlType {
             GgmlType::Q5_0 => 6,
             GgmlType::Q5_1 => 7,
             GgmlType::Q8_0 => 8,
+            GgmlType::Q2_K => 10,
             GgmlType::Q3_K => 11,
             GgmlType::Q4_K => 12,
             GgmlType::Q5_K => 13,
@@ -95,7 +99,9 @@ impl GgmlType {
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
                 32
             }
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => QK_K,
+            GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => {
+                QK_K
+            }
         }
     }
 
@@ -109,6 +115,7 @@ impl GgmlType {
             GgmlType::Q5_0 => 22,
             GgmlType::Q5_1 => 24,
             GgmlType::Q8_0 => 34,
+            GgmlType::Q2_K => 84,
             GgmlType::Q3_K => 110,
             GgmlType::Q4_K => 144,
             GgmlType::Q5_K => 176,
@@ -163,6 +170,7 @@ pub fn dequant_block(ty: GgmlType, chunk: &[u8], out: &mut [f32]) {
         GgmlType::Q5_0 => block_q5_0(chunk, out),
         GgmlType::Q5_1 => block_q5_1(chunk, out),
         GgmlType::Q8_0 => block_q8_0(chunk, out),
+        GgmlType::Q2_K => block_q2_k(chunk, out),
         GgmlType::Q3_K => block_q3_k(chunk, out),
         GgmlType::Q4_K => block_q4_k(chunk, out),
         GgmlType::Q5_K => block_q5_k(chunk, out),
@@ -328,6 +336,44 @@ fn q3_k_scales(raw: &[u8; 12]) -> [i8; 16] {
         s[12 + b] = ((lo1 >> 4) | (((hi >> 6) & 0x03) << 4)) as i8;
     }
     s
+}
+
+/// `Q2_K`: a 256-element k-quant super-block of 2-bit weights, the simplest
+/// k-quant scale scheme — 16 sub-block scale bytes, each holding *both* a
+/// 4-bit scale (low nibble) and a 4-bit min (high nibble) directly, no
+/// bit-shuffling across bytes needed (unlike [`get_scale_min_k4`] or
+/// [`q3_k_scales`]).
+fn block_q2_k(blk: &[u8], out: &mut [f32]) {
+    let scales = &blk[0..16];
+    let qs = &blk[16..80];
+    let d = rd_f16(blk, 80);
+    let dmin = rd_f16(blk, 82);
+
+    let mut y = 0usize;
+    let mut is = 0usize;
+    for n in 0..2 {
+        let q = &qs[n * 32..n * 32 + 32];
+        let mut shift = 0u32;
+        for _j in 0..4 {
+            let sc = scales[is];
+            is += 1;
+            let dl = d * (sc & 0x0f) as f32;
+            let ml = dmin * (sc >> 4) as f32;
+            for &qb in q.iter().take(16) {
+                out[y] = dl * ((qb >> shift) & 3) as f32 - ml;
+                y += 1;
+            }
+            let sc = scales[is];
+            is += 1;
+            let dl = d * (sc & 0x0f) as f32;
+            let ml = dmin * (sc >> 4) as f32;
+            for &qb in q.iter().skip(16).take(16) {
+                out[y] = dl * ((qb >> shift) & 3) as f32 - ml;
+                y += 1;
+            }
+            shift += 2;
+        }
+    }
 }
 
 /// `Q3_K`: a 256-element k-quant super-block of 3-bit weights — a 2-bit plane
@@ -1751,6 +1797,44 @@ mod tests {
 
         let y = dequantize(GgmlType::Q4_K, &blk, QK_K).unwrap();
         assert!(y.iter().all(|&v| (v - 1.0).abs() < 1e-4), "{:?}", &y[..4]);
+    }
+
+    #[test]
+    fn q2_k_constant_block() {
+        let mut blk = Vec::new();
+        blk.extend(std::iter::repeat_n(0x11u8, QK_K / 16)); // scales: dl=1, ml=1 uniform
+        blk.extend(std::iter::repeat_n(0xffu8, QK_K / 4)); // qs: every 2-bit slice is 3
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes()); // d
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes()); // dmin
+        assert_eq!(blk.len(), GgmlType::Q2_K.type_size());
+
+        let y = dequantize(GgmlType::Q2_K, &blk, QK_K).unwrap();
+        // dl=1, ml=1, 2-bit value=3 everywhere -> 1*3 - 1 = 2.
+        assert!(y.iter().all(|&v| (v - 2.0).abs() < 1e-4), "{:?}", &y[..4]);
+    }
+
+    #[test]
+    fn q2_k_shift_progression_hand_computed() {
+        // 0xE4 = 0b1110_0100: (byte>>shift)&3 = 0,1,2,3 for shift=0,2,4,6
+        // (same byte used for the Q3_K shift tests, same derivation).
+        let mut blk = Vec::new();
+        blk.extend(std::iter::repeat_n(0x11u8, QK_K / 16)); // dl=1, ml=1 uniform
+        blk.extend(std::iter::repeat_n(0xE4u8, QK_K / 4));
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        assert_eq!(blk.len(), GgmlType::Q2_K.type_size());
+
+        let y = dequantize(GgmlType::Q2_K, &blk, QK_K).unwrap();
+        // Each of the two 128-wide n-blocks repeats four 32-wide plateaus:
+        // dl*val - ml = 1*val - 1 for val = 0,1,2,3 (shift = 0,2,4,6).
+        for half in [0usize, 128] {
+            for (j, &want) in [-1.0f32, 0.0, 1.0, 2.0].iter().enumerate() {
+                let start = half + j * 32;
+                for &v in &y[start..start + 32] {
+                    assert!((v - want).abs() < 1e-4, "half={half} j={j}: {v} vs {want}");
+                }
+            }
+        }
     }
 
     #[test]
