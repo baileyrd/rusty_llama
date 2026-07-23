@@ -58,6 +58,8 @@ struct SamplingParams {
     mirostat: Option<u8>,
     mirostat_tau: Option<f32>,
     mirostat_eta: Option<f32>,
+    xtc_probability: Option<f32>,
+    xtc_threshold: Option<f32>,
 }
 
 /// OpenAI `response_format` — `{"type":"json_object"}` constrains output to JSON.
@@ -780,6 +782,8 @@ fn resolve_sampler(p: &SamplingParams) -> SamplerConfig {
         mirostat_tau: p.mirostat_tau.unwrap_or(5.0),
         mirostat_eta: p.mirostat_eta.unwrap_or(0.1),
         mirostat_m: 100,
+        xtc_probability: p.xtc_probability.unwrap_or(0.0),
+        xtc_threshold: p.xtc_threshold.unwrap_or(0.1),
     }
 }
 
