@@ -5,6 +5,37 @@ requests against `main` instead, reverse chronological, one entry per PR.
 
 ---
 
+## PR #92 — Share a KV cell budget across server slots via KvPagePool
+**2026-07-23** · [#92](https://github.com/baileyrd/rusty_llama/pull/92)
+
+- **Added:** `KvPagePool`, a shared cell-budget accounting structure
+  (`Rc<RefCell<...>>`, matching the single-threaded worker's ownership
+  model), and `RunState::with_pool`/`RunState::release_kv` alongside the
+  existing `RunState::new` (unchanged, still a private unbounded cache — the
+  CLI's call site is untouched). The server worker now builds one pool per
+  process and every slot's `RunState` draws from it, so `cap` slots share
+  one memory ceiling instead of each independently growing without bound;
+  `release_kv()` returns a slot's growth to the pool when its sequence
+  finishes, before the slot's next admission.
+- Default pool budget matches what `cap` slots would have eagerly reserved
+  pre-paging (`cap * 2 * n_layers * seq_len * kv_dim`) — the worst case
+  doesn't regress. Override via `RUSTY_LLAMA_KV_BUDGET_MB`.
+- Admission of a new job backs off while the pool has no headroom *and* at
+  least one other slot is already active, so an in-flight sequence's growth
+  isn't starved by new arrivals — but the very first admission of an
+  otherwise-idle round is never blocked, so a too-small configured budget
+  runs over rather than deadlocking the server. `has_headroom()` is
+  admission-time backpressure only, never mid-generation blocking (which
+  would corrupt an in-flight sequence).
+- Deliberately built as the full shared page-pool (breaking `RunState`
+  constructor addition) rather than a narrower shrink-on-finish-only
+  alternative, per explicit direction — `KvPagePool` tracks a cell budget,
+  not a literal page/block-table; each `KvCache` still owns one contiguous
+  buffer, so #87's paging invariants are unchanged.
+- Closes #88 (split from #75 alongside #87/#90, held pending this design).
+- 3 new unit tests; full suite 173+22+9+3+2 / 205+22+9+3+2+1 (default /
+  `--all-features`) passed, 0 failed.
+
 ## PR #90 — Page KvCache: grow capacity lazily instead of eagerly reserving seq_len
 **2026-07-23** · [#90](https://github.com/baileyrd/rusty_llama/pull/90)
 
