@@ -5,6 +5,56 @@ requests against `main` instead, reverse chronological, one entry per PR.
 
 ---
 
+## PR #90 — Page KvCache: grow capacity lazily instead of eagerly reserving seq_len
+**2026-07-23** · [#90](https://github.com/baileyrd/rusty_llama/pull/90)
+
+- **Changed:** `KvCache` starts at `min(KV_PAGE, max_seq_len)` capacity (256
+  positions) and grows in `KV_PAGE` increments — relaying out each layer's
+  block on growth — instead of eagerly allocating the full context window at
+  construction. `RunState`'s public API is unchanged; this is purely an
+  internal `KvCache` representation change.
+- **Fixed:** the resident GPU/CUDA decode paths' one-time prefill-KV upload
+  (`backend/cuda.rs`, `backend/gpu.rs`) previously computed their per-layer
+  host-buffer offset from the model's fixed `seq_len` — an assumption paging
+  breaks outright (a correctness bug, not just a missed optimization, if left
+  as-is). Both now read the KV cache's actual current capacity via the new
+  `RunState::kv_capacity()`.
+- No GPU in this environment: the CUDA/wgpu offset-math fix is
+  compile-verified (`cargo build/test/clippy --all-features` clean) and
+  reasoned through against each function's existing contract, but not run on
+  real hardware — stated plainly rather than claimed as a runtime guarantee.
+- Split from #75 (originally filed as one issue conflating this with
+  cross-slot pool sharing, which needs a breaking `RunState` constructor
+  change and stays held as #88).
+- 3 new `KvCache` unit tests (including a data-survives-relayout check); full
+  suite 170+22+9+3+2 / 202+22+9+3+2+1 (default / `--all-features`) passed, 0
+  failed.
+
+## PR #89 — Render chat via the GGUF's embedded Jinja template (minijinja)
+**2026-07-23** · [#89](https://github.com/baileyrd/rusty_llama/pull/89)
+
+- **Added:** `minijinja` as a new (non-optional) dependency — the base build
+  goes from three small deps to four, a deliberate trade approved before
+  implementation. `ChatRenderer::resolve` now prefers rendering a GGUF's
+  actual `tokenizer.chat_template` Jinja source via `minijinja` over
+  pattern-matching known families, falling back to the 5 existing hardcoded
+  `ChatTemplate` renderers only when a GGUF has no template string at all. A
+  template that fails to parse/render is a hard error, never a silent
+  fallback to a guessed family.
+- `bos_token` is always passed as `""` to the Jinja context (whether a given
+  template embeds it isn't statically knowable per-template), so BOS is
+  always added via the tokenizer instead — a deliberate simplification,
+  documented on `render_jinja`.
+- `ChatTemplate` itself is untouched; every pre-existing test passes
+  unmodified.
+- No real GGUF files or network access to fetch one in this environment, so
+  the "byte-identical to a live upstream template" criterion was adjusted to
+  a hand-traced, independently-verified Jinja template exercising the same
+  rendering mechanism (loops/if/interpolation) — stated as a real scope
+  limitation, not a corner cut for convenience.
+- 6 new `chat.rs` unit tests; full suite 167+22+9+3+2 / 199+22+9+3+2+1
+  passed, 0 failed.
+
 ## PR #85 — Support sharded (multi-file) GGUF loading
 **2026-07-23** · [#85](https://github.com/baileyrd/rusty_llama/pull/85)
 
