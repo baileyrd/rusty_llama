@@ -15,6 +15,7 @@
 //! | Q5_0   | 32           | 22          | 5-bit (4-bit + high plane), single scale |
 //! | Q5_1   | 32           | 24          | 5-bit (4-bit + high plane), scale + min |
 //! | Q8_0   | 32           | 34          | 8-bit, single scale           |
+//! | Q3_K   | 256          | 110         | k-quant, 16 sub-block scales, 3-bit |
 //! | Q4_K   | 256          | 144         | k-quant, 8 sub-block scales   |
 //! | Q5_K   | 256          | 176         | k-quant, 8 sub-block scales, 5-bit |
 //! | Q6_K   | 256          | 210         | k-quant, 16 sub-block scales  |
@@ -41,6 +42,7 @@ pub enum GgmlType {
     Q5_0,
     Q5_1,
     Q8_0,
+    Q3_K,
     Q4_K,
     Q5_K,
     Q6_K,
@@ -57,6 +59,7 @@ impl GgmlType {
             6 => GgmlType::Q5_0,
             7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
+            11 => GgmlType::Q3_K,
             12 => GgmlType::Q4_K,
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
@@ -78,6 +81,7 @@ impl GgmlType {
             GgmlType::Q5_0 => 6,
             GgmlType::Q5_1 => 7,
             GgmlType::Q8_0 => 8,
+            GgmlType::Q3_K => 11,
             GgmlType::Q4_K => 12,
             GgmlType::Q5_K => 13,
             GgmlType::Q6_K => 14,
@@ -91,7 +95,7 @@ impl GgmlType {
             GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
                 32
             }
-            GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => QK_K,
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => QK_K,
         }
     }
 
@@ -105,6 +109,7 @@ impl GgmlType {
             GgmlType::Q5_0 => 22,
             GgmlType::Q5_1 => 24,
             GgmlType::Q8_0 => 34,
+            GgmlType::Q3_K => 110,
             GgmlType::Q4_K => 144,
             GgmlType::Q5_K => 176,
             GgmlType::Q6_K => 210,
@@ -158,6 +163,7 @@ pub fn dequant_block(ty: GgmlType, chunk: &[u8], out: &mut [f32]) {
         GgmlType::Q5_0 => block_q5_0(chunk, out),
         GgmlType::Q5_1 => block_q5_1(chunk, out),
         GgmlType::Q8_0 => block_q8_0(chunk, out),
+        GgmlType::Q3_K => block_q3_k(chunk, out),
         GgmlType::Q4_K => block_q4_k(chunk, out),
         GgmlType::Q5_K => block_q5_k(chunk, out),
         GgmlType::Q6_K => block_q6_k(chunk, out),
@@ -300,6 +306,67 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
         let d = (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4);
         let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
         (d, m)
+    }
+}
+
+/// Unpack `Q3_K`'s 16 signed 6-bit sub-block scales from its packed 12 bytes.
+/// Each output byte's low nibble comes directly from one of the first 8 raw
+/// bytes; its top 2 bits come from the last 4 raw bytes, at a shift that
+/// depends on which of the 4 destination "groups" (`s[0..4]`, `s[4..8]`,
+/// `s[8..12]`, `s[12..16]`) it feeds — the top 2 bits of `raw[8+b]` are shared
+/// four ways, 2 bits going to each group. Values are unsigned 6-bit (`[0,63]`)
+/// stored in `i8`; the `-32` re-bias to a signed scale happens at use.
+fn q3_k_scales(raw: &[u8; 12]) -> [i8; 16] {
+    let mut s = [0i8; 16];
+    for b in 0..4 {
+        let lo0 = raw[b];
+        let lo1 = raw[4 + b];
+        let hi = raw[8 + b];
+        s[b] = ((lo0 & 0x0f) | ((hi & 0x03) << 4)) as i8;
+        s[4 + b] = ((lo1 & 0x0f) | (((hi >> 2) & 0x03) << 4)) as i8;
+        s[8 + b] = ((lo0 >> 4) | (((hi >> 4) & 0x03) << 4)) as i8;
+        s[12 + b] = ((lo1 >> 4) | (((hi >> 6) & 0x03) << 4)) as i8;
+    }
+    s
+}
+
+/// `Q3_K`: a 256-element k-quant super-block of 3-bit weights — a 2-bit plane
+/// (`qs`) plus a separate 1-bit "high" plane (`hmask`, inverted: a *clear* bit
+/// means the high bit is set, adding `4`) — with 16 signed 6-bit sub-block
+/// scales (one per 16-element group, [`q3_k_scales`]) and a single super-block
+/// f16 scale (no min — unlike `Q4_K`/`Q5_K`, `Q3_K`'s zero point is the fixed
+/// `-4` baked into the high-bit convention, not a per-block min).
+fn block_q3_k(blk: &[u8], out: &mut [f32]) {
+    let hmask = &blk[0..32];
+    let qs = &blk[32..96];
+    let scales_raw: [u8; 12] = blk[96..108].try_into().unwrap();
+    let d_all = rd_f16(blk, 108);
+    let scales = q3_k_scales(&scales_raw);
+
+    let mut y = 0usize;
+    let mut is = 0usize;
+    let mut m: u8 = 1;
+    for n in 0..2 {
+        let q = &qs[n * 32..n * 32 + 32];
+        let mut shift = 0u32;
+        for _j in 0..4 {
+            let dl0 = d_all * (scales[is] - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let hb = if hmask[l] & m != 0 { 0 } else { 4 };
+                out[y] = dl0 * (((q[l] >> shift) & 3) as i32 - hb) as f32;
+                y += 1;
+            }
+            let dl1 = d_all * (scales[is] - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let hb = if hmask[l + 16] & m != 0 { 0 } else { 4 };
+                out[y] = dl1 * (((q[l + 16] >> shift) & 3) as i32 - hb) as f32;
+                y += 1;
+            }
+            shift += 2;
+            m <<= 1;
+        }
     }
 }
 
@@ -1684,6 +1751,65 @@ mod tests {
 
         let y = dequantize(GgmlType::Q4_K, &blk, QK_K).unwrap();
         assert!(y.iter().all(|&v| (v - 1.0).abs() < 1e-4), "{:?}", &y[..4]);
+    }
+
+    #[test]
+    fn q3_k_scale_unpack_hand_computed() {
+        // raw[0]=0x25 (lo0: low nibble 5, high nibble 2), raw[4]=0x39 (lo1:
+        // low nibble 9, high nibble 3), raw[8]=0xE4 = 0b1110_0100 (the "hi"
+        // byte for b=0: (hi>>0)&3=0, (hi>>2)&3=1, (hi>>4)&3=2, (hi>>6)&3=3).
+        // s[0]   = (0x25&0xf=5)  | (0<<4=0)  = 5
+        // s[4]   = (0x39&0xf=9)  | (1<<4=16) = 25
+        // s[8]   = (0x25>>4=2)   | (2<<4=32) = 34
+        // s[12]  = (0x39>>4=3)   | (3<<4=48) = 51
+        let mut raw = [0u8; 12];
+        raw[0] = 0x25;
+        raw[4] = 0x39;
+        raw[8] = 0xE4;
+        let s = q3_k_scales(&raw);
+        assert_eq!(s[0], 5);
+        assert_eq!(s[4], 25);
+        assert_eq!(s[8], 34);
+        assert_eq!(s[12], 51);
+    }
+
+    #[test]
+    fn q3_k_constant_block_high_bit_set() {
+        // scales_raw chosen so every one of the 16 decoded scales is 1 (see
+        // q3_k_scale_unpack_hand_computed for the bit layout): raw[0..8] =
+        // 0x11 (low and high nibble both 1) and raw[8..12] = 0 (no extra top
+        // bits). d_all=1.0 -> dl = 1*(1-32) = -31 for every sub-block.
+        // hmask all-1s -> the high bit is always "set" (hb=0 per the inverted
+        // convention). qs all-1s -> every 2-bit slice at every shift is 3.
+        // Every output should be dl*(3-0) = -93.
+        let mut blk = Vec::new();
+        blk.extend(std::iter::repeat_n(0xffu8, QK_K / 8)); // hmask
+        blk.extend(std::iter::repeat_n(0xffu8, QK_K / 4)); // qs
+        let mut scales_raw = [0x11u8; 12];
+        scales_raw[8..12].copy_from_slice(&[0u8; 4]);
+        blk.extend_from_slice(&scales_raw);
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        assert_eq!(blk.len(), GgmlType::Q3_K.type_size());
+
+        let y = dequantize(GgmlType::Q3_K, &blk, QK_K).unwrap();
+        assert!(y.iter().all(|&v| (v - -93.0).abs() < 1e-3), "{:?}", &y[..4]);
+    }
+
+    #[test]
+    fn q3_k_high_bit_clear_adds_offset() {
+        // Same as above but hmask all-0 -> the high bit is "clear" (hb=4 per
+        // the inverted convention), so every output is dl*(3-4) = -31*-1 = 31.
+        let mut blk = Vec::new();
+        blk.extend(std::iter::repeat_n(0x00u8, QK_K / 8)); // hmask
+        blk.extend(std::iter::repeat_n(0xffu8, QK_K / 4)); // qs
+        let mut scales_raw = [0x11u8; 12];
+        scales_raw[8..12].copy_from_slice(&[0u8; 4]);
+        blk.extend_from_slice(&scales_raw);
+        blk.extend_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        assert_eq!(blk.len(), GgmlType::Q3_K.type_size());
+
+        let y = dequantize(GgmlType::Q3_K, &blk, QK_K).unwrap();
+        assert!(y.iter().all(|&v| (v - 31.0).abs() < 1e-3), "{:?}", &y[..4]);
     }
 
     #[test]
