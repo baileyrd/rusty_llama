@@ -55,6 +55,9 @@ struct SamplingParams {
     seed: Option<u64>,
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
+    mirostat: Option<u8>,
+    mirostat_tau: Option<f32>,
+    mirostat_eta: Option<f32>,
 }
 
 /// OpenAI `response_format` — `{"type":"json_object"}` constrains output to JSON.
@@ -773,6 +776,10 @@ fn resolve_sampler(p: &SamplingParams) -> SamplerConfig {
         frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
         presence_penalty: p.presence_penalty.unwrap_or(0.0),
         seed: p.seed.unwrap_or_else(time_seed),
+        mirostat: p.mirostat.unwrap_or(0),
+        mirostat_tau: p.mirostat_tau.unwrap_or(5.0),
+        mirostat_eta: p.mirostat_eta.unwrap_or(0.1),
+        mirostat_m: 100,
     }
 }
 

@@ -38,6 +38,9 @@ Options:
   --repeat-last-n <int>   penalty window            (default: 64)
   --frequency-penalty <f> frequency penalty         (default: 0.0)
   --presence-penalty <f>  presence penalty          (default: 0.0)
+  --mirostat <int>        mirostat mode: 0|1|2, off/v1/v2 (default: 0)
+  --mirostat-lr <float>   mirostat learning rate (eta)   (default: 0.1)
+  --mirostat-ent <float>  mirostat target entropy (tau)  (default: 5.0)
   --embedding             output an embedding vector instead of text
   --pooling <mode>        embedding pooling: mean|last|cls (default: mean)
   --embd-normalize <n>    embedding norm: 2 = L2, -1 = none     (default: 2)
@@ -70,6 +73,9 @@ struct Args {
     repeat_last_n: usize,
     frequency_penalty: f32,
     presence_penalty: f32,
+    mirostat: u8,
+    mirostat_lr: f32,
+    mirostat_ent: f32,
     embedding: bool,
     pooling: String,
     embd_normalize: i32,
@@ -327,6 +333,10 @@ fn stream_generation(
         frequency_penalty: args.frequency_penalty,
         presence_penalty: args.presence_penalty,
         seed: args.seed,
+        mirostat: args.mirostat,
+        mirostat_tau: args.mirostat_ent,
+        mirostat_eta: args.mirostat_lr,
+        mirostat_m: 100,
     };
     let mut sampler = SamplerChain::from_config(&sampler_cfg, model.config.vocab_size);
     if let Some(src) = resolve_grammar(args)? {
@@ -428,6 +438,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         repeat_last_n: 64,
         frequency_penalty: 0.0,
         presence_penalty: 0.0,
+        mirostat: 0,
+        mirostat_lr: 0.1,
+        mirostat_ent: 5.0,
         embedding: false,
         pooling: "mean".to_string(),
         embd_normalize: 2,
@@ -482,6 +495,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--repeat-last-n" => args.repeat_last_n = value()?.parse()?,
             "--frequency-penalty" => args.frequency_penalty = value()?.parse()?,
             "--presence-penalty" => args.presence_penalty = value()?.parse()?,
+            "--mirostat" => args.mirostat = value()?.parse()?,
+            "--mirostat-lr" => args.mirostat_lr = value()?.parse()?,
+            "--mirostat-ent" => args.mirostat_ent = value()?.parse()?,
             "--pooling" => args.pooling = value()?.clone(),
             "--embd-normalize" => args.embd_normalize = value()?.parse()?,
             "--system" => args.system = value()?.clone(),
