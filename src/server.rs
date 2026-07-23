@@ -342,7 +342,7 @@ fn worker(
     }
 
     let cp = bail!(Checkpoint::open(model_path), "open model");
-    let gguf = bail!(Gguf::parse(cp.bytes()), "parse GGUF");
+    let gguf = bail!(cp.gguf(), "parse GGUF");
     let model = bail!(Model::from_gguf(&gguf), "build model");
     let tokenizer = bail!(Tokenizer::from_gguf(&gguf), "load tokenizer");
     let backend = bail!(make_backend(backend_name), "init backend");

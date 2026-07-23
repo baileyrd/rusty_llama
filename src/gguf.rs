@@ -86,6 +86,9 @@ pub struct TensorInfo {
     pub ggml_type: GgmlType,
     /// Byte offset from the start of the tensor-data section.
     pub offset: u64,
+    /// Index into [`Gguf`]'s per-shard data (0 for a non-split file — every
+    /// tensor lives in "shard 0", the only shard).
+    pub shard: usize,
 }
 
 impl TensorInfo {
@@ -95,17 +98,39 @@ impl TensorInfo {
     }
 }
 
-/// A parsed GGUF file, borrowing the underlying bytes.
+/// One shard's parsed header: everything [`Gguf::parse`] produces except the
+/// backing bytes themselves, so [`Gguf::parse_sharded`] can reuse the same
+/// per-file parsing logic and then merge several of these.
+struct ShardHeader {
+    version: u32,
+    metadata: HashMap<String, MetaValue>,
+    /// Tensors as read from this shard's own tensor table (`shard` unset —
+    /// the caller tags it after merging).
+    tensors: Vec<TensorInfo>,
+    data_offset: usize,
+}
+
+/// A parsed GGUF file, borrowing the underlying bytes. Ordinarily backed by a
+/// single memory-mapped file; [`Gguf::parse_sharded`] backs it by several
+/// (llama.cpp's split-GGUF convention — one logical model spread across
+/// `model-NNNNN-of-MMMMM.gguf` files), in which case each [`TensorInfo`]
+/// records which shard's bytes it lives in.
 pub struct Gguf<'a> {
-    data: &'a [u8],
+    /// One byte slice per shard (length 1 for a non-split file).
+    data: Vec<&'a [u8]>,
+    /// Per-shard tensor-data start offset, indexed the same as `data`.
+    data_offset: Vec<usize>,
     /// File format version (2 or 3).
     pub version: u32,
-    /// All metadata key/value pairs.
+    /// All metadata key/value pairs. For a split file this is shard 0's
+    /// metadata — every shard is expected to carry the same shared keys
+    /// (architecture, hyperparameters, tokenizer, ...), so this repo doesn't
+    /// cross-validate them shard-to-shard.
     pub metadata: HashMap<String, MetaValue>,
-    /// Tensor descriptors in file order.
+    /// Tensor descriptors in file order (shard 0's tensors first, then shard
+    /// 1's, ...).
     pub tensors: Vec<TensorInfo>,
     index: HashMap<String, usize>,
-    data_offset: usize,
 }
 
 impl<'a> Gguf<'a> {
@@ -114,8 +139,11 @@ impl<'a> Gguf<'a> {
         data.len() >= 4 && &data[..4] == MAGIC
     }
 
-    /// Parse a GGUF file from raw (typically memory-mapped) bytes.
-    pub fn parse(data: &'a [u8]) -> Result<Self> {
+    /// Parse a single GGUF file's header (magic/version/metadata/tensor
+    /// table) without tagging tensors to a shard — shared by [`Gguf::parse`]
+    /// (shard 0, the only one) and [`Gguf::parse_sharded`] (one call per
+    /// shard, merged afterward).
+    fn parse_header(data: &[u8]) -> Result<ShardHeader> {
         let mut r = Reader { data, pos: 0 };
 
         if r.bytes(4)? != MAGIC {
@@ -141,8 +169,8 @@ impl<'a> Gguf<'a> {
         }
 
         let mut tensors = Vec::with_capacity(tensor_count.min(1 << 16));
-        let mut index = HashMap::with_capacity(tensor_count.min(1 << 16));
-        for i in 0..tensor_count {
+        let mut names = std::collections::HashSet::with_capacity(tensor_count.min(1 << 16));
+        for _ in 0..tensor_count {
             let name = r.string()?;
             let n_dims = r.u32()? as usize;
             let mut dims = Vec::with_capacity(n_dims.min(1 << 16));
@@ -157,7 +185,7 @@ impl<'a> Gguf<'a> {
                 .ok_or_else(|| Error::Format(format!("tensor '{name}' dims overflow")))?;
             let ggml_type = GgmlType::from_u32(r.u32()?)?;
             let offset = r.u64()?;
-            if index.insert(name.clone(), i).is_some() {
+            if !names.insert(name.clone()) {
                 return Err(Error::Format(format!("duplicate tensor name '{name}'")));
             }
             tensors.push(TensorInfo {
@@ -165,6 +193,7 @@ impl<'a> Gguf<'a> {
                 dims,
                 ggml_type,
                 offset,
+                shard: 0, // tagged by the caller once the final shard index is known
             });
         }
 
@@ -180,13 +209,83 @@ impl<'a> Gguf<'a> {
             return Err(Error::Format("GGUF tensor data section is missing".into()));
         }
 
-        Ok(Gguf {
-            data,
+        Ok(ShardHeader {
             version,
             metadata,
             tensors,
-            index,
             data_offset,
+        })
+    }
+
+    /// Parse a GGUF file from raw (typically memory-mapped) bytes.
+    pub fn parse(data: &'a [u8]) -> Result<Self> {
+        let h = Self::parse_header(data)?;
+        let mut index = HashMap::with_capacity(h.tensors.len());
+        for (i, t) in h.tensors.iter().enumerate() {
+            index.insert(t.name.clone(), i);
+        }
+        Ok(Gguf {
+            data: vec![data],
+            data_offset: vec![h.data_offset],
+            version: h.version,
+            metadata: h.metadata,
+            tensors: h.tensors,
+            index,
+        })
+    }
+
+    /// Parse a model split across several GGUF files (llama.cpp's
+    /// `split.count`/`split.no` convention: each shard is a complete,
+    /// independently-parseable GGUF file whose tensor table lists only the
+    /// tensors physically stored in it). `shards` must be in shard order
+    /// (shard 0 first); every tensor across every shard must have a unique
+    /// name. Metadata is taken from `shards[0]` — see the [`Gguf::metadata`]
+    /// doc.
+    pub fn parse_sharded(shards: &[&'a [u8]]) -> Result<Self> {
+        if shards.is_empty() {
+            return Err(Error::Format("no shards given".into()));
+        }
+        let mut data = Vec::with_capacity(shards.len());
+        let mut data_offset = Vec::with_capacity(shards.len());
+        let mut tensors = Vec::new();
+        let mut index = HashMap::new();
+        let mut version = None;
+        let mut metadata = None;
+        for (shard, &bytes) in shards.iter().enumerate() {
+            let h = Self::parse_header(bytes)?;
+            if let Some(v) = version {
+                if v != h.version {
+                    return Err(Error::Format(format!(
+                        "shard {shard} has GGUF version {}, expected {v} (from shard 0)",
+                        h.version
+                    )));
+                }
+            } else {
+                version = Some(h.version);
+            }
+            data.push(bytes);
+            data_offset.push(h.data_offset);
+            for mut t in h.tensors {
+                t.shard = shard;
+                if index.insert(t.name.clone(), tensors.len()).is_some() {
+                    return Err(Error::Format(format!(
+                        "duplicate tensor name '{}' across shards",
+                        t.name
+                    )));
+                }
+                tensors.push(t);
+            }
+            if shard == 0 {
+                metadata = Some(h.metadata);
+            }
+        }
+        Ok(Gguf {
+            data,
+            data_offset,
+            version: version.unwrap(),
+            metadata: metadata.unwrap(),
+            tensors,
+            index,
         })
     }
 
@@ -224,17 +323,18 @@ impl<'a> Gguf<'a> {
     /// Borrow the raw (still-quantized) bytes for a tensor.
     pub fn tensor_bytes(&self, info: &TensorInfo) -> Result<&'a [u8]> {
         let need = info.ggml_type.bytes_for(info.n_elements());
-        let start = self.data_offset + info.offset as usize;
+        let shard_data = self.data[info.shard];
+        let start = self.data_offset[info.shard] + info.offset as usize;
         let end = start
             .checked_add(need)
             .ok_or_else(|| Error::Format("tensor offset overflow".into()))?;
-        if end > self.data.len() {
+        if end > shard_data.len() {
             return Err(Error::Format(format!(
-                "tensor '{}' extends past end of file",
-                info.name
+                "tensor '{}' extends past end of shard {}",
+                info.name, info.shard
             )));
         }
-        Ok(&self.data[start..end])
+        Ok(&shard_data[start..end])
     }
 }
 
@@ -367,5 +467,75 @@ mod hardening_tests {
         // tensor_count = u64::MAX must not pre-allocate; it errors on truncated data.
         let b = header(u64::MAX);
         assert!(Gguf::parse(&b).is_err());
+    }
+
+    /// Build a minimal (no metadata) single-file GGUF holding the given named
+    /// f32 tensors, packed back-to-back with no inter-tensor padding.
+    fn build_f32_gguf(tensors: &[(&str, &[f32])]) -> Vec<u8> {
+        let mut offsets = Vec::with_capacity(tensors.len());
+        let mut offset = 0u64;
+        for (_, vals) in tensors {
+            offsets.push(offset);
+            offset += (vals.len() * 4) as u64;
+        }
+        let mut b = header(tensors.len() as u64);
+        for ((name, vals), off) in tensors.iter().zip(&offsets) {
+            str_(&mut b, name);
+            b.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            b.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // type F32
+            b.extend_from_slice(&off.to_le_bytes());
+        }
+        let pad = b.len().next_multiple_of(DEFAULT_ALIGNMENT) - b.len();
+        b.resize(b.len() + pad, 0);
+        for (_, vals) in tensors {
+            for &v in *vals {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn sharded_gguf_matches_equivalent_single_file() {
+        let t_a = [1.0f32, 2.0, 3.0];
+        let t_b = [4.0f32, 5.0];
+        let t_c = [6.0f32, 7.0, 8.0, 9.0];
+
+        // Shard 0 holds tensors a,b; shard 1 holds tensor c.
+        let shard0 = build_f32_gguf(&[("a", &t_a), ("b", &t_b)]);
+        let shard1 = build_f32_gguf(&[("c", &t_c)]);
+        let sharded = Gguf::parse_sharded(&[&shard0, &shard1]).unwrap();
+
+        // The equivalent single file with all three tensors together.
+        let single = build_f32_gguf(&[("a", &t_a), ("b", &t_b), ("c", &t_c)]);
+        let combined = Gguf::parse(&single).unwrap();
+
+        for name in ["a", "b", "c"] {
+            let s_info = sharded.tensor(name).expect("sharded lookup");
+            let c_info = combined.tensor(name).expect("combined lookup");
+            let s_bytes = sharded.tensor_bytes(s_info).unwrap();
+            let c_bytes = combined.tensor_bytes(c_info).unwrap();
+            assert_eq!(s_bytes, c_bytes, "tensor '{name}' bytes mismatch");
+        }
+        assert_eq!(sharded.tensor("a").unwrap().shard, 0);
+        assert_eq!(sharded.tensor("b").unwrap().shard, 0);
+        assert_eq!(sharded.tensor("c").unwrap().shard, 1);
+    }
+
+    #[test]
+    fn sharded_gguf_rejects_duplicate_name_across_shards() {
+        let shard0 = build_f32_gguf(&[("w", &[1.0f32])]);
+        let shard1 = build_f32_gguf(&[("w", &[2.0f32])]);
+        let err = match Gguf::parse_sharded(&[&shard0, &shard1]) {
+            Ok(_) => panic!("expected duplicate-name error"),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn sharded_gguf_rejects_empty_shard_list() {
+        assert!(Gguf::parse_sharded(&[]).is_err());
     }
 }

@@ -139,7 +139,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // GGUF files carry their own tokenizer; llama2.c checkpoints need -z.
     if Gguf::is_gguf(checkpoint.bytes()) {
-        let gguf = Gguf::parse(checkpoint.bytes())?;
+        let gguf = checkpoint.gguf()?;
         let model = Model::from_gguf(&gguf)?;
         let tokenizer = Tokenizer::from_gguf(&gguf)
             .map_err(|e| format!("failed to read GGUF tokenizer: {e}"))?;
@@ -298,7 +298,7 @@ fn stream_generation(
         )
     };
     let lora_gguf = match &lora_cp {
-        Some(cp) => Some(Gguf::parse(cp.bytes())?),
+        Some(cp) => Some(cp.gguf()?),
         None => None,
     };
     let lora = match &lora_gguf {
@@ -314,7 +314,7 @@ fn stream_generation(
         )
     };
     let cv_gguf = match &cv_cp {
-        Some(cp) => Some(Gguf::parse(cp.bytes())?),
+        Some(cp) => Some(cp.gguf()?),
         None => None,
     };
     let control = match &cv_gguf {
