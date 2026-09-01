@@ -1,5 +1,7 @@
 # rusty_llama
 
+> **Archived — merged into [Rusty Mill](https://github.com/Rusty-Mill/rusty_mill).** This crate now lives at [`crates/rusty_llama`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_llama) in the Rusty Mill monorepo, which is where active development, issues, and pull requests happen now. This standalone repo is kept for historical reference only.
+
 A small, from-scratch **Llama inference engine in Rust** — think "llama.cpp,
 the Rust way", built up one layer at a time so every piece is understandable.
 
